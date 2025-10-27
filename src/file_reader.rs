@@ -20,6 +20,7 @@ use async_openai::{
 };
 use kameo::prelude::*;
 use serde_json::{Value, json};
+use tokio::time::{sleep, timeout};
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -30,7 +31,6 @@ use crate::{
     },
     tools::{filesystem, search},
 };
-use tokio::time::{sleep, timeout};
 
 const SYSTEM_PROMPT_TEMPLATE: &str = r#"You are Weaver's file-reading assistant assigned to explore the UNCC CS2 PreTeXt project.
 Always stay within the UNCC CS2 PreTeXt workspace and rely on the provided tools to inspect files.
@@ -244,9 +244,7 @@ impl FileReader {
             Some(m) => m,
             None => u64::MAX,
         };
-        let base_delay = RETRY_BASE_DELAY_MS
-            .saturating_mul(multiplier)
-            .min(60_000);
+        let base_delay = RETRY_BASE_DELAY_MS.saturating_mul(multiplier).min(60_000);
         let jitter = (iteration as u64 * 137) % (RETRY_MAX_JITTER_MS + 1);
         let delay_ms = base_delay + jitter;
         sleep(Duration::from_millis(delay_ms)).await;
@@ -372,7 +370,8 @@ impl FileReader {
                         )
                     })?;
                 info!(
-                    "tool_call read_file_range depth={} path={} start_line={} end_line={} line_count={}",
+                    "tool_call read_file_range depth={} path={} start_line={} end_line={} \
+                     line_count={}",
                     self.depth,
                     range.path.display(),
                     range.start_line,
@@ -491,7 +490,8 @@ impl FileReader {
                     messages.len()
                 );
                 let start = Instant::now();
-                let response_res = timeout(timeout_duration, self.client.chat().create(request)).await;
+                let response_res =
+                    timeout(timeout_duration, self.client.chat().create(request)).await;
                 let response = match response_res {
                     Ok(Ok(resp)) => {
                         info!(
@@ -505,9 +505,7 @@ impl FileReader {
                     Ok(Err(err)) => {
                         warn!(
                             "llm_request_error depth={} iteration={} error={}",
-                            self.depth,
-                            iteration,
-                            err
+                            self.depth, iteration, err
                         );
                         self.sleep_backoff(iteration).await;
                         continue 'retry;

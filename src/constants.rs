@@ -17,7 +17,8 @@ pub const DEFAULT_MAX_SUBDELEGATIONS: usize = 2;
 /// Timeout applied to each chat-completion request (seconds).
 pub const REQUEST_TIMEOUT_SECS: u64 = 60;
 
-/// Base delay (milliseconds) used for exponential backoff after a failed request.
+/// Base delay (milliseconds) used for exponential backoff after a failed
+/// request.
 pub const RETRY_BASE_DELAY_MS: u64 = 250;
 
 /// Maximum jitter (milliseconds) added to each backoff sleep.
