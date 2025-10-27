@@ -11,9 +11,12 @@ bpaf = { version = "0.9.20", features = [
   "batteries",
   "bright-color",
 ] }
+grep-regex = "0.1.14"
+grep-searcher = { version = "0.1.16", features = ["avx-accel", "simd-accel"] }
 kameo = "0.18.0"
+pathdiff = "0.2.3"
 petgraph = { version = "0.8.3", features = ["serde"] }
-rerun = "0.26.1"
+rerun = "0.26.2"
 schemars = { version = "1.0.4", features = ["uuid1"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
@@ -22,9 +25,11 @@ tokio = { version = "1.48.0", features = ["full"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = [
   "chrono",
+  "env-filter",
   "fmt",
   "local-time",
   "once_cell",
   "parking_lot",
 ] }
 uuid = { version = "1.18.1", package = "uuid", features = ["serde", "v4"] }
+walkdir = "2.5.0"

@@ -1,0 +1,3 @@
+# Optimize code generation for the current host CPU when building with Cargo.
+[build]
+rustflags = ["-C", "target-cpu=native"]
