@@ -33,30 +33,28 @@ impl std::error::Error for CliError {}
 
 #[derive(Debug, Clone)]
 struct RunConfig {
-    topic: String,
-    concepts: usize,
+    topic:             String,
+    concepts:          usize,
     learning_outcomes: usize,
-    target_edges: usize,
-    use_llm: bool,
-    export_dot: Option<PathBuf>,
+    target_edges:      usize,
+    use_llm:           bool,
+    export_dot:        Option<PathBuf>,
 }
 
 fn usage() -> &'static str {
-    "Usage: weaver mvp run [--topic TEXT] [--concepts N] [--los N] [--edges N] [--use-llm true|false] [--export-dot PATH]"
+    "Usage: weaver mvp run [--topic TEXT] [--concepts N] [--los N] [--edges N] [--use-llm \
+     true|false] [--export-dot PATH]"
 }
 
 fn parse_args() -> Result<RunConfig, CliError> {
     let mut args = env::args().skip(1);
 
     let Some(command) = args.next() else {
-        return Err(CliError(format!("{}", usage())));
+        return Err(CliError(usage().to_string()));
     };
 
     if command != "mvp" {
-        return Err(CliError(format!(
-            "unknown command '{command}'. {}",
-            usage()
-        )));
+        return Err(CliError(format!("unknown command '{command}'. {}", usage())));
     }
 
     let Some(sub) = args.next() else {
@@ -68,12 +66,12 @@ fn parse_args() -> Result<RunConfig, CliError> {
     }
 
     let mut config = RunConfig {
-        topic: "Design Recipe".to_string(),
-        concepts: 25,
+        topic:             "Design Recipe".to_string(),
+        concepts:          25,
         learning_outcomes: 5,
-        target_edges: 40,
-        use_llm: false,
-        export_dot: None,
+        target_edges:      40,
+        use_llm:           false,
+        export_dot:        None,
     };
 
     while let Some(flag) = args.next() {
@@ -156,14 +154,14 @@ async fn run_mvp(config: RunConfig) -> Result<(), DynError> {
     let adder_ref = GraphAdder::spawn(GraphAdder::with_event_sender(graph_store, Some(event_tx)));
 
     let node_generator_ref = NodeGenerator::spawn(NodeGenerator::new(NodeGeneratorConfig {
-        use_llm: config.use_llm,
-        default_concepts: config.concepts,
+        use_llm:                   config.use_llm,
+        default_concepts:          config.concepts,
         default_learning_outcomes: config.learning_outcomes,
     }));
 
     let nodes = node_generator_ref
         .ask(GenerateNodes {
-            concepts: config.concepts,
+            concepts:          config.concepts,
             learning_outcomes: config.learning_outcomes,
         })
         .await
@@ -185,21 +183,18 @@ async fn run_mvp(config: RunConfig) -> Result<(), DynError> {
         rejected_nodes
     );
 
-    let inventory = adder_ref
-        .ask(Inventory::default())
-        .await
-        .map_err(|err| -> DynError {
-            Box::new(CliError(format!("failed to fetch inventory: {err}")))
-        })?;
+    let inventory = adder_ref.ask(Inventory).await.map_err(|err| -> DynError {
+        Box::new(CliError(format!("failed to fetch inventory: {err}")))
+    })?;
 
     let edge_generator_ref = EdgeGenerator::spawn(EdgeGenerator::new(EdgeGeneratorConfig {
-        use_llm: config.use_llm,
+        use_llm:              config.use_llm,
         default_target_edges: config.target_edges,
     }));
 
     let edges = edge_generator_ref
         .ask(GenerateEdges {
-            inventory: inventory.clone(),
+            inventory:    inventory.clone(),
             target_edges: config.target_edges,
         })
         .await
@@ -221,12 +216,9 @@ async fn run_mvp(config: RunConfig) -> Result<(), DynError> {
         rejected_edges
     );
 
-    let summary = adder_ref
-        .ask(Summarize::default())
-        .await
-        .map_err(|err| -> DynError {
-            Box::new(CliError(format!("failed to compute summary: {err}")))
-        })?;
+    let summary = adder_ref.ask(Summarize).await.map_err(|err| -> DynError {
+        Box::new(CliError(format!("failed to compute summary: {err}")))
+    })?;
 
     println!(
         "Nodes: {} (concept={}, learning_outcome={})",
@@ -248,10 +240,7 @@ async fn run_mvp(config: RunConfig) -> Result<(), DynError> {
     if !summary.top_learning_outcomes.is_empty() {
         println!("Top learning outcomes by incoming supports:");
         for entry in summary.top_learning_outcomes.iter().take(5) {
-            println!(
-                "  {} ({} supports) - {}",
-                entry.id, entry.supports, entry.text
-            );
+            println!("  {} ({} supports) - {}", entry.id, entry.supports, entry.text);
         }
     }
 

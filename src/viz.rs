@@ -16,25 +16,25 @@ use crate::{
 #[derive(Debug, Clone)]
 pub enum Event {
     NodeAccepted {
-        id: Uuid,
-        kind: NodeKind,
+        id:    Uuid,
+        kind:  NodeKind,
         level: u8,
-        tags: Option<Vec<String>>,
-        text: String,
+        tags:  Option<Vec<String>>,
+        text:  String,
     },
     NodeRejected {
-        text: String,
+        text:   String,
         reason: String,
     },
     EdgeAccepted {
-        relation: Relation,
-        from: Uuid,
-        to: Uuid,
+        relation:  Relation,
+        from:      Uuid,
+        to:        Uuid,
         rationale: String,
     },
     EdgeRejected {
         relation: Relation,
-        reason: String,
+        reason:   String,
     },
     SummaryLine {
         message: String,
@@ -44,20 +44,20 @@ pub enum Event {
 #[derive(Debug, Clone)]
 struct NodeCache {
     #[allow(dead_code)]
-    kind: NodeKind,
+    kind:  NodeKind,
     #[allow(dead_code)]
     level: u8,
     #[allow(dead_code)]
-    text: String,
+    text:  String,
     order: usize,
 }
 
 /// Rerun-backed visualizer actor state.
 #[derive(Debug)]
 pub struct Viz {
-    stream: Option<RecordingStream>,
-    nodes: HashMap<Uuid, NodeCache>,
-    edges: Vec<(Uuid, Uuid, Relation, String)>,
+    stream:       Option<RecordingStream>,
+    nodes:        HashMap<Uuid, NodeCache>,
+    edges:        Vec<(Uuid, Uuid, Relation, String)>,
     level_counts: HashMap<u8, usize>,
 }
 
@@ -152,10 +152,7 @@ impl Viz {
         self.log_text(
             "graph/events",
             TextLogLevel::INFO,
-            format!(
-                "ACCEPT node {:?} lvl {} {}: {}{}",
-                kind, level, id, label, tag_suffix
-            ),
+            format!("ACCEPT node {:?} lvl {} {}: {}{}", kind, level, id, label, tag_suffix),
         );
 
         self.log_nodes();
@@ -236,19 +233,15 @@ impl Viz {
         if !directed.is_empty() {
             directed.sort();
             directed.dedup();
-            let _ = stream.log(
-                "graph/edges",
-                &GraphEdges::new(directed.clone()).with_directed_edges(),
-            );
+            let _ =
+                stream.log("graph/edges", &GraphEdges::new(directed.clone()).with_directed_edges());
         }
 
         if !supports.is_empty() {
             supports.sort();
             supports.dedup();
-            let _ = stream.log(
-                "graph/edges_supports",
-                &GraphEdges::new(supports).with_undirected_edges(),
-            );
+            let _ = stream
+                .log("graph/edges_supports", &GraphEdges::new(supports).with_undirected_edges());
         }
     }
 }

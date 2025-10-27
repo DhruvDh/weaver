@@ -12,7 +12,7 @@ use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::model::{EdgeProposal, NodeKind, NodeProposal};
+use crate::model::{EdgeProposal, InventoryEntry, NodeKind, NodeProposal};
 
 /// Errors surfaced when interacting with the LLM backend.
 #[derive(Debug, Error)]
@@ -31,7 +31,7 @@ pub enum LlmError {
 #[derive(Debug, Clone)]
 pub struct LlmClient {
     client: Client<OpenAIConfig>,
-    model: String,
+    model:  String,
 }
 
 impl LlmClient {
@@ -70,7 +70,8 @@ Rules:
 - Match the requested counts for each node type."#;
 
         let user_prompt = format!(
-            "Produce exactly {concepts} Concept nodes and {learning_outcomes} LearningOutcome nodes. Return ONLY JSON that satisfies the schema.",
+            "Produce exactly {concepts} Concept nodes and {learning_outcomes} LearningOutcome \
+             nodes. Return ONLY JSON that satisfies the schema.",
             concepts = concepts,
             learning_outcomes = learning_outcomes
         );
@@ -90,10 +91,10 @@ Rules:
 
         let response_format = ResponseFormat::JsonSchema {
             json_schema: ResponseFormatJsonSchema {
-                name: "node_batch".into(),
+                name:        "node_batch".into(),
                 description: Some("List of node proposals".into()),
-                schema: Some(schema_value),
-                strict: Some(true),
+                schema:      Some(schema_value),
+                strict:      Some(true),
             },
         };
 
@@ -126,23 +127,17 @@ Rules:
 
     pub async fn generate_edges(
         &self,
-        inventory: &[(
-            uuid::Uuid,
-            crate::model::NodeKind,
-            u8,
-            String,
-            Option<Vec<String>>,
-        )],
+        inventory: &[InventoryEntry],
         target_edges: usize,
     ) -> Result<Vec<EdgeProposal>, LlmError> {
         let inventory_items: Vec<InventoryItem> = inventory
             .iter()
             .map(|(id, kind, level, text, tags)| InventoryItem {
-                id: *id,
-                kind: kind.clone(),
+                id:    *id,
+                kind:  kind.clone(),
                 level: *level,
-                text: text.clone(),
-                tags: tags.clone(),
+                text:  text.clone(),
+                tags:  tags.clone(),
             })
             .collect();
         let inventory_json = serde_json::to_string_pretty(&inventory_items)
@@ -158,7 +153,8 @@ Rules:
 - Aim for the requested number of edges; it is OK to return fewer but avoid duplicates."#;
 
         let user_prompt = format!(
-            "Accepted nodes (JSON array):\n{}\nRequested edge count: {}\nReturn ONLY JSON that satisfies the schema.",
+            "Accepted nodes (JSON array):\n{}\nRequested edge count: {}\nReturn ONLY JSON that \
+             satisfies the schema.",
             inventory_json, target_edges
         );
 
@@ -177,10 +173,10 @@ Rules:
 
         let response_format = ResponseFormat::JsonSchema {
             json_schema: ResponseFormatJsonSchema {
-                name: "edge_batch".into(),
+                name:        "edge_batch".into(),
                 description: Some("List of edge proposals".into()),
-                schema: Some(schema_value),
-                strict: Some(true),
+                schema:      Some(schema_value),
+                strict:      Some(true),
             },
         };
 
@@ -214,11 +210,11 @@ Rules:
 
 #[derive(Debug, Clone, Serialize)]
 struct InventoryItem {
-    id: uuid::Uuid,
-    kind: NodeKind,
+    id:    uuid::Uuid,
+    kind:  NodeKind,
     level: u8,
-    text: String,
-    tags: Option<Vec<String>>,
+    text:  String,
+    tags:  Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]

@@ -11,8 +11,8 @@ use uuid::Uuid;
 use crate::{
     graph::GraphStore,
     model::{
-        ALLOWED_TAGS, Decision, Edge, EdgeProposal, Granularity, MAX_NODE_LEVEL, Node, NodeKind,
-        NodeProposal, Relation, clean_text, normalize_text,
+        ALLOWED_TAGS, Decision, Edge, EdgeProposal, Granularity, InventoryEntry, MAX_NODE_LEVEL,
+        Node, NodeKind, NodeProposal, Relation, clean_text, normalize_text,
     },
     summary::{Summary, TopLearningOutcome},
     viz::Event,
@@ -40,7 +40,7 @@ pub struct ExportDot;
 /// Primary mutator actor that validates and applies graph updates.
 #[derive(Debug, Actor)]
 pub struct GraphAdder {
-    store: GraphStore,
+    store:        GraphStore,
     event_sender: Option<UnboundedSender<Event>>,
 }
 
@@ -115,7 +115,7 @@ impl GraphAdder {
             let reason = "node text must be a single sentence";
             warn!(reason = reason, "node.rejected");
             self.emit_event(Event::NodeRejected {
-                text: cleaned_text,
+                text:   cleaned_text,
                 reason: reason.to_string(),
             });
             return Decision::rejected(reason);
@@ -127,7 +127,7 @@ impl GraphAdder {
                 let reason = "learning outcomes must start with 'I can' or 'Students can'";
                 warn!(reason = reason, "node.rejected");
                 self.emit_event(Event::NodeRejected {
-                    text: cleaned_text,
+                    text:   cleaned_text,
                     reason: reason.to_string(),
                 });
                 return Decision::rejected(reason);
@@ -138,7 +138,7 @@ impl GraphAdder {
             let reason = "duplicate node within batch";
             warn!(reason = reason, "node.rejected");
             self.emit_event(Event::NodeRejected {
-                text: cleaned_text,
+                text:   cleaned_text,
                 reason: reason.to_string(),
             });
             return Decision::rejected(reason);
@@ -148,7 +148,7 @@ impl GraphAdder {
             let reason = "duplicate node already present";
             warn!(reason = reason, "node.rejected");
             self.emit_event(Event::NodeRejected {
-                text: cleaned_text,
+                text:   cleaned_text,
                 reason: reason.to_string(),
             });
             return Decision::rejected(reason);
@@ -245,18 +245,17 @@ impl GraphAdder {
             return Decision::rejected(reason);
         }
 
-        if let Some(existing) = self.store.graph().find_edge(from_index, to_index) {
-            if let Some(weight) = self.store.graph().edge_weight(existing) {
-                if weight.relation == relation {
-                    let reason = "edge already exists";
-                    warn!(relation = ?relation, reason = reason, "edge.rejected");
-                    self.emit_event(Event::EdgeRejected {
-                        relation,
-                        reason: reason.to_string(),
-                    });
-                    return Decision::rejected(reason);
-                }
-            }
+        if let Some(existing) = self.store.graph().find_edge(from_index, to_index)
+            && let Some(weight) = self.store.graph().edge_weight(existing)
+            && weight.relation == relation
+        {
+            let reason = "edge already exists";
+            warn!(relation = ?relation, reason = reason, "edge.rejected");
+            self.emit_event(Event::EdgeRejected {
+                relation,
+                reason: reason.to_string(),
+            });
+            return Decision::rejected(reason);
         }
 
         let Some(from_node) = self.store.node(from_index).cloned() else {
@@ -339,9 +338,9 @@ impl GraphAdder {
         let rationale = rationale.to_string();
 
         let edge = Edge {
-            from: from_index,
-            to: to_index,
-            relation: relation.clone(),
+            from:      from_index,
+            to:        to_index,
+            relation:  relation.clone(),
             rationale: rationale.clone(),
         };
 
@@ -365,7 +364,7 @@ impl GraphAdder {
 
     fn sanitize_tags(tags: Option<Vec<String>>) -> Option<Vec<String>> {
         let mut result = Vec::new();
-        let Some(tags) = tags else { return None };
+        let tags = tags?;
 
         for tag in tags {
             if result.len() == MAX_TAGS_PER_NODE {
@@ -443,7 +442,7 @@ impl Message<AddEdges> for GraphAdder {
 }
 
 impl Message<Inventory> for GraphAdder {
-    type Reply = Vec<(Uuid, NodeKind, u8, String, Option<Vec<String>>)>;
+    type Reply = Vec<InventoryEntry>;
 
     fn handle(
         &mut self,
@@ -488,17 +487,18 @@ impl Message<ExportDot> for GraphAdder {
 
 #[cfg(test)]
 mod tests {
+    use uuid::Uuid;
+
     use super::*;
     use crate::model::{Granularity, NodeKind};
-    use uuid::Uuid;
 
     fn sample_concept(text: &str) -> NodeProposal {
         NodeProposal {
-            kind: NodeKind::Concept,
+            kind:        NodeKind::Concept,
             granularity: Granularity::Sentence,
-            level: 0,
-            text: text.to_string(),
-            tags: Some(vec!["tests".to_string()]),
+            level:       0,
+            text:        text.to_string(),
+            tags:        Some(vec!["tests".to_string()]),
         }
     }
 
@@ -510,18 +510,18 @@ mod tests {
             sample_concept("Graphs model dependencies with directed edges."),
             sample_concept("Graphs model dependencies with directed edges."),
             NodeProposal {
-                kind: NodeKind::LearningOutcome,
+                kind:        NodeKind::LearningOutcome,
                 granularity: Granularity::Sentence,
-                level: 2,
-                text: "Understand recursion across modules.".to_string(),
-                tags: Some(vec!["purpose".to_string()]),
+                level:       2,
+                text:        "Understand recursion across modules.".to_string(),
+                tags:        Some(vec!["purpose".to_string()]),
             },
             NodeProposal {
-                kind: NodeKind::LearningOutcome,
+                kind:        NodeKind::LearningOutcome,
                 granularity: Granularity::Sentence,
-                level: 2,
-                text: "I can trace prerequisite chains in a learning network.".to_string(),
-                tags: Some(vec!["implementation".to_string()]),
+                level:       2,
+                text:        "I can trace prerequisite chains in a learning network.".to_string(),
+                tags:        Some(vec!["implementation".to_string()]),
             },
         ];
 
@@ -529,14 +529,8 @@ mod tests {
 
         assert!(decisions[0].accepted, "first node should be accepted");
         assert!(!decisions[1].accepted, "duplicate node should be rejected");
-        assert!(
-            !decisions[2].accepted,
-            "learning outcome without prefix should be rejected"
-        );
-        assert!(
-            decisions[3].accepted,
-            "valid learning outcome should be accepted"
-        );
+        assert!(!decisions[2].accepted, "learning outcome without prefix should be rejected");
+        assert!(decisions[3].accepted, "valid learning outcome should be accepted");
     }
 
     #[test]
@@ -554,21 +548,21 @@ mod tests {
 
         let edges = vec![
             EdgeProposal {
-                relation: Relation::PrerequisiteFor,
-                from_id: node_ids[0],
-                to_id: node_ids[1],
+                relation:  Relation::PrerequisiteFor,
+                from_id:   node_ids[0],
+                to_id:     node_ids[1],
                 rationale: "Concept A informs Concept B.".to_string(),
             },
             EdgeProposal {
-                relation: Relation::PrerequisiteFor,
-                from_id: node_ids[1],
-                to_id: node_ids[2],
+                relation:  Relation::PrerequisiteFor,
+                from_id:   node_ids[1],
+                to_id:     node_ids[2],
                 rationale: "Concept B prepares learners for Concept C.".to_string(),
             },
             EdgeProposal {
-                relation: Relation::PrerequisiteFor,
-                from_id: node_ids[2],
-                to_id: node_ids[0],
+                relation:  Relation::PrerequisiteFor,
+                from_id:   node_ids[2],
+                to_id:     node_ids[0],
                 rationale: "Concept C loops back to Concept A.".to_string(),
             },
         ];
@@ -576,10 +570,7 @@ mod tests {
         let decisions = adder.handle_add_edges(edges);
         assert!(decisions[0].accepted);
         assert!(decisions[1].accepted);
-        assert!(
-            !decisions[2].accepted,
-            "cycle-forming edge must be rejected"
-        );
+        assert!(!decisions[2].accepted, "cycle-forming edge must be rejected");
     }
 
     #[test]
@@ -594,9 +585,9 @@ mod tests {
         let ids: Vec<Uuid> = decisions.iter().filter_map(|d| d.assigned_id).collect();
 
         let edges = vec![EdgeProposal {
-            relation: Relation::Supports,
-            from_id: ids[0],
-            to_id: ids[1],
+            relation:  Relation::Supports,
+            from_id:   ids[0],
+            to_id:     ids[1],
             rationale: "Closures provide reusable iterator adapters.".to_string(),
         }];
 

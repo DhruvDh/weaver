@@ -7,22 +7,22 @@ use petgraph::{
 };
 use uuid::Uuid;
 
-use crate::model::{Edge, Node, NodeKind, Relation, clean_text, normalize_text};
+use crate::model::{Edge, InventoryEntry, Node, Relation, clean_text, normalize_text};
 
 /// Wrapper around the petgraph store with convenient indexes.
 #[derive(Debug)]
 pub struct GraphStore {
-    graph: Graph<Node, Edge, Directed>,
+    graph:      Graph<Node, Edge, Directed>,
     text_index: HashMap<String, NodeIndex>,
-    id_index: HashMap<Uuid, NodeIndex>,
+    id_index:   HashMap<Uuid, NodeIndex>,
 }
 
 impl GraphStore {
     pub fn new() -> Self {
         Self {
-            graph: Graph::default(),
+            graph:      Graph::default(),
             text_index: HashMap::new(),
-            id_index: HashMap::new(),
+            id_index:   HashMap::new(),
         }
     }
 
@@ -52,18 +52,12 @@ impl GraphStore {
         self.graph.node_weight(index)
     }
 
-    pub fn inventory(&self) -> Vec<(Uuid, NodeKind, u8, String, Option<Vec<String>>)> {
+    pub fn inventory(&self) -> Vec<InventoryEntry> {
         self.graph
             .node_indices()
             .filter_map(|index| {
                 self.graph.node_weight(index).map(|node| {
-                    (
-                        node.id,
-                        node.kind.clone(),
-                        node.level,
-                        node.text.clone(),
-                        node.tags.clone(),
-                    )
+                    (node.id, node.kind.clone(), node.level, node.text.clone(), node.tags.clone())
                 })
             })
             .collect()
@@ -114,10 +108,9 @@ impl GraphStore {
                 let sanitized = clean_text(&weight.rationale).replace('"', "\\\"");
                 label = format!("{}: {}", relation, sanitized);
             }
-            if let (Some(from_node), Some(to_node)) = (
-                self.graph.node_weight(weight.from),
-                self.graph.node_weight(weight.to),
-            ) {
+            if let (Some(from_node), Some(to_node)) =
+                (self.graph.node_weight(weight.from), self.graph.node_weight(weight.to))
+            {
                 output.push_str(&format!(
                     "  \"{}\" -> \"{}\" [label=\"{}\"];\n",
                     from_node.id, to_node.id, label

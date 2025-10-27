@@ -12,16 +12,16 @@ use crate::{
 /// Configuration for generating node proposals.
 #[derive(Debug, Clone)]
 pub struct NodeGeneratorConfig {
-    pub use_llm: bool,
-    pub default_concepts: usize,
+    pub use_llm:                   bool,
+    pub default_concepts:          usize,
     pub default_learning_outcomes: usize,
 }
 
 impl Default for NodeGeneratorConfig {
     fn default() -> Self {
         Self {
-            use_llm: false,
-            default_concepts: 25,
+            use_llm:                   false,
+            default_concepts:          25,
             default_learning_outcomes: 5,
         }
     }
@@ -29,15 +29,16 @@ impl Default for NodeGeneratorConfig {
 
 /// Request a batch of node proposals.
 pub struct GenerateNodes {
-    pub concepts: usize,
+    pub concepts:          usize,
     pub learning_outcomes: usize,
 }
 
-/// Actor responsible for producing node proposals via LLM or deterministic fallback.
+/// Actor responsible for producing node proposals via LLM or deterministic
+/// fallback.
 #[derive(Debug, Actor)]
 pub struct NodeGenerator {
     config: NodeGeneratorConfig,
-    llm: Option<LlmClient>,
+    llm:    Option<LlmClient>,
 }
 
 impl NodeGenerator {

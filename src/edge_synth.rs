@@ -5,24 +5,23 @@ use kameo::{
     message::{Context, Message},
 };
 use tracing::warn;
-use uuid::Uuid;
 
 use crate::{
     llm::{LlmClient, LlmError},
-    model::{EdgeProposal, NodeKind, Relation},
+    model::{EdgeProposal, InventoryEntry, NodeKind, Relation},
 };
 
 /// Configuration for generating edge proposals.
 #[derive(Debug, Clone)]
 pub struct EdgeGeneratorConfig {
-    pub use_llm: bool,
+    pub use_llm:              bool,
     pub default_target_edges: usize,
 }
 
 impl Default for EdgeGeneratorConfig {
     fn default() -> Self {
         Self {
-            use_llm: false,
+            use_llm:              false,
             default_target_edges: 40,
         }
     }
@@ -30,7 +29,7 @@ impl Default for EdgeGeneratorConfig {
 
 /// Request a batch of edge proposals.
 pub struct GenerateEdges {
-    pub inventory: Vec<(Uuid, NodeKind, u8, String, Option<Vec<String>>)>,
+    pub inventory:    Vec<InventoryEntry>,
     pub target_edges: usize,
 }
 
@@ -38,7 +37,7 @@ pub struct GenerateEdges {
 #[derive(Debug, Actor)]
 pub struct EdgeGenerator {
     config: EdgeGeneratorConfig,
-    llm: Option<LlmClient>,
+    llm:    Option<LlmClient>,
 }
 
 impl EdgeGenerator {
@@ -54,10 +53,7 @@ impl EdgeGenerator {
         Self { config, llm }
     }
 
-    fn fallback_edges(
-        inventory: &[(Uuid, NodeKind, u8, String, Option<Vec<String>>)],
-        target_edges: usize,
-    ) -> Vec<EdgeProposal> {
+    fn fallback_edges(inventory: &[InventoryEntry], target_edges: usize) -> Vec<EdgeProposal> {
         let mut edges = Vec::new();
         let mut seen = HashSet::new();
 
@@ -83,9 +79,9 @@ impl EdgeGenerator {
                     let key = (concept.0, *lo_id, Relation::Supports);
                     if seen.insert(key) {
                         edges.push(EdgeProposal {
-                            relation: Relation::Supports,
-                            from_id: concept.0,
-                            to_id: *lo_id,
+                            relation:  Relation::Supports,
+                            from_id:   concept.0,
+                            to_id:     *lo_id,
                             rationale: format!(
                                 "{} underpins {}",
                                 truncate_sentence(&concept.3),
@@ -105,9 +101,9 @@ impl EdgeGenerator {
                 let key = (from.0, to.0, Relation::PrerequisiteFor);
                 if seen.insert(key) {
                     edges.push(EdgeProposal {
-                        relation: Relation::PrerequisiteFor,
-                        from_id: from.0,
-                        to_id: to.0,
+                        relation:  Relation::PrerequisiteFor,
+                        from_id:   from.0,
+                        to_id:     to.0,
                         rationale: format!(
                             "{} prepares learners for {}",
                             truncate_sentence(&from.3),

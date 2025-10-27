@@ -30,13 +30,17 @@ pub enum Granularity {
 /// Fully validated node stored in the graph.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
-    pub id: Uuid,
-    pub kind: NodeKind,
+    pub id:          Uuid,
+    pub kind:        NodeKind,
     pub granularity: Granularity,
-    pub level: u8,
-    pub text: String,
-    pub tags: Option<Vec<String>>,
+    pub level:       u8,
+    pub text:        String,
+    pub tags:        Option<Vec<String>>,
 }
+
+/// Flattened representation of a node used when sharing inventory across
+/// actors.
+pub type InventoryEntry = (Uuid, NodeKind, u8, String, Option<Vec<String>>);
 
 /// Relation type between two nodes.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, JsonSchema)]
@@ -48,36 +52,36 @@ pub enum Relation {
 /// Fully validated edge stored in the graph.
 #[derive(Debug, Clone)]
 pub struct Edge {
-    pub from: NodeIndex,
-    pub to: NodeIndex,
-    pub relation: Relation,
+    pub from:      NodeIndex,
+    pub to:        NodeIndex,
+    pub relation:  Relation,
     pub rationale: String,
 }
 
 /// Proposed node emitted by a generator (LLM or fallback).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct NodeProposal {
-    pub kind: NodeKind,
+    pub kind:        NodeKind,
     pub granularity: Granularity,
-    pub level: u8,
-    pub text: String,
-    pub tags: Option<Vec<String>>,
+    pub level:       u8,
+    pub text:        String,
+    pub tags:        Option<Vec<String>>,
 }
 
 /// Proposed edge emitted by a generator (LLM or fallback).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct EdgeProposal {
-    pub relation: Relation,
-    pub from_id: Uuid,
-    pub to_id: Uuid,
+    pub relation:  Relation,
+    pub from_id:   Uuid,
+    pub to_id:     Uuid,
     pub rationale: String,
 }
 
 /// Decision result returned by the GraphAdder for node and edge proposals.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Decision {
-    pub accepted: bool,
-    pub reason: Option<String>,
+    pub accepted:    bool,
+    pub reason:      Option<String>,
     pub assigned_id: Option<Uuid>,
 }
 
@@ -94,8 +98,8 @@ impl Decision {
     /// Construct a rejected decision with the provided reason.
     pub fn rejected(reason: impl Into<String>) -> Self {
         Self {
-            accepted: false,
-            reason: Some(reason.into()),
+            accepted:    false,
+            reason:      Some(reason.into()),
             assigned_id: None,
         }
     }

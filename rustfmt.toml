@@ -1,0 +1,72 @@
+########################################################
+# Basic Configuration
+########################################################
+
+# Because `merge_imports` is deprecated, use this instead:
+imports_granularity = "Crate"
+
+# Keep imports sorted
+reorder_imports = true
+
+# Group standard-library vs. external crate imports
+group_imports = "StdExternalCrate"
+
+# Reorder mod statements 
+reorder_modules = true
+
+# Force Unix line endings
+newline_style = "Unix"
+
+# Ensure formatting assumptions match the crate edition
+edition = "2024"
+
+# The target maximum width of a line
+max_width = 100
+
+# Prefer standard block indentation instead of visual alignment
+indent_style = "Block"
+
+########################################################
+# Alignment & Layout
+########################################################
+
+# Align struct fields if the longest field name is <= threshold
+# Increase beyond 20 if you want deeper alignment.
+struct_field_align_threshold = 20
+
+# Enum discriminant alignment is often unstable, but if your rustfmt
+# version supports it and doesn't warn, set it:
+enum_discrim_align_threshold = 20
+
+# Parameter layout: use the default, more conservative multi-line style
+fn_params_layout = "Tall"
+
+# Allow slightly wider function calls before wrapping to reduce awkward nesting
+fn_call_width = 80
+
+########################################################
+# Comments & Code Blocks
+########################################################
+
+# Wrap comments (including doc comments) at max_width
+wrap_comments = true
+
+# Attempt to format code blocks in doc comments
+format_code_in_doc_comments = true
+
+########################################################
+# Other Tweaks
+########################################################
+
+# Use shorthand field initialization (Foo { x, y }).
+use_field_init_shorthand = true
+
+# If you want to reorder impl items (unstable):
+# reorder_impl_items = true
+
+# You can also normalize block comment style:
+normalize_comments = true
+normalize_doc_attributes = true
+
+# Additional string formatting at line breaks
+format_strings = true

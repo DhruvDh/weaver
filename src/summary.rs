@@ -11,21 +11,21 @@ use crate::{
 /// Aggregate statistics about the current graph state.
 #[derive(Debug, Clone, Serialize, kameo::Reply)]
 pub struct Summary {
-    pub total_nodes: usize,
-    pub concepts: usize,
-    pub learning_outcomes: usize,
-    pub total_edges: usize,
-    pub prerequisite_edges: usize,
-    pub supports_edges: usize,
-    pub prerequisite_dag_ok: bool,
+    pub total_nodes:           usize,
+    pub concepts:              usize,
+    pub learning_outcomes:     usize,
+    pub total_edges:           usize,
+    pub prerequisite_edges:    usize,
+    pub supports_edges:        usize,
+    pub prerequisite_dag_ok:   bool,
     pub top_learning_outcomes: Vec<TopLearningOutcome>,
 }
 
 /// Lightweight view of a learning outcome ranked by inbound supports.
 #[derive(Debug, Clone, Serialize)]
 pub struct TopLearningOutcome {
-    pub id: Uuid,
-    pub text: String,
+    pub id:       Uuid,
+    pub text:     String,
     pub supports: usize,
 }
 
@@ -33,13 +33,13 @@ impl Summary {
     /// Create an empty summary placeholder.
     pub fn empty() -> Self {
         Self {
-            total_nodes: 0,
-            concepts: 0,
-            learning_outcomes: 0,
-            total_edges: 0,
-            prerequisite_edges: 0,
-            supports_edges: 0,
-            prerequisite_dag_ok: true,
+            total_nodes:           0,
+            concepts:              0,
+            learning_outcomes:     0,
+            total_edges:           0,
+            prerequisite_edges:    0,
+            supports_edges:        0,
+            prerequisite_dag_ok:   true,
             top_learning_outcomes: Vec::new(),
         }
     }
@@ -65,26 +65,25 @@ impl Summary {
 
         let mut support_counts: HashMap<Uuid, usize> = HashMap::new();
         for edge_index in store.edge_indices() {
-            if let Some(edge) = store.edge_weight(edge_index) {
-                if matches!(edge.relation, Relation::Supports) {
-                    if let Some(node) = store.node(edge.to) {
-                        *support_counts.entry(node.id).or_default() += 1;
-                    }
-                }
+            if let Some(edge) = store.edge_weight(edge_index)
+                && matches!(edge.relation, Relation::Supports)
+                && let Some(node) = store.node(edge.to)
+            {
+                *support_counts.entry(node.id).or_default() += 1;
             }
         }
 
         let mut learning_outcomes = Vec::new();
         for index in store.node_indices() {
-            if let Some(node) = store.node(index) {
-                if matches!(node.kind, NodeKind::LearningOutcome) {
-                    let supports = support_counts.get(&node.id).copied().unwrap_or(0);
-                    learning_outcomes.push(TopLearningOutcome {
-                        id: node.id,
-                        text: node.text.clone(),
-                        supports,
-                    });
-                }
+            if let Some(node) = store.node(index)
+                && matches!(node.kind, NodeKind::LearningOutcome)
+            {
+                let supports = support_counts.get(&node.id).copied().unwrap_or(0);
+                learning_outcomes.push(TopLearningOutcome {
+                    id: node.id,
+                    text: node.text.clone(),
+                    supports,
+                });
             }
         }
 
