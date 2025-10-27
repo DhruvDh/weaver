@@ -3,6 +3,7 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -24,10 +25,12 @@ use tracing::{debug, info, warn};
 use crate::{
     constants::{
         DEFAULT_MAX_SUBDELEGATIONS, DEFAULT_TEMPERATURE, DEFAULT_TOP_P, MAX_TOOL_ITERATIONS,
-        PRETEXT_SUBDIR,
+        PRETEXT_SUBDIR, REQUEST_TIMEOUT_SECS, RETRY_BASE_DELAY_MS, RETRY_MAX_EXP,
+        RETRY_MAX_JITTER_MS,
     },
     tools::{filesystem, search},
 };
+use tokio::time::{sleep, timeout};
 
 const SYSTEM_PROMPT_TEMPLATE: &str = r#"You are Weaver's file-reading assistant assigned to explore the UNCC CS2 PreTeXt project.
 Always stay within the UNCC CS2 PreTeXt workspace and rely on the provided tools to inspect files.
@@ -235,6 +238,20 @@ impl FileReader {
         )
     }
 
+    async fn sleep_backoff(&self, iteration: usize) {
+        let exp = (iteration as u32).min(RETRY_MAX_EXP);
+        let multiplier = match 1u64.checked_shl(exp) {
+            Some(m) => m,
+            None => u64::MAX,
+        };
+        let base_delay = RETRY_BASE_DELAY_MS
+            .saturating_mul(multiplier)
+            .min(60_000);
+        let jitter = (iteration as u64 * 137) % (RETRY_MAX_JITTER_MS + 1);
+        let delay_ms = base_delay + jitter;
+        sleep(Duration::from_millis(delay_ms)).await;
+    }
+
     fn tool_specs(&self) -> Vec<ChatCompletionTool> {
         TOOL_NAMES
             .iter()
@@ -286,7 +303,8 @@ impl FileReader {
                     .await
                     .with_context(|| format!("list_directory failed for {}", path.display()))?;
                 info!(
-                    "tool_call list_directory path={} entry_count={}",
+                    "tool_call list_directory depth={} path={} entry_count={}",
+                    self.depth,
                     path.display(),
                     entries.len()
                 );
@@ -315,7 +333,8 @@ impl FileReader {
                     .await
                     .with_context(|| format!("read_file_full failed for {}", path.display()))?;
                 info!(
-                    "tool_call read_file_full path={} bytes={}",
+                    "tool_call read_file_full depth={} path={} bytes={}",
+                    self.depth,
                     path.display(),
                     content.as_bytes().len()
                 );
@@ -353,7 +372,8 @@ impl FileReader {
                         )
                     })?;
                 info!(
-                    "tool_call read_file_range path={} start_line={} end_line={} line_count={}",
+                    "tool_call read_file_range depth={} path={} start_line={} end_line={} line_count={}",
+                    self.depth,
                     range.path.display(),
                     range.start_line,
                     range.end_line,
@@ -390,7 +410,8 @@ impl FileReader {
                         )
                     })?;
                 info!(
-                    "tool_call search_text scope={} pattern={} match_count={}",
+                    "tool_call search_text depth={} scope={} pattern={} match_count={}",
+                    self.depth,
                     path.display(),
                     pattern,
                     matches.len()
@@ -453,6 +474,7 @@ impl FileReader {
         mut messages: Vec<ChatCompletionRequestMessage>,
     ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + '_>> {
         Box::pin(async move {
+            let timeout_duration = Duration::from_secs(REQUEST_TIMEOUT_SECS);
             'retry: for iteration in 0..MAX_TOOL_ITERATIONS {
                 debug!(iteration, "Starting LLM tool iteration");
                 let request = CreateChatCompletionRequestArgs::default()
@@ -462,11 +484,42 @@ impl FileReader {
                     .top_p(DEFAULT_TOP_P)
                     .tools(self.tool_specs())
                     .build()?;
-
-                let response = match self.client.chat().create(request).await {
-                    Ok(resp) => resp,
-                    Err(err) => {
-                        warn!(iteration, error = %err, "LLM request failed; retrying");
+                info!(
+                    "llm_request_start depth={} iteration={} messages={}",
+                    self.depth,
+                    iteration,
+                    messages.len()
+                );
+                let start = Instant::now();
+                let response_res = timeout(timeout_duration, self.client.chat().create(request)).await;
+                let response = match response_res {
+                    Ok(Ok(resp)) => {
+                        info!(
+                            "llm_request_ok depth={} iteration={} elapsed_ms={}",
+                            self.depth,
+                            iteration,
+                            start.elapsed().as_millis()
+                        );
+                        resp
+                    }
+                    Ok(Err(err)) => {
+                        warn!(
+                            "llm_request_error depth={} iteration={} error={}",
+                            self.depth,
+                            iteration,
+                            err
+                        );
+                        self.sleep_backoff(iteration).await;
+                        continue 'retry;
+                    }
+                    Err(_) => {
+                        warn!(
+                            "llm_request_timeout depth={} iteration={} timeout_secs={}",
+                            self.depth,
+                            iteration,
+                            timeout_duration.as_secs()
+                        );
+                        self.sleep_backoff(iteration).await;
                         continue 'retry;
                     }
                 };

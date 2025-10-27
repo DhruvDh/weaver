@@ -40,7 +40,8 @@ async fn main() -> Result<()> {
     let reader = FileReader::spawn(actor);
 
     let prompt = "Summarize the key goals of the UNCC CS2 PreTeXt project. Highlight any modules \
-                  in the `uncc_cs2-pretext-project/source/` tree that look important.";
+                  in the `uncc_cs2-pretext-project/source/` tree that look important. Please do \
+                  so by calling `delegate_subtask` on individual chapters.";
     debug!(prompt, "Dispatching FileReaderQuery with LLM tool access");
 
     match reader
