@@ -1,6 +1,8 @@
 use std::{
     env,
+    future::Future,
     path::{Path, PathBuf},
+    pin::Pin,
 };
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -20,7 +22,10 @@ use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
 use crate::{
-    constants::{DEFAULT_TEMPERATURE, DEFAULT_TOP_P, MAX_TOOL_ITERATIONS, PRETEXT_SUBDIR},
+    constants::{
+        DEFAULT_MAX_SUBDELEGATIONS, DEFAULT_TEMPERATURE, DEFAULT_TOP_P, MAX_TOOL_ITERATIONS,
+        PRETEXT_SUBDIR,
+    },
     tools::{filesystem, search},
 };
 
@@ -36,6 +41,7 @@ pub enum ToolName {
     ReadFileFull,
     ReadFileRange,
     SearchText,
+    DelegateSubtask,
 }
 
 impl ToolName {
@@ -45,6 +51,7 @@ impl ToolName {
             ToolName::ReadFileFull => "read_file_full",
             ToolName::ReadFileRange => "read_file_range",
             ToolName::SearchText => "search_text",
+            ToolName::DelegateSubtask => "delegate_subtask",
         }
     }
 
@@ -58,6 +65,9 @@ impl ToolName {
                 "Read a specific inclusive line range from a UTF-8 text file."
             }
             ToolName::SearchText => "Run a regex search (ripgrep-style) within the workspace.",
+            ToolName::DelegateSubtask => {
+                "Delegate a complex file-reading subtask to a nested FileReader agent."
+            }
         }
     }
 
@@ -114,6 +124,16 @@ impl ToolName {
                     }
                 }
             }),
+            ToolName::DelegateSubtask => json!({
+                "type": "object",
+                "required": ["prompt"],
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "Instruction for the delegated FileReader agent."
+                    }
+                }
+            }),
         }
     }
 
@@ -123,29 +143,38 @@ impl ToolName {
             "read_file_full" => Some(ToolName::ReadFileFull),
             "read_file_range" => Some(ToolName::ReadFileRange),
             "search_text" => Some(ToolName::SearchText),
+            "delegate_subtask" => Some(ToolName::DelegateSubtask),
             _ => None,
         }
     }
 }
 
-const TOOL_NAMES: [ToolName; 4] = [
+const TOOL_NAMES: [ToolName; 5] = [
     ToolName::ListDirectory,
     ToolName::ReadFileFull,
     ToolName::ReadFileRange,
     ToolName::SearchText,
+    ToolName::DelegateSubtask,
 ];
 
 /// Actor that exposes local filesystem utilities to LLM collaborators.
 #[derive(Actor)]
 pub struct FileReader {
-    client: Client<OpenAIConfig>,
-    model:  String,
-    root:   PathBuf,
+    client:             Client<OpenAIConfig>,
+    model:              String,
+    root:               PathBuf,
+    depth:              usize,
+    max_subdelegations: usize,
 }
 
 impl FileReader {
     /// Build a new [`FileReader`] using `OPENAI_MODEL`/`OPENAI_API_BASE`.
     pub fn from_env(root: impl AsRef<Path>) -> Result<Self> {
+        Self::from_env_with_limit(root, DEFAULT_MAX_SUBDELEGATIONS)
+    }
+
+    /// Build a new [`FileReader`] with a custom delegation limit.
+    pub fn from_env_with_limit(root: impl AsRef<Path>, max_subdelegations: usize) -> Result<Self> {
         let model = env::var("OPENAI_MODEL")
             .map_err(|_| anyhow!("OPENAI_MODEL environment variable must be set"))?;
 
@@ -159,11 +188,24 @@ impl FileReader {
             .canonicalize()
             .with_context(|| format!("failed to canonicalize root {}", root.as_ref().display()))?;
 
-        Ok(Self {
-            client: Client::with_config(config),
+        let client = Client::with_config(config);
+        Ok(Self::new(client, model, root, 0, max_subdelegations))
+    }
+
+    fn new(
+        client: Client<OpenAIConfig>,
+        model: String,
+        root: PathBuf,
+        depth: usize,
+        max_subdelegations: usize,
+    ) -> Self {
+        Self {
+            client,
             model,
             root,
-        })
+            depth,
+            max_subdelegations,
+        }
     }
 
     fn system_prompt(&self) -> String {
@@ -181,6 +223,16 @@ impl FileReader {
 
     pub fn tool_names() -> &'static [ToolName] {
         &TOOL_NAMES
+    }
+
+    fn spawn_child_reader(&self) -> FileReader {
+        FileReader::new(
+            self.client.clone(),
+            self.model.clone(),
+            self.root.clone(),
+            self.depth + 1,
+            self.max_subdelegations,
+        )
     }
 
     fn tool_specs(&self) -> Vec<ChatCompletionTool> {
@@ -357,7 +409,167 @@ impl FileReader {
                     .collect::<Vec<_>>();
                 Ok(json!({ "matches": rendered }))
             }
+            ToolName::DelegateSubtask => {
+                if self.depth >= self.max_subdelegations {
+                    bail!(
+                        "delegate_subtask limit reached (depth {} >= {})",
+                        self.depth,
+                        self.max_subdelegations
+                    );
+                }
+                let prompt = args
+                    .get("prompt")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("delegate_subtask requires `prompt`"))?;
+                let prompt = prompt.to_string();
+                let child = self.spawn_child_reader();
+                info!(
+                    "tool_call delegate_subtask depth={} prompt_len={}",
+                    child.depth,
+                    prompt.len()
+                );
+                let child_messages = vec![
+                    ChatCompletionRequestSystemMessageArgs::default()
+                        .content(child.system_prompt())
+                        .build()?
+                        .into(),
+                    ChatCompletionRequestUserMessageArgs::default()
+                        .content(prompt)
+                        .build()?
+                        .into(),
+                ];
+                let result = child.run_conversation(child_messages).await?;
+                Ok(json!({
+                    "type": "delegation_result",
+                    "depth": child.depth,
+                    "content": result,
+                }))
+            }
         }
+    }
+
+    fn run_conversation(
+        &self,
+        mut messages: Vec<ChatCompletionRequestMessage>,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + '_>> {
+        Box::pin(async move {
+            'retry: for iteration in 0..MAX_TOOL_ITERATIONS {
+                debug!(iteration, "Starting LLM tool iteration");
+                let request = CreateChatCompletionRequestArgs::default()
+                    .model(self.model.clone())
+                    .messages(messages.clone())
+                    .temperature(DEFAULT_TEMPERATURE)
+                    .top_p(DEFAULT_TOP_P)
+                    .tools(self.tool_specs())
+                    .build()?;
+
+                let response = match self.client.chat().create(request).await {
+                    Ok(resp) => resp,
+                    Err(err) => {
+                        warn!(iteration, error = %err, "LLM request failed; retrying");
+                        continue 'retry;
+                    }
+                };
+                let mut choices = response.choices.into_iter();
+                let message = choices
+                    .next()
+                    .ok_or_else(|| anyhow!("chat completion returned no choices"))?
+                    .message;
+
+                debug!(
+                    iteration,
+                    role = ?message.role,
+                    has_content = message.content.as_ref().map(|c| !c.trim().is_empty()),
+                    tool_call_count = message.tool_calls.as_ref().map(|c| c.len()),
+                    content = ?message.content,
+                    refusal = ?message.refusal,
+                    "Assistant message received"
+                );
+
+                match message.tool_calls {
+                    Some(tool_calls) if !tool_calls.is_empty() => {
+                        debug!(
+                            iteration,
+                            tool_call_count = tool_calls.len(),
+                            "Assistant requested tool calls"
+                        );
+                        let assistant_msg = ChatCompletionRequestAssistantMessageArgs::default()
+                            .tool_calls(tool_calls.clone())
+                            .build()?
+                            .into();
+                        messages.push(assistant_msg);
+
+                        for tool_call in tool_calls {
+                            debug!(
+                                iteration,
+                                tool = tool_call.function.name.as_str(),
+                                "Executing assistant-requested tool"
+                            );
+                            let tool_name = tool_call.function.name.clone();
+                            let tool_msg = match self.execute_tool(&tool_call).await {
+                                Ok(result) => ChatCompletionRequestToolMessageArgs::default()
+                                    .tool_call_id(tool_call.id.clone())
+                                    .content(result.to_string())
+                                    .build()?
+                                    .into(),
+                                Err(err) => {
+                                    warn!(
+                                        "tool_error tool={} iteration={} error={}",
+                                        tool_name, iteration, err
+                                    );
+                                    let args_json: Value =
+                                        serde_json::from_str(&tool_call.function.arguments)
+                                            .unwrap_or_else(|_| {
+                                                Value::String(tool_call.function.arguments.clone())
+                                            });
+                                    let error_payload = json!({
+                                        "type": "tool_error",
+                                        "tool": tool_name,
+                                        "arguments": args_json,
+                                        "message": err.to_string(),
+                                    });
+                                    ChatCompletionRequestToolMessageArgs::default()
+                                        .tool_call_id(tool_call.id.clone())
+                                        .content(error_payload.to_string())
+                                        .build()?
+                                        .into()
+                                }
+                            };
+                            messages.push(tool_msg);
+                        }
+                        continue;
+                    }
+                    Some(empty_calls) => {
+                        debug!(
+                            iteration,
+                            tool_call_count = empty_calls.len(),
+                            "Assistant returned empty tool call list; treating as no tool calls"
+                        );
+                    }
+                    None => {}
+                }
+
+                if let Some(content) = message.content {
+                    let trimmed = content.trim();
+                    if trimmed.is_empty() {
+                        debug!(iteration, "Assistant content was empty; continuing");
+                    } else {
+                        debug!(iteration, "Assistant returned final content");
+                        return Ok(content);
+                    }
+                }
+
+                debug!(
+                    iteration,
+                    "Assistant response had no tool calls and no content; continuing"
+                );
+            }
+
+            bail!(
+                "LLM tool loop did not terminate with a message after {} iterations",
+                MAX_TOOL_ITERATIONS
+            );
+        })
     }
 }
 
@@ -374,7 +586,7 @@ impl Message<FileReaderQuery> for FileReader {
         FileReaderQuery { prompt }: FileReaderQuery,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let mut messages: Vec<ChatCompletionRequestMessage> = vec![
+        let messages: Vec<ChatCompletionRequestMessage> = vec![
             ChatCompletionRequestSystemMessageArgs::default()
                 .content(self.system_prompt())
                 .build()?
@@ -384,119 +596,6 @@ impl Message<FileReaderQuery> for FileReader {
                 .build()?
                 .into(),
         ];
-
-        'retry: for iteration in 0..MAX_TOOL_ITERATIONS {
-            debug!(iteration, "Starting LLM tool iteration");
-            let request = CreateChatCompletionRequestArgs::default()
-                .model(self.model.clone())
-                .messages(messages.clone())
-                .temperature(DEFAULT_TEMPERATURE)
-                .top_p(DEFAULT_TOP_P)
-                .tools(self.tool_specs())
-                .build()?;
-
-            let response = match self.client.chat().create(request).await {
-                Ok(resp) => resp,
-                Err(err) => {
-                    warn!(iteration, error = %err, "LLM request failed; retrying");
-                    continue 'retry;
-                }
-            };
-            let mut choices = response.choices.into_iter();
-            let message = choices
-                .next()
-                .ok_or_else(|| anyhow!("chat completion returned no choices"))?
-                .message;
-
-            debug!(
-                iteration,
-                role = ?message.role,
-                has_content = message.content.as_ref().map(|c| !c.trim().is_empty()),
-                tool_call_count = message.tool_calls.as_ref().map(|c| c.len()),
-                content = ?message.content,
-                refusal = ?message.refusal,
-                "Assistant message received"
-            );
-
-            match message.tool_calls {
-                Some(tool_calls) if !tool_calls.is_empty() => {
-                    debug!(
-                        iteration,
-                        tool_call_count = tool_calls.len(),
-                        "Assistant requested tool calls"
-                    );
-                    let assistant_msg = ChatCompletionRequestAssistantMessageArgs::default()
-                        .tool_calls(tool_calls.clone())
-                        .build()?
-                        .into();
-                    messages.push(assistant_msg);
-
-                    for tool_call in tool_calls {
-                        debug!(
-                            iteration,
-                            tool = tool_call.function.name.as_str(),
-                            "Executing assistant-requested tool"
-                        );
-                        let tool_name = tool_call.function.name.clone();
-                        let tool_msg = match self.execute_tool(&tool_call).await {
-                            Ok(result) => ChatCompletionRequestToolMessageArgs::default()
-                                .tool_call_id(tool_call.id.clone())
-                                .content(result.to_string())
-                                .build()?
-                                .into(),
-                            Err(err) => {
-                                warn!(
-                                    "tool_error tool={} iteration={} error={}",
-                                    tool_name, iteration, err
-                                );
-                                let args_json: Value =
-                                    serde_json::from_str(&tool_call.function.arguments)
-                                        .unwrap_or_else(|_| {
-                                            Value::String(tool_call.function.arguments.clone())
-                                        });
-                                let error_payload = json!({
-                                    "type": "tool_error",
-                                    "tool": tool_name,
-                                    "arguments": args_json,
-                                    "message": err.to_string(),
-                                });
-                                ChatCompletionRequestToolMessageArgs::default()
-                                    .tool_call_id(tool_call.id.clone())
-                                    .content(error_payload.to_string())
-                                    .build()?
-                                    .into()
-                            }
-                        };
-                        messages.push(tool_msg);
-                    }
-                    continue;
-                }
-                Some(empty_calls) => {
-                    debug!(
-                        iteration,
-                        tool_call_count = empty_calls.len(),
-                        "Assistant returned empty tool call list; treating as no tool calls"
-                    );
-                }
-                None => {}
-            }
-
-            if let Some(content) = message.content {
-                let trimmed = content.trim();
-                if trimmed.is_empty() {
-                    debug!(iteration, "Assistant content was empty; continuing");
-                } else {
-                    debug!(iteration, "Assistant returned final content");
-                    return Ok(content);
-                }
-            }
-
-            debug!(iteration, "Assistant response had no tool calls and no content; continuing");
-        }
-
-        bail!(
-            "LLM tool loop did not terminate with a message after {} iterations",
-            MAX_TOOL_ITERATIONS
-        );
+        self.run_conversation(messages).await
     }
 }

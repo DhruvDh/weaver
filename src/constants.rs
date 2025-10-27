@@ -10,3 +10,6 @@ pub const PRETEXT_SUBDIR: &str = "uncc_cs2-pretext-project";
 /// Maximum number of tool-calling loops before giving up on an assistant
 /// response.
 pub const MAX_TOOL_ITERATIONS: usize = 60;
+
+/// Maximum depth of recursive delegation for FileReader agents.
+pub const DEFAULT_MAX_SUBDELEGATIONS: usize = 2;
