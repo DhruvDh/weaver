@@ -1,0 +1,3 @@
+[submodule "uncc_cs2-pretext-project"]
+	path = uncc_cs2-pretext-project
+	url = https://github.com/nanajjar/uncc_cs2-pretext-project.git
