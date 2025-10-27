@@ -14,8 +14,15 @@ pub const MAX_TOOL_ITERATIONS: usize = 60;
 /// Maximum depth of recursive delegation for FileReader agents.
 pub const DEFAULT_MAX_SUBDELEGATIONS: usize = 2;
 
+/// Default number of delegate subtasks to run in parallel when using the
+/// `subtasks` array form.
+pub const DEFAULT_PARALLEL_DELEGATIONS: usize = 4;
+
+/// Hard ceiling on delegate subtask parallelism to prevent runaway fan-out.
+pub const MAX_PARALLEL_DELEGATIONS: usize = 8;
+
 /// Timeout applied to each chat-completion request (seconds).
-pub const REQUEST_TIMEOUT_SECS: u64 = 60;
+pub const REQUEST_TIMEOUT_SECS: u64 = 300;
 
 /// Base delay (milliseconds) used for exponential backoff after a failed
 /// request.

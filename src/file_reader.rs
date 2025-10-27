@@ -20,14 +20,17 @@ use async_openai::{
 };
 use kameo::prelude::*;
 use serde_json::{Value, json};
-use tokio::time::{sleep, timeout};
+use tokio::{
+    task::JoinSet,
+    time::{sleep, timeout},
+};
 use tracing::{debug, info, warn};
 
 use crate::{
     constants::{
-        DEFAULT_MAX_SUBDELEGATIONS, DEFAULT_TEMPERATURE, DEFAULT_TOP_P, MAX_TOOL_ITERATIONS,
-        PRETEXT_SUBDIR, REQUEST_TIMEOUT_SECS, RETRY_BASE_DELAY_MS, RETRY_MAX_EXP,
-        RETRY_MAX_JITTER_MS,
+        DEFAULT_MAX_SUBDELEGATIONS, DEFAULT_PARALLEL_DELEGATIONS, DEFAULT_TEMPERATURE,
+        DEFAULT_TOP_P, MAX_PARALLEL_DELEGATIONS, MAX_TOOL_ITERATIONS, PRETEXT_SUBDIR,
+        REQUEST_TIMEOUT_SECS, RETRY_BASE_DELAY_MS, RETRY_MAX_EXP, RETRY_MAX_JITTER_MS,
     },
     tools::{filesystem, search},
 };
@@ -36,6 +39,7 @@ const SYSTEM_PROMPT_TEMPLATE: &str = r#"You are Weaver's file-reading assistant 
 Always stay within the UNCC CS2 PreTeXt workspace and rely on the provided tools to inspect files.
 The primary course content lives under `./uncc_cs2-pretext-project/`; call `list_directory` whenever you need to confirm the current structure.
 Never assume content from file names alone—use `read_file_full` or `read_file_range` to inspect source material before describing or citing it.
+When tasks can be partitioned, prefer launching delegate subtasks in parallel. The `delegate_subtask` tool accepts either a single `subtask` string or a `subtasks` array, and it is recommended to batch independent subtasks so they run concurrently. The runtime executes up to 4 subtasks concurrently.
 Only answer after gathering the necessary context via tool calls, and reference the specific files you actually examined."#;
 
 #[derive(Clone, Copy, Debug)]
@@ -69,7 +73,8 @@ impl ToolName {
             }
             ToolName::SearchText => "Run a regex search (ripgrep-style) within the workspace.",
             ToolName::DelegateSubtask => {
-                "Delegate a complex file-reading subtask to a nested FileReader agent."
+                "Delegate one or more subtasks to child FileReader agents. This is preferred for \
+                 parallelizable work."
             }
         }
     }
@@ -129,13 +134,21 @@ impl ToolName {
             }),
             ToolName::DelegateSubtask => json!({
                 "type": "object",
-                "required": ["prompt"],
                 "properties": {
-                    "prompt": {
+                    "subtask": {
                         "type": "string",
-                        "description": "Instruction for the delegated FileReader agent."
+                        "description": "Instruction for a delegated FileReader agent."
+                    },
+                    "subtasks": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Precise description with motivation of subtasks to delegate in parallel."
                     }
-                }
+                },
+                "anyOf": [
+                    {"required": ["subtask"]},
+                    {"required": ["subtasks"]}
+                ]
             }),
         }
     }
@@ -236,6 +249,105 @@ impl FileReader {
             self.depth + 1,
             self.max_subdelegations,
         )
+    }
+
+    fn spawn_delegate_task(
+        &self,
+        join_set: &mut JoinSet<(usize, String, Result<String>)>,
+        idx: usize,
+        subtask: String,
+    ) -> Result<()> {
+        let child = self.spawn_child_reader();
+        let system_prompt = child.system_prompt();
+        let system_msg = ChatCompletionRequestSystemMessageArgs::default()
+            .content(system_prompt)
+            .build()?;
+        let user_msg = ChatCompletionRequestUserMessageArgs::default()
+            .content(subtask.clone())
+            .build()?;
+        let messages = vec![system_msg.into(), user_msg.into()];
+
+        join_set.spawn(async move {
+            let outcome = child.run_conversation(messages).await;
+            (idx, subtask, outcome)
+        });
+        Ok(())
+    }
+
+    async fn run_delegate_batch(
+        &self,
+        subtasks: Vec<String>,
+        max_concurrency: usize,
+    ) -> Result<Value> {
+        let total = subtasks.len();
+        if total == 0 {
+            bail!("delegate_subtask requires at least one subtask");
+        }
+
+        let limit = max_concurrency
+            .clamp(1, MAX_PARALLEL_DELEGATIONS)
+            .min(total);
+
+        let mut join_set: JoinSet<(usize, String, Result<String>)> = JoinSet::new();
+        let mut pending = subtasks.into_iter().enumerate();
+        let mut active = 0usize;
+
+        for _ in 0..limit {
+            if let Some((idx, subtask)) = pending.next() {
+                self.spawn_delegate_task(&mut join_set, idx, subtask)?;
+                active += 1;
+            }
+        }
+
+        let mut results: Vec<Option<Value>> = vec![None; total];
+
+        while active > 0 {
+            if let Some(res) = join_set.join_next().await {
+                active -= 1;
+                match res {
+                    Ok((idx, subtask, outcome)) => {
+                        let entry = match outcome {
+                            Ok(content) => json!({
+                                "subtask": subtask,
+                                "status": "ok",
+                                "content": content,
+                            }),
+                            Err(err) => json!({
+                                "subtask": subtask,
+                                "status": "error",
+                                "error": err.to_string(),
+                            }),
+                        };
+                        results[idx] = Some(entry);
+                    }
+                    Err(join_err) => {
+                        bail!("delegate subtask panicked: {join_err}");
+                    }
+                }
+            }
+
+            if let Some((idx, subtask)) = pending.next() {
+                self.spawn_delegate_task(&mut join_set, idx, subtask)?;
+                active += 1;
+            }
+        }
+
+        if results.iter().any(|entry| entry.is_none()) {
+            bail!("missing delegate results after execution");
+        }
+
+        let collected: Vec<Value> = results
+            .into_iter()
+            .map(|entry| entry.expect("guarded above"))
+            .collect();
+
+        Ok(json!({
+            "type": "delegation_batch_result",
+            "depth": self.depth + 1,
+            "requested": collected.len(),
+            "max_concurrency": limit,
+            "results": collected,
+        }))
     }
 
     async fn sleep_backoff(&self, iteration: usize) {
@@ -437,33 +549,68 @@ impl FileReader {
                         self.max_subdelegations
                     );
                 }
-                let prompt = args
-                    .get("prompt")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow!("delegate_subtask requires `prompt`"))?;
-                let prompt = prompt.to_string();
-                let child = self.spawn_child_reader();
+                let mut subtasks = Vec::new();
+
+                if let Some(subtask) = args.get("subtask").and_then(Value::as_str) {
+                    let trimmed = subtask.trim();
+                    if !trimmed.is_empty() {
+                        subtasks.push(trimmed.to_string());
+                    }
+                }
+
+                if let Some(value) = args.get("subtasks") {
+                    let arr = value
+                        .as_array()
+                        .ok_or_else(|| anyhow!("`subtasks` must be an array of strings"))?;
+                    for entry in arr {
+                        let text = entry
+                            .as_str()
+                            .ok_or_else(|| anyhow!("`subtasks` must contain only strings"))?;
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            subtasks.push(trimmed.to_string());
+                        }
+                    }
+                }
+
+                if subtasks.is_empty() {
+                    if let Some(prompt) = args.get("prompt").and_then(Value::as_str) {
+                        let trimmed = prompt.trim();
+                        if !trimmed.is_empty() {
+                            subtasks.push(trimmed.to_string());
+                        }
+                    }
+                    if let Some(value) = args.get("prompts") {
+                        let arr = value
+                            .as_array()
+                            .ok_or_else(|| anyhow!("`prompts` must be an array of strings"))?;
+                        for entry in arr {
+                            let text = entry
+                                .as_str()
+                                .ok_or_else(|| anyhow!("`prompts` must contain only strings"))?;
+                            let trimmed = text.trim();
+                            if !trimmed.is_empty() {
+                                subtasks.push(trimmed.to_string());
+                            }
+                        }
+                    }
+                }
+
+                if subtasks.is_empty() {
+                    bail!("delegate_subtask requires `subtask` or a non-empty `subtasks` array");
+                }
+
                 info!(
-                    "tool_call delegate_subtask depth={} prompt_len={}",
-                    child.depth,
-                    prompt.len()
+                    "tool_call delegate_subtask depth={} subtasks={} max_concurrency={}",
+                    self.depth + 1,
+                    subtasks.len(),
+                    DEFAULT_PARALLEL_DELEGATIONS
                 );
-                let child_messages = vec![
-                    ChatCompletionRequestSystemMessageArgs::default()
-                        .content(child.system_prompt())
-                        .build()?
-                        .into(),
-                    ChatCompletionRequestUserMessageArgs::default()
-                        .content(prompt)
-                        .build()?
-                        .into(),
-                ];
-                let result = child.run_conversation(child_messages).await?;
-                Ok(json!({
-                    "type": "delegation_result",
-                    "depth": child.depth,
-                    "content": result,
-                }))
+
+                let result = self
+                    .run_delegate_batch(subtasks, DEFAULT_PARALLEL_DELEGATIONS)
+                    .await?;
+                Ok(result)
             }
         }
     }
