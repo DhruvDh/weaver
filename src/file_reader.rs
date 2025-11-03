@@ -8,9 +8,8 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use async_openai::types::{
     ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessageArgs,
     ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
-    ChatCompletionRequestToolMessageArgs, ChatCompletionRequestUserMessageArgs, ChatCompletionTool,
-    ChatCompletionToolArgs, ChatCompletionToolType, CreateChatCompletionRequest,
-    CreateChatCompletionRequestArgs, CreateChatCompletionResponse, FunctionObjectArgs,
+    ChatCompletionRequestToolMessageArgs, ChatCompletionRequestUserMessageArgs,
+    CreateChatCompletionResponse,
 };
 use kameo::prelude::*;
 use serde_json::{Value, json};
@@ -27,6 +26,7 @@ use crate::{
         REQUEST_TIMEOUT_SECS, RETRY_BASE_DELAY_MS, RETRY_MAX_EXP, RETRY_MAX_JITTER_MS,
     },
     llm_gateway::{ChatCompletionRequest, LLMGateway},
+    tool_registry::{self, ToolArgs, ToolName},
     tools::{filesystem, search},
 };
 
@@ -37,145 +37,7 @@ Never assume content from file names alone—use `read_file_full` or `read_file_
 When tasks can be partitioned, prefer launching delegate subtasks in parallel. The `delegate_subtask` tool accepts a `subtasks` array; wrap a single instruction in an array when needed. The runtime executes up to 4 subtasks concurrently.
 Only answer after gathering the necessary context via tool calls, and reference the specific files you actually examined."#;
 
-#[derive(Clone, Copy, Debug)]
-pub enum ToolName {
-    ListDirectory,
-    ReadFileFull,
-    ReadFileRange,
-    SearchText,
-    DelegateSubtask,
-}
-
-impl ToolName {
-    pub const fn identifier(self) -> &'static str {
-        match self {
-            ToolName::ListDirectory => "list_directory",
-            ToolName::ReadFileFull => "read_file_full",
-            ToolName::ReadFileRange => "read_file_range",
-            ToolName::SearchText => "search_text",
-            ToolName::DelegateSubtask => "delegate_subtask",
-        }
-    }
-
-    pub fn description(self) -> &'static str {
-        match self {
-            ToolName::ListDirectory => {
-                "List the entries of a directory relative to the workspace root."
-            }
-            ToolName::ReadFileFull => "Read the full contents of a UTF-8 text file.",
-            ToolName::ReadFileRange => {
-                "Read a specific inclusive line range from a UTF-8 text file."
-            }
-            ToolName::SearchText => "Run a regex search (ripgrep-style) within the workspace.",
-            ToolName::DelegateSubtask => {
-                "Delegate one or more subtasks to child FileReader agents via the `subtasks` \
-                 array. Wrap single subtasks in an array when needed."
-            }
-        }
-    }
-
-    fn json_schema(self) -> Value {
-        match self {
-            ToolName::ListDirectory => json!({
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Directory path relative to workspace root. Defaults to \".\""
-                    }
-                }
-            }),
-            ToolName::ReadFileFull => json!({
-                "type": "object",
-                "required": ["path"],
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "File path relative to workspace root."
-                    }
-                }
-            }),
-            ToolName::ReadFileRange => json!({
-                "type": "object",
-                "required": ["path", "start_line", "end_line"],
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "File path relative to workspace root."
-                    },
-                    "start_line": {
-                        "type": "integer",
-                        "minimum": 1
-                    },
-                    "end_line": {
-                        "type": "integer",
-                        "minimum": 1
-                    }
-                }
-            }),
-            ToolName::SearchText => json!({
-                "type": "object",
-                "required": ["pattern"],
-                "properties": {
-                    "pattern": {
-                        "type": "string",
-                        "description": "Rust-style regular expression."
-                    },
-                    "path": {
-                        "type": "string",
-                        "description": "Optional directory to scope the search. Defaults to root."
-                    }
-                }
-            }),
-            ToolName::DelegateSubtask => json!({
-                "type": "object",
-                "required": ["subtasks"],
-                "properties": {
-                    "subtask": {
-                        "type": "string",
-                        "description": "Instruction for a delegated FileReader agent."
-                    },
-                    "subtasks": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Precise, educational description with motivation and acceptance criteria of subtasks to delegate in parallel."
-                    }
-                }
-            }),
-        }
-    }
-
-    fn from_identifier(name: &str) -> Option<Self> {
-        match name {
-            "list_directory" => Some(ToolName::ListDirectory),
-            "read_file_full" => Some(ToolName::ReadFileFull),
-            "read_file_range" => Some(ToolName::ReadFileRange),
-            "search_text" => Some(ToolName::SearchText),
-            "delegate_subtask" => Some(ToolName::DelegateSubtask),
-            _ => None,
-        }
-    }
-}
-
-const TOOL_NAMES: [ToolName; 5] = [
-    ToolName::ListDirectory,
-    ToolName::ReadFileFull,
-    ToolName::ReadFileRange,
-    ToolName::SearchText,
-    ToolName::DelegateSubtask,
-];
-
 const MASKED_PATH: &str = "<path-unavailable>";
-
-fn push_trimmed_subtask(dest: &mut Vec<String>, text: &str) -> bool {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        false
-    } else {
-        dest.push(trimmed.to_string());
-        true
-    }
-}
 
 /// Actor that exposes local filesystem utilities to LLM collaborators.
 #[derive(Actor)]
@@ -240,7 +102,7 @@ impl FileReader {
     }
 
     pub fn tool_names() -> &'static [ToolName] {
-        &TOOL_NAMES
+        tool_registry::all_tools()
     }
 
     fn spawn_child_reader(&self) -> FileReader {
@@ -361,26 +223,6 @@ impl FileReader {
         sleep(Duration::from_millis(delay_ms)).await;
     }
 
-    fn tool_specs(&self) -> Vec<ChatCompletionTool> {
-        TOOL_NAMES
-            .iter()
-            .map(|tool| {
-                ChatCompletionToolArgs::default()
-                    .r#type(ChatCompletionToolType::Function)
-                    .function(
-                        FunctionObjectArgs::default()
-                            .name(tool.identifier())
-                            .description(tool.description())
-                            .parameters(tool.json_schema())
-                            .build()
-                            .expect("tool schema"),
-                    )
-                    .build()
-                    .expect("tool")
-            })
-            .collect()
-    }
-
     fn resolve_path(&self, relative: impl AsRef<Path>) -> Result<PathBuf> {
         let rel = relative.as_ref();
         let candidate = if rel.is_absolute() {
@@ -410,10 +252,12 @@ impl FileReader {
         let tool = ToolName::from_identifier(call.function.name.as_str())
             .ok_or_else(|| anyhow!("unsupported tool call: {}", call.function.name))?;
 
-        match tool {
-            ToolName::ListDirectory => {
-                let path_str = args.get("path").and_then(Value::as_str).unwrap_or(".");
-                let path = self.resolve_path(path_str)?;
+        let parsed_args = tool_registry::parse_args(tool, &args)?;
+
+        match parsed_args {
+            ToolArgs::ListDirectory(params) => {
+                let target = params.path.as_deref().unwrap_or(".");
+                let path = self.resolve_path(target)?;
                 let entries = filesystem::list_dir(&path)
                     .await
                     .with_context(|| format!("list_directory failed for {}", path.display()))?;
@@ -436,12 +280,8 @@ impl FileReader {
                     .collect::<Vec<_>>();
                 Ok(json!({ "entries": rendered }))
             }
-            ToolName::ReadFileFull => {
-                let path_str = args
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow!("read_file_full requires `path`"))?;
-                let path = self.resolve_path(path_str)?;
+            ToolArgs::ReadFileFull(params) => {
+                let path = self.resolve_path(&params.path)?;
                 let content = filesystem::read_file_full(&path)
                     .await
                     .with_context(|| format!("read_file_full failed for {}", path.display()))?;
@@ -456,30 +296,16 @@ impl FileReader {
                     "content": content,
                 }))
             }
-            ToolName::ReadFileRange => {
-                let path_str = args
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow!("read_file_range requires `path`"))?;
-                let start_line = args
-                    .get("start_line")
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| anyhow!("read_file_range requires `start_line`"))?
-                    as usize;
-                let end_line = args
-                    .get("end_line")
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| anyhow!("read_file_range requires `end_line`"))?
-                    as usize;
-                let path = self.resolve_path(path_str)?;
-                let range = filesystem::read_file_range(&path, start_line, end_line)
+            ToolArgs::ReadFileRange(params) => {
+                let path = self.resolve_path(&params.path)?;
+                let range = filesystem::read_file_range(&path, params.start_line, params.end_line)
                     .await
                     .with_context(|| {
                         format!(
                             "read_file_range failed for {} ({}-{})",
                             path.display(),
-                            start_line,
-                            end_line
+                            params.start_line,
+                            params.end_line
                         )
                     })?;
                 info!(
@@ -498,32 +324,26 @@ impl FileReader {
                     "content": range.text,
                 }))
             }
-            ToolName::SearchText => {
-                let pattern = args
-                    .get("pattern")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow!("search_text requires `pattern`"))?;
-                let path = args
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .map(|p| self.resolve_path(p))
-                    .transpose()?
-                    .unwrap_or_else(|| self.root.clone());
+            ToolArgs::SearchText(params) => {
+                let scope = match params.path {
+                    Some(ref p) => self.resolve_path(p)?,
+                    None => self.root.clone(),
+                };
 
-                let matches = search::search_recursive(&path, pattern)
+                let matches = search::search_recursive(&scope, &params.pattern)
                     .await
                     .with_context(|| {
                         format!(
                             "search_text failed for pattern `{}` in {}",
-                            pattern,
-                            path.display()
+                            params.pattern,
+                            scope.display()
                         )
                     })?;
                 info!(
                     "tool_call search_text depth={} scope={} pattern={} match_count={}",
                     self.depth,
-                    path.display(),
-                    pattern,
+                    scope.display(),
+                    params.pattern,
                     matches.len()
                 );
                 let rendered = matches
@@ -538,7 +358,7 @@ impl FileReader {
                     .collect::<Vec<_>>();
                 Ok(json!({ "matches": rendered }))
             }
-            ToolName::DelegateSubtask => {
+            ToolArgs::DelegateSubtask(params) => {
                 if self.depth >= self.max_subdelegations {
                     bail!(
                         "delegate_subtask limit reached (depth {} >= {})",
@@ -546,43 +366,16 @@ impl FileReader {
                         self.max_subdelegations
                     );
                 }
-                let mut subtasks = Vec::new();
-
-                if let Some(single) = args.get("subtask") {
-                    let text = single
-                        .as_str()
-                        .ok_or_else(|| anyhow!("`subtask` must be a string"))?;
-                    let _ = push_trimmed_subtask(&mut subtasks, text);
-                }
-
-                let subtasks_value = args
-                    .get("subtasks")
-                    .ok_or_else(|| anyhow!("delegate_subtask requires `subtasks`"))?;
-                let arr = subtasks_value
-                    .as_array()
-                    .ok_or_else(|| anyhow!("`subtasks` must be an array of strings"))?;
-
-                subtasks.reserve(arr.len());
-                for entry in arr {
-                    let text = entry
-                        .as_str()
-                        .ok_or_else(|| anyhow!("`subtasks` must contain only strings"))?;
-                    let _ = push_trimmed_subtask(&mut subtasks, text);
-                }
-
-                if subtasks.is_empty() {
-                    bail!("delegate_subtask requires at least one non-empty subtask");
-                }
 
                 info!(
                     "tool_call delegate_subtask depth={} subtasks={} max_concurrency={}",
                     self.depth + 1,
-                    subtasks.len(),
+                    params.subtasks.len(),
                     DEFAULT_PARALLEL_DELEGATIONS
                 );
 
                 let result = self
-                    .run_delegate_batch(subtasks, DEFAULT_PARALLEL_DELEGATIONS)
+                    .run_delegate_batch(params.subtasks, DEFAULT_PARALLEL_DELEGATIONS)
                     .await?;
                 Ok(result)
             }
@@ -596,13 +389,14 @@ impl FileReader {
         let timeout_duration = Duration::from_secs(REQUEST_TIMEOUT_SECS);
         'retry: for iteration in 0..MAX_TOOL_ITERATIONS {
             debug!(iteration, "Starting LLM tool iteration");
-            let request: CreateChatCompletionRequest = CreateChatCompletionRequestArgs::default()
-                .model(self.model.clone())
-                .messages(messages.clone())
-                .temperature(DEFAULT_TEMPERATURE)
-                .top_p(DEFAULT_TOP_P)
-                .tools(self.tool_specs())
-                .build()?;
+            let tool_names = Self::tool_names().to_vec();
+            let request = ChatCompletionRequest {
+                model: self.model.clone(),
+                messages: messages.clone(),
+                temperature: DEFAULT_TEMPERATURE,
+                top_p: DEFAULT_TOP_P,
+                tool_names,
+            };
             info!(
                 "llm_request_start depth={} iteration={} messages={}",
                 self.depth,
@@ -610,8 +404,7 @@ impl FileReader {
                 messages.len()
             );
             let start = Instant::now();
-            let response_future = self.gateway.ask(ChatCompletionRequest { request });
-            let response_res = timeout(timeout_duration, response_future).await;
+            let response_res = timeout(timeout_duration, self.gateway.ask(request)).await;
             let response: CreateChatCompletionResponse = match response_res {
                 Ok(Ok(resp)) => {
                     info!(

@@ -22,6 +22,12 @@ pub const DEFAULT_PARALLEL_DELEGATIONS: usize = 4;
 /// Hard ceiling on delegate subtask parallelism to prevent runaway fan-out.
 pub const MAX_PARALLEL_DELEGATIONS: usize = 8;
 
+/// Maximum number of in-flight OpenAI requests handled by the gateway.
+pub const LLM_MAX_CONCURRENT_REQUESTS: usize = 128;
+
+/// Maximum number of retry attempts for a single OpenAI request.
+pub const LLM_MAX_RETRIES: usize = 5;
+
 /// Timeout applied to each chat-completion request (seconds).
 pub const REQUEST_TIMEOUT_SECS: u64 = 300;
 
