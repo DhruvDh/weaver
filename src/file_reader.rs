@@ -1,33 +1,29 @@
 use std::{
     env,
     path::{Path, PathBuf},
-    time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use async_openai::types::{
-    ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessageArgs,
     ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
-    ChatCompletionRequestToolMessageArgs, ChatCompletionRequestUserMessageArgs,
-    CreateChatCompletionResponse,
+    ChatCompletionRequestUserMessageArgs,
 };
-use kameo::prelude::*;
+use async_trait::async_trait;
+use kameo::{prelude::*, reply::DelegatedReply};
 use serde_json::{Value, json};
-use tokio::{
-    task::JoinSet,
-    time::{sleep, timeout},
-};
-use tracing::{debug, info, warn};
+use tokio::task::JoinSet;
 
 use crate::{
     constants::{
         DEFAULT_MAX_SUBDELEGATIONS, DEFAULT_PARALLEL_DELEGATIONS, DEFAULT_TEMPERATURE,
         DEFAULT_TOP_P, MAX_PARALLEL_DELEGATIONS, MAX_TOOL_ITERATIONS, PRETEXT_SUBDIR,
-        REQUEST_TIMEOUT_SECS, RETRY_BASE_DELAY_MS, RETRY_MAX_EXP, RETRY_MAX_JITTER_MS,
     },
     llm_gateway::{ChatCompletionRequest, LLMGateway},
-    tool_registry::{self, ToolArgs, ToolName},
-    tools::{filesystem, search},
+    tools::{
+        filesystem,
+        llm::{self, ToolInvocation, ToolName},
+        search,
+    },
 };
 
 const SYSTEM_PROMPT_TEMPLATE: &str = r#"You are Weaver's file-reading assistant assigned to explore the UNCC CS2 PreTeXt project.
@@ -38,6 +34,12 @@ When tasks can be partitioned, prefer launching delegate subtasks in parallel. T
 Only answer after gathering the necessary context via tool calls, and reference the specific files you actually examined."#;
 
 const MASKED_PATH: &str = "<path-unavailable>";
+
+/// Message used by the LLM gateway to execute a tool invocation within the
+/// file reader context.
+pub struct ExecuteTool {
+    pub invocation: llm::ToolInvocation,
+}
 
 /// Actor that exposes local filesystem utilities to LLM collaborators.
 #[derive(Actor)]
@@ -102,7 +104,7 @@ impl FileReader {
     }
 
     pub fn tool_names() -> &'static [ToolName] {
-        tool_registry::all_tools()
+        llm::all_tools()
     }
 
     fn spawn_child_reader(&self) -> FileReader {
@@ -122,17 +124,17 @@ impl FileReader {
         subtask: String,
     ) -> Result<()> {
         let child = self.spawn_child_reader();
-        let system_prompt = child.system_prompt();
-        let system_msg = ChatCompletionRequestSystemMessageArgs::default()
-            .content(system_prompt)
-            .build()?;
-        let user_msg = ChatCompletionRequestUserMessageArgs::default()
-            .content(subtask.clone())
-            .build()?;
-        let messages = vec![system_msg.into(), user_msg.into()];
-
+        let actor = FileReader::spawn(child);
         join_set.spawn(async move {
-            let outcome = child.run_conversation(messages).await;
+            let outcome = match actor
+                .ask(FileReaderQuery {
+                    prompt: subtask.clone(),
+                })
+                .await
+            {
+                Ok(content) => Ok(content),
+                Err(err) => Err(anyhow!(err)),
+            };
             (idx, subtask, outcome)
         });
         Ok(())
@@ -214,16 +216,7 @@ impl FileReader {
         }))
     }
 
-    async fn sleep_backoff(&self, iteration: usize) {
-        let exp = (iteration as u32).min(RETRY_MAX_EXP);
-        let multiplier = 1u64.checked_shl(exp).unwrap_or(u64::MAX);
-        let base_delay = RETRY_BASE_DELAY_MS.saturating_mul(multiplier).min(60_000);
-        let jitter = (iteration as u64 * 137) % (RETRY_MAX_JITTER_MS + 1);
-        let delay_ms = base_delay + jitter;
-        sleep(Duration::from_millis(delay_ms)).await;
-    }
-
-    fn resolve_path(&self, relative: impl AsRef<Path>) -> Result<PathBuf> {
+    fn resolve_workspace_path(&self, relative: impl AsRef<Path>) -> Result<PathBuf> {
         let rel = relative.as_ref();
         let candidate = if rel.is_absolute() {
             rel.to_path_buf()
@@ -239,297 +232,84 @@ impl FileReader {
         Ok(canonical)
     }
 
-    fn render_relative_path(&self, path: &Path) -> String {
+    fn render_workspace_relative_path(&self, path: &Path) -> String {
         pathdiff::diff_paths(path, &self.root)
             .and_then(|p| p.to_str().map(|s| s.to_string()))
             .unwrap_or_else(|| MASKED_PATH.to_string())
     }
 
-    async fn execute_tool(&self, call: &ChatCompletionMessageToolCall) -> Result<Value> {
-        let args: Value = serde_json::from_str(&call.function.arguments)
-            .with_context(|| format!("invalid JSON arguments for {}", call.function.name))?;
+    async fn execute_invocation(&self, invocation: ToolInvocation) -> Result<Value> {
+        invocation.into_action().execute(self).await
+    }
+}
 
-        let tool = ToolName::from_identifier(call.function.name.as_str())
-            .ok_or_else(|| anyhow!("unsupported tool call: {}", call.function.name))?;
-
-        let parsed_args = tool_registry::parse_args(tool, &args)?;
-
-        match parsed_args {
-            ToolArgs::ListDirectory(params) => {
-                let target = params.path.as_deref().unwrap_or(".");
-                let path = self.resolve_path(target)?;
-                let entries = filesystem::list_dir(&path)
-                    .await
-                    .with_context(|| format!("list_directory failed for {}", path.display()))?;
-                info!(
-                    "tool_call list_directory depth={} path={} entry_count={}",
-                    self.depth,
-                    path.display(),
-                    entries.len()
-                );
-                let rendered = entries
-                    .into_iter()
-                    .map(|entry| {
-                        json!({
-                            "name": entry.name,
-                            "path": self.render_relative_path(&entry.path),
-                            "kind": entry.kind.as_str(),
-                            "size": entry.size,
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                Ok(json!({ "entries": rendered }))
-            }
-            ToolArgs::ReadFileFull(params) => {
-                let path = self.resolve_path(&params.path)?;
-                let content = filesystem::read_file_full(&path)
-                    .await
-                    .with_context(|| format!("read_file_full failed for {}", path.display()))?;
-                info!(
-                    "tool_call read_file_full depth={} path={} bytes={}",
-                    self.depth,
-                    path.display(),
-                    content.len()
-                );
-                Ok(json!({
-                    "path": self.render_relative_path(&path),
-                    "content": content,
-                }))
-            }
-            ToolArgs::ReadFileRange(params) => {
-                let path = self.resolve_path(&params.path)?;
-                let range = filesystem::read_file_range(&path, params.start_line, params.end_line)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "read_file_range failed for {} ({}-{})",
-                            path.display(),
-                            params.start_line,
-                            params.end_line
-                        )
-                    })?;
-                info!(
-                    "tool_call read_file_range depth={} path={} start_line={} end_line={} \
-                     line_count={}",
-                    self.depth,
-                    range.path.display(),
-                    range.start_line,
-                    range.end_line,
-                    range.end_line.saturating_sub(range.start_line) + 1
-                );
-                Ok(json!({
-                    "path": self.render_relative_path(&range.path),
-                    "start_line": range.start_line,
-                    "end_line": range.end_line,
-                    "content": range.text,
-                }))
-            }
-            ToolArgs::SearchText(params) => {
-                let scope = match params.path {
-                    Some(ref p) => self.resolve_path(p)?,
-                    None => self.root.clone(),
-                };
-
-                let matches = search::search_recursive(&scope, &params.pattern)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "search_text failed for pattern `{}` in {}",
-                            params.pattern,
-                            scope.display()
-                        )
-                    })?;
-                info!(
-                    "tool_call search_text depth={} scope={} pattern={} match_count={}",
-                    self.depth,
-                    scope.display(),
-                    params.pattern,
-                    matches.len()
-                );
-                let rendered = matches
-                    .into_iter()
-                    .map(|m| {
-                        json!({
-                            "path": self.render_relative_path(&m.path),
-                            "line_number": m.line_number,
-                            "line": m.context,
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                Ok(json!({ "matches": rendered }))
-            }
-            ToolArgs::DelegateSubtask(params) => {
-                if self.depth >= self.max_subdelegations {
-                    bail!(
-                        "delegate_subtask limit reached (depth {} >= {})",
-                        self.depth,
-                        self.max_subdelegations
-                    );
-                }
-
-                info!(
-                    "tool_call delegate_subtask depth={} subtasks={} max_concurrency={}",
-                    self.depth + 1,
-                    params.subtasks.len(),
-                    DEFAULT_PARALLEL_DELEGATIONS
-                );
-
-                let result = self
-                    .run_delegate_batch(params.subtasks, DEFAULT_PARALLEL_DELEGATIONS)
-                    .await?;
-                Ok(result)
-            }
-        }
+#[async_trait]
+impl llm::ToolHost for FileReader {
+    fn depth(&self) -> usize {
+        self.depth
     }
 
-    async fn run_conversation(
+    fn max_subdelegations(&self) -> usize {
+        self.max_subdelegations
+    }
+
+    fn workspace_root(&self) -> &Path {
+        &self.root
+    }
+
+    fn resolve_path(&self, relative: &str) -> Result<PathBuf> {
+        self.resolve_workspace_path(relative)
+    }
+
+    fn render_relative_path(&self, path: &Path) -> String {
+        self.render_workspace_relative_path(path)
+    }
+
+    async fn list_directory(&self, path: &Path) -> Result<Vec<filesystem::DirEntryInfo>> {
+        filesystem::list_dir(path)
+            .await
+            .with_context(|| format!("list_directory failed for {}", path.display()))
+    }
+
+    async fn read_file_full(&self, path: &Path) -> Result<String> {
+        filesystem::read_file_full(path)
+            .await
+            .with_context(|| format!("read_file_full failed for {}", path.display()))
+    }
+
+    async fn read_file_range(
         &self,
-        mut messages: Vec<ChatCompletionRequestMessage>,
-    ) -> Result<String> {
-        let timeout_duration = Duration::from_secs(REQUEST_TIMEOUT_SECS);
-        'retry: for iteration in 0..MAX_TOOL_ITERATIONS {
-            debug!(iteration, "Starting LLM tool iteration");
-            let tool_names = Self::tool_names().to_vec();
-            let request = ChatCompletionRequest {
-                model: self.model.clone(),
-                messages: messages.clone(),
-                temperature: DEFAULT_TEMPERATURE,
-                top_p: DEFAULT_TOP_P,
-                tool_names,
-            };
-            info!(
-                "llm_request_start depth={} iteration={} messages={}",
-                self.depth,
-                iteration,
-                messages.len()
-            );
-            let start = Instant::now();
-            let response_res = timeout(timeout_duration, self.gateway.ask(request)).await;
-            let response: CreateChatCompletionResponse = match response_res {
-                Ok(Ok(resp)) => {
-                    info!(
-                        "llm_request_ok depth={} iteration={} elapsed_ms={}",
-                        self.depth,
-                        iteration,
-                        start.elapsed().as_millis()
-                    );
-                    resp
-                }
-                Ok(Err(err)) => {
-                    warn!(
-                        "llm_request_error depth={} iteration={} error={}",
-                        self.depth, iteration, err
-                    );
-                    self.sleep_backoff(iteration).await;
-                    continue 'retry;
-                }
-                Err(_) => {
-                    warn!(
-                        "llm_request_timeout depth={} iteration={} timeout_secs={}",
-                        self.depth,
-                        iteration,
-                        timeout_duration.as_secs()
-                    );
-                    self.sleep_backoff(iteration).await;
-                    continue 'retry;
-                }
-            };
-            let mut choices = response.choices.into_iter();
-            let message = choices
-                .next()
-                .ok_or_else(|| anyhow!("chat completion returned no choices"))?
-                .message;
+        path: &Path,
+        start_line: usize,
+        end_line: usize,
+    ) -> Result<filesystem::FileRange> {
+        filesystem::read_file_range(path, start_line, end_line)
+            .await
+            .with_context(|| {
+                format!(
+                    "read_file_range failed for {} ({}-{})",
+                    path.display(),
+                    start_line,
+                    end_line
+                )
+            })
+    }
 
-            debug!(
-                iteration,
-                role = ?message.role,
-                has_content = message.content.as_ref().map(|c| !c.trim().is_empty()),
-                tool_call_count = message.tool_calls.as_ref().map(|c| c.len()),
-                content = ?message.content,
-                refusal = ?message.refusal,
-                "Assistant message received"
-            );
+    async fn search_recursive(
+        &self,
+        scope: &Path,
+        pattern: &str,
+    ) -> Result<Vec<search::SearchMatch>> {
+        search::search_recursive(scope, pattern)
+            .await
+            .with_context(|| {
+                format!("search_text failed for pattern `{}` in {}", pattern, scope.display())
+            })
+    }
 
-            match message.tool_calls {
-                Some(tool_calls) if !tool_calls.is_empty() => {
-                    debug!(
-                        iteration,
-                        tool_call_count = tool_calls.len(),
-                        "Assistant requested tool calls"
-                    );
-                    let assistant_msg = ChatCompletionRequestAssistantMessageArgs::default()
-                        .tool_calls(tool_calls.clone())
-                        .build()?
-                        .into();
-                    messages.push(assistant_msg);
-
-                    for tool_call in tool_calls {
-                        debug!(
-                            iteration,
-                            tool = tool_call.function.name.as_str(),
-                            "Executing assistant-requested tool"
-                        );
-                        let tool_name = tool_call.function.name.clone();
-                        let tool_msg = match self.execute_tool(&tool_call).await {
-                            Ok(result) => ChatCompletionRequestToolMessageArgs::default()
-                                .tool_call_id(tool_call.id.clone())
-                                .content(result.to_string())
-                                .build()?
-                                .into(),
-                            Err(err) => {
-                                warn!(
-                                    "tool_error tool={} iteration={} error={}",
-                                    tool_name, iteration, err
-                                );
-                                let args_json: Value =
-                                    serde_json::from_str(&tool_call.function.arguments)
-                                        .unwrap_or_else(|_| {
-                                            Value::String(tool_call.function.arguments.clone())
-                                        });
-                                let error_payload = json!({
-                                    "type": "tool_error",
-                                    "tool": tool_name,
-                                    "arguments": args_json,
-                                    "message": err.to_string(),
-                                });
-                                ChatCompletionRequestToolMessageArgs::default()
-                                    .tool_call_id(tool_call.id.clone())
-                                    .content(error_payload.to_string())
-                                    .build()?
-                                    .into()
-                            }
-                        };
-                        messages.push(tool_msg);
-                    }
-                    continue;
-                }
-                Some(empty_calls) => {
-                    debug!(
-                        iteration,
-                        tool_call_count = empty_calls.len(),
-                        "Assistant returned empty tool call list; treating as no tool calls"
-                    );
-                }
-                None => {}
-            }
-
-            if let Some(content) = message.content {
-                let trimmed = content.trim();
-                if trimmed.is_empty() {
-                    debug!(iteration, "Assistant content was empty; continuing");
-                } else {
-                    debug!(iteration, "Assistant returned final content");
-                    return Ok(content);
-                }
-            }
-
-            debug!(iteration, "Assistant response had no tool calls and no content; continuing");
-        }
-
-        bail!(
-            "LLM tool loop did not terminate with a message after {} iterations",
-            MAX_TOOL_ITERATIONS
-        );
+    async fn delegate_subtasks(&self, subtasks: Vec<String>) -> Result<Value> {
+        self.run_delegate_batch(subtasks, DEFAULT_PARALLEL_DELEGATIONS)
+            .await
     }
 }
 
@@ -539,23 +319,56 @@ pub struct FileReaderQuery {
 }
 
 impl Message<FileReaderQuery> for FileReader {
-    type Reply = Result<String>;
+    type Reply = DelegatedReply<Result<String>>;
 
     async fn handle(
         &mut self,
         FileReaderQuery { prompt }: FileReaderQuery,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let tool_host = ctx.actor_ref().clone();
+        let gateway = self.gateway.clone();
+        let system_prompt = self.system_prompt();
+        let model = self.model.clone();
+        let tool_names = Self::tool_names().to_vec();
+
+        ctx.spawn(async move {
+            let system_msg: ChatCompletionRequestMessage =
+                ChatCompletionRequestSystemMessageArgs::default()
+                    .content(system_prompt)
+                    .build()
+                    .map_err(|err| anyhow!(err))?
+                    .into();
+            let user_msg: ChatCompletionRequestMessage =
+                ChatCompletionRequestUserMessageArgs::default()
+                    .content(prompt)
+                    .build()
+                    .map_err(|err| anyhow!(err))?
+                    .into();
+            let request = ChatCompletionRequest {
+                model,
+                messages: vec![system_msg, user_msg],
+                temperature: DEFAULT_TEMPERATURE,
+                top_p: DEFAULT_TOP_P,
+                tool_names,
+                max_iterations: MAX_TOOL_ITERATIONS,
+                tool_host,
+            };
+
+            let response = gateway.ask(request).await.map_err(|err| anyhow!(err))?;
+            Ok(response)
+        })
+    }
+}
+
+impl Message<ExecuteTool> for FileReader {
+    type Reply = Result<Value>;
+
+    async fn handle(
+        &mut self,
+        ExecuteTool { invocation }: ExecuteTool,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let messages: Vec<ChatCompletionRequestMessage> = vec![
-            ChatCompletionRequestSystemMessageArgs::default()
-                .content(self.system_prompt())
-                .build()?
-                .into(),
-            ChatCompletionRequestUserMessageArgs::default()
-                .content(prompt)
-                .build()?
-                .into(),
-        ];
-        self.run_conversation(messages).await
+        self.execute_invocation(invocation).await
     }
 }
