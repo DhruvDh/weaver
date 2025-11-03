@@ -1,5 +1,6 @@
 mod adder;
 mod edge_synth;
+mod events;
 mod graph;
 mod llm;
 mod model;
@@ -11,11 +12,12 @@ use std::{env, fmt, path::PathBuf};
 
 use adder::{AddEdges, AddNodes, ExportDot, GraphAdder, Inventory, Summarize};
 use edge_synth::{EdgeGenerator, EdgeGeneratorConfig, GenerateEdges};
+use events::DomainEvent;
 use graph::GraphStore;
 use kameo::Actor;
 use node_synth::{GenerateNodes, NodeGenerator, NodeGeneratorConfig};
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{Level, info};
 use viz::Viz;
 
 type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -130,6 +132,12 @@ fn parse_bool(value: &str) -> Option<bool> {
 
 #[tokio::main]
 async fn main() -> Result<(), DynError> {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(Level::INFO)
+        .with_target(false)
+        .compact()
+        .try_init();
+
     let config = match parse_args() {
         Ok(cfg) => cfg,
         Err(err) => {
@@ -145,7 +153,7 @@ async fn main() -> Result<(), DynError> {
 async fn run_mvp(config: RunConfig) -> Result<(), DynError> {
     info!(topic = %config.topic, use_llm = config.use_llm, "starting run");
 
-    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let (event_tx, event_rx) = mpsc::unbounded_channel::<DomainEvent>();
     tokio::spawn(async move {
         Viz::new(true).run(event_rx).await;
     });

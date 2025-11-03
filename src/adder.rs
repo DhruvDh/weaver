@@ -9,13 +9,13 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::{
+    events::DomainEvent,
     graph::GraphStore,
     model::{
         ALLOWED_TAGS, Decision, Edge, EdgeProposal, Granularity, InventoryEntry, MAX_NODE_LEVEL,
         Node, NodeKind, NodeProposal, Relation, clean_text, normalize_text,
     },
     summary::{Summary, TopLearningOutcome},
-    viz::Event,
 };
 
 const MAX_TAGS_PER_NODE: usize = 3;
@@ -41,13 +41,13 @@ pub struct ExportDot;
 #[derive(Debug, Actor)]
 pub struct GraphAdder {
     store:        GraphStore,
-    event_sender: Option<UnboundedSender<Event>>,
+    event_sender: Option<UnboundedSender<DomainEvent>>,
 }
 
 impl GraphAdder {
     pub fn with_event_sender(
         store: GraphStore,
-        event_sender: Option<UnboundedSender<Event>>,
+        event_sender: Option<UnboundedSender<DomainEvent>>,
     ) -> Self {
         Self {
             store,
@@ -72,6 +72,7 @@ impl GraphAdder {
         proposal: NodeProposal,
         batch_seen: &mut HashSet<String>,
     ) -> Decision {
+        let original = proposal.clone();
         let NodeProposal {
             kind,
             granularity,
@@ -83,9 +84,9 @@ impl GraphAdder {
         if granularity != Granularity::Sentence {
             let reason = "granularity must be sentence";
             warn!(reason = reason, "node.rejected");
-            self.emit_event(Event::NodeRejected {
-                text,
-                reason: reason.to_string(),
+            self.emit_event(DomainEvent::NodeRejected {
+                proposal: original,
+                reason:   reason.to_string(),
             });
             return Decision::rejected(reason);
         }
@@ -93,9 +94,15 @@ impl GraphAdder {
         if level > MAX_NODE_LEVEL {
             let reason = "level must be between 0 and 3";
             warn!(reason = reason, "node.rejected");
-            self.emit_event(Event::NodeRejected {
-                text,
-                reason: reason.to_string(),
+            self.emit_event(DomainEvent::NodeRejected {
+                proposal: NodeProposal {
+                    kind: kind.clone(),
+                    granularity,
+                    level,
+                    text,
+                    tags: tags.clone(),
+                },
+                reason:   reason.to_string(),
             });
             return Decision::rejected(reason);
         }
@@ -104,9 +111,15 @@ impl GraphAdder {
         if cleaned_text.is_empty() {
             let reason = "node text is empty after trimming";
             warn!(reason = reason, "node.rejected");
-            self.emit_event(Event::NodeRejected {
-                text,
-                reason: reason.to_string(),
+            self.emit_event(DomainEvent::NodeRejected {
+                proposal: NodeProposal {
+                    kind: kind.clone(),
+                    granularity,
+                    level,
+                    text,
+                    tags: tags.clone(),
+                },
+                reason:   reason.to_string(),
             });
             return Decision::rejected(reason);
         }
@@ -114,9 +127,15 @@ impl GraphAdder {
         if !Self::is_single_sentence(&cleaned_text) {
             let reason = "node text must be a single sentence";
             warn!(reason = reason, "node.rejected");
-            self.emit_event(Event::NodeRejected {
-                text:   cleaned_text,
-                reason: reason.to_string(),
+            self.emit_event(DomainEvent::NodeRejected {
+                proposal: NodeProposal {
+                    kind: kind.clone(),
+                    granularity,
+                    level,
+                    text: cleaned_text.clone(),
+                    tags: tags.clone(),
+                },
+                reason:   reason.to_string(),
             });
             return Decision::rejected(reason);
         }
@@ -126,9 +145,15 @@ impl GraphAdder {
             if !(lowered.starts_with("i can ") || lowered.starts_with("students can ")) {
                 let reason = "learning outcomes must start with 'I can' or 'Students can'";
                 warn!(reason = reason, "node.rejected");
-                self.emit_event(Event::NodeRejected {
-                    text:   cleaned_text,
-                    reason: reason.to_string(),
+                self.emit_event(DomainEvent::NodeRejected {
+                    proposal: NodeProposal {
+                        kind: kind.clone(),
+                        granularity,
+                        level,
+                        text: cleaned_text.clone(),
+                        tags: tags.clone(),
+                    },
+                    reason:   reason.to_string(),
                 });
                 return Decision::rejected(reason);
             }
@@ -137,9 +162,15 @@ impl GraphAdder {
         if !batch_seen.insert(normalize_text(&cleaned_text)) {
             let reason = "duplicate node within batch";
             warn!(reason = reason, "node.rejected");
-            self.emit_event(Event::NodeRejected {
-                text:   cleaned_text,
-                reason: reason.to_string(),
+            self.emit_event(DomainEvent::NodeRejected {
+                proposal: NodeProposal {
+                    kind: kind.clone(),
+                    granularity,
+                    level,
+                    text: cleaned_text.clone(),
+                    tags: tags.clone(),
+                },
+                reason:   reason.to_string(),
             });
             return Decision::rejected(reason);
         }
@@ -147,9 +178,15 @@ impl GraphAdder {
         if self.store.find_by_text(&cleaned_text).is_some() {
             let reason = "duplicate node already present";
             warn!(reason = reason, "node.rejected");
-            self.emit_event(Event::NodeRejected {
-                text:   cleaned_text,
-                reason: reason.to_string(),
+            self.emit_event(DomainEvent::NodeRejected {
+                proposal: NodeProposal {
+                    kind: kind.clone(),
+                    granularity,
+                    level,
+                    text: cleaned_text.clone(),
+                    tags: tags.clone(),
+                },
+                reason:   reason.to_string(),
             });
             return Decision::rejected(reason);
         }
@@ -169,7 +206,7 @@ impl GraphAdder {
         self.store.add_node(node);
 
         info!(node_id = %node_id, kind = ?kind, level, "node.accepted");
-        self.emit_event(Event::NodeAccepted {
+        self.emit_event(DomainEvent::NodeAccepted {
             id: node_id,
             kind,
             level,
@@ -197,6 +234,7 @@ impl GraphAdder {
         proposal: EdgeProposal,
         batch_seen: &mut HashSet<(Uuid, Uuid, Relation)>,
     ) -> Decision {
+        let original = proposal.clone();
         let EdgeProposal {
             relation,
             from_id,
@@ -208,9 +246,9 @@ impl GraphAdder {
         if !batch_seen.insert(key) {
             let reason = "duplicate edge within batch";
             warn!(reason = reason, relation = ?relation, "edge.rejected");
-            self.emit_event(Event::EdgeRejected {
-                relation,
-                reason: reason.to_string(),
+            self.emit_event(DomainEvent::EdgeRejected {
+                proposal: original,
+                reason:   reason.to_string(),
             });
             return Decision::rejected(reason);
         }
@@ -218,9 +256,14 @@ impl GraphAdder {
         let Some(from_index) = self.store.find_by_id(&from_id) else {
             let reason = format!("unknown from_id {}", from_id);
             warn!(relation = ?relation, from_id = %from_id, reason = %reason, "edge.rejected");
-            self.emit_event(Event::EdgeRejected {
-                relation,
-                reason: reason.clone(),
+            self.emit_event(DomainEvent::EdgeRejected {
+                proposal: EdgeProposal {
+                    relation: relation.clone(),
+                    from_id,
+                    to_id,
+                    rationale: rationale.clone(),
+                },
+                reason:   reason.clone(),
             });
             return Decision::rejected(reason);
         };
@@ -228,9 +271,14 @@ impl GraphAdder {
         let Some(to_index) = self.store.find_by_id(&to_id) else {
             let reason = format!("unknown to_id {}", to_id);
             warn!(relation = ?relation, to_id = %to_id, reason = %reason, "edge.rejected");
-            self.emit_event(Event::EdgeRejected {
-                relation,
-                reason: reason.clone(),
+            self.emit_event(DomainEvent::EdgeRejected {
+                proposal: EdgeProposal {
+                    relation: relation.clone(),
+                    from_id,
+                    to_id,
+                    rationale: rationale.clone(),
+                },
+                reason:   reason.clone(),
             });
             return Decision::rejected(reason);
         };
@@ -238,9 +286,14 @@ impl GraphAdder {
         if from_index == to_index {
             let reason = "self-loops are not allowed";
             warn!(relation = ?relation, reason = reason, "edge.rejected");
-            self.emit_event(Event::EdgeRejected {
-                relation,
-                reason: reason.to_string(),
+            self.emit_event(DomainEvent::EdgeRejected {
+                proposal: EdgeProposal {
+                    relation: relation.clone(),
+                    from_id,
+                    to_id,
+                    rationale: rationale.clone(),
+                },
+                reason:   reason.to_string(),
             });
             return Decision::rejected(reason);
         }
@@ -251,9 +304,14 @@ impl GraphAdder {
         {
             let reason = "edge already exists";
             warn!(relation = ?relation, reason = reason, "edge.rejected");
-            self.emit_event(Event::EdgeRejected {
-                relation,
-                reason: reason.to_string(),
+            self.emit_event(DomainEvent::EdgeRejected {
+                proposal: EdgeProposal {
+                    relation: relation.clone(),
+                    from_id,
+                    to_id,
+                    rationale: rationale.clone(),
+                },
+                reason:   reason.to_string(),
             });
             return Decision::rejected(reason);
         }
@@ -261,9 +319,14 @@ impl GraphAdder {
         let Some(from_node) = self.store.node(from_index).cloned() else {
             let reason = "from node missing from store";
             warn!(relation = ?relation, reason = reason, "edge.rejected");
-            self.emit_event(Event::EdgeRejected {
-                relation,
-                reason: reason.to_string(),
+            self.emit_event(DomainEvent::EdgeRejected {
+                proposal: EdgeProposal {
+                    relation: relation.clone(),
+                    from_id,
+                    to_id,
+                    rationale: rationale.clone(),
+                },
+                reason:   reason.to_string(),
             });
             return Decision::rejected(reason);
         };
@@ -271,9 +334,14 @@ impl GraphAdder {
         let Some(to_node) = self.store.node(to_index).cloned() else {
             let reason = "to node missing from store";
             warn!(relation = ?relation, reason = reason, "edge.rejected");
-            self.emit_event(Event::EdgeRejected {
-                relation,
-                reason: reason.to_string(),
+            self.emit_event(DomainEvent::EdgeRejected {
+                proposal: EdgeProposal {
+                    relation: relation.clone(),
+                    from_id,
+                    to_id,
+                    rationale: rationale.clone(),
+                },
+                reason:   reason.to_string(),
             });
             return Decision::rejected(reason);
         };
@@ -283,9 +351,14 @@ impl GraphAdder {
         {
             let reason = "edge would introduce a prerequisite cycle";
             warn!(relation = ?relation, reason = reason, "edge.rejected");
-            self.emit_event(Event::EdgeRejected {
-                relation,
-                reason: reason.to_string(),
+            self.emit_event(DomainEvent::EdgeRejected {
+                proposal: EdgeProposal {
+                    relation: relation.clone(),
+                    from_id,
+                    to_id,
+                    rationale: rationale.clone(),
+                },
+                reason:   reason.to_string(),
             });
             return Decision::rejected(reason);
         }
@@ -295,9 +368,14 @@ impl GraphAdder {
         {
             let reason = "prerequisite edges must originate from a concept";
             warn!(relation = ?relation, reason = reason, "edge.rejected");
-            self.emit_event(Event::EdgeRejected {
-                relation,
-                reason: reason.to_string(),
+            self.emit_event(DomainEvent::EdgeRejected {
+                proposal: EdgeProposal {
+                    relation: relation.clone(),
+                    from_id,
+                    to_id,
+                    rationale: rationale.clone(),
+                },
+                reason:   reason.to_string(),
             });
             return Decision::rejected(reason);
         }
@@ -307,9 +385,14 @@ impl GraphAdder {
         {
             let reason = "prerequisite edges must target a concept or learning outcome";
             warn!(relation = ?relation, reason = reason, "edge.rejected");
-            self.emit_event(Event::EdgeRejected {
-                relation,
-                reason: reason.to_string(),
+            self.emit_event(DomainEvent::EdgeRejected {
+                proposal: EdgeProposal {
+                    relation: relation.clone(),
+                    from_id,
+                    to_id,
+                    rationale: rationale.clone(),
+                },
+                reason:   reason.to_string(),
             });
             return Decision::rejected(reason);
         }
@@ -317,9 +400,14 @@ impl GraphAdder {
         if matches!(relation, Relation::PrerequisiteFor) && from_node.level > to_node.level {
             let reason = "prerequisite edges must not decrease level";
             warn!(relation = ?relation, reason = reason, "edge.rejected");
-            self.emit_event(Event::EdgeRejected {
-                relation,
-                reason: reason.to_string(),
+            self.emit_event(DomainEvent::EdgeRejected {
+                proposal: EdgeProposal {
+                    relation: relation.clone(),
+                    from_id,
+                    to_id,
+                    rationale: rationale.clone(),
+                },
+                reason:   reason.to_string(),
             });
             return Decision::rejected(reason);
         }
@@ -328,9 +416,14 @@ impl GraphAdder {
         if rationale.is_empty() {
             let reason = "edge rationale missing";
             warn!(relation = ?relation, reason = reason, "edge.rejected");
-            self.emit_event(Event::EdgeRejected {
-                relation,
-                reason: reason.to_string(),
+            self.emit_event(DomainEvent::EdgeRejected {
+                proposal: EdgeProposal {
+                    relation: relation.clone(),
+                    from_id,
+                    to_id,
+                    rationale: rationale.to_string(),
+                },
+                reason:   reason.to_string(),
             });
             return Decision::rejected(reason);
         }
@@ -348,7 +441,7 @@ impl GraphAdder {
 
         info!(relation = ?relation, from = %from_id, to = %to_id, "edge.accepted");
 
-        self.emit_event(Event::EdgeAccepted {
+        self.emit_event(DomainEvent::EdgeAccepted {
             relation,
             from: from_id,
             to: to_id,
@@ -408,7 +501,7 @@ impl GraphAdder {
         matches!(trimmed.chars().last(), Some('.') | Some('!') | Some('?')) && ender_count == 1
     }
 
-    fn emit_event(&self, event: Event) {
+    fn emit_event(&self, event: DomainEvent) {
         if let Some(sender) = &self.event_sender {
             let _ = sender.send(event);
         }
@@ -464,7 +557,7 @@ impl Message<Summarize> for GraphAdder {
         let summary = self.summarize();
 
         for TopLearningOutcome { id, text, supports } in &summary.top_learning_outcomes {
-            self.emit_event(Event::SummaryLine {
+            self.emit_event(DomainEvent::SummaryLine {
                 message: format!("LO {id} ({supports} supports): {}", text),
             });
         }
@@ -490,7 +583,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::model::{Granularity, NodeKind};
+    use crate::model::{Granularity, NodeKind, Relation};
 
     fn sample_concept(text: &str) -> NodeProposal {
         NodeProposal {
@@ -597,5 +690,86 @@ mod tests {
         let dot = adder.store.export_dot();
         assert!(dot.contains("Concept A explores closures"));
         assert!(dot.contains("supports"));
+    }
+
+    #[test]
+    fn test_edge_missing_rationale_rejected() {
+        let mut adder = GraphAdder::with_event_sender(GraphStore::new(), None);
+
+        let decisions = adder.handle_add_nodes(vec![
+            sample_concept("Concept A ensures code compiles."),
+            sample_concept("Concept B adds error handling."),
+        ]);
+        let ids: Vec<Uuid> = decisions.iter().filter_map(|d| d.assigned_id).collect();
+
+        let decisions = adder.handle_add_edges(vec![EdgeProposal {
+            relation:  Relation::Supports,
+            from_id:   ids[0],
+            to_id:     ids[1],
+            rationale: "   ".to_string(),
+        }]);
+
+        assert!(!decisions[0].accepted, "edge with whitespace-only rationale must be rejected");
+        assert_eq!(decisions[0].reason.as_deref(), Some("edge rationale missing"));
+    }
+
+    #[test]
+    fn test_support_self_loop_rejected() {
+        let mut adder = GraphAdder::with_event_sender(GraphStore::new(), None);
+
+        let decisions =
+            adder.handle_add_nodes(vec![sample_concept("Concept A documents invariants.")]);
+        let node_id = decisions[0].assigned_id.expect("node should be accepted");
+
+        let decisions = adder.handle_add_edges(vec![EdgeProposal {
+            relation:  Relation::Supports,
+            from_id:   node_id,
+            to_id:     node_id,
+            rationale: "Self references do not add new knowledge.".to_string(),
+        }]);
+
+        assert!(!decisions[0].accepted, "self-loop supports edges must be rejected");
+        assert_eq!(decisions[0].reason.as_deref(), Some("self-loops are not allowed"));
+    }
+
+    #[test]
+    fn test_duplicate_edge_same_relation_rejected() {
+        let mut adder = GraphAdder::with_event_sender(GraphStore::new(), None);
+
+        let decisions = adder.handle_add_nodes(vec![
+            sample_concept("Concept A introduces algebraic data types."),
+            sample_concept("Concept B uses algebraic data types in pattern matching."),
+        ]);
+        let ids: Vec<Uuid> = decisions.iter().filter_map(|d| d.assigned_id).collect();
+
+        let edges = vec![
+            EdgeProposal {
+                relation:  Relation::Supports,
+                from_id:   ids[0],
+                to_id:     ids[1],
+                rationale: "Concept A examples support Concept B exercises.".to_string(),
+            },
+            EdgeProposal {
+                relation:  Relation::Supports,
+                from_id:   ids[0],
+                to_id:     ids[1],
+                rationale: "Duplicate relation should be rejected.".to_string(),
+            },
+            EdgeProposal {
+                relation:  Relation::PrerequisiteFor,
+                from_id:   ids[0],
+                to_id:     ids[1],
+                rationale: "Concept A must precede Concept B.".to_string(),
+            },
+        ];
+
+        let decisions = adder.handle_add_edges(edges);
+        assert!(decisions[0].accepted, "first edge should be accepted");
+        assert!(!decisions[1].accepted, "duplicate supports edge should be rejected");
+        assert_eq!(decisions[1].reason.as_deref(), Some("duplicate edge within batch"));
+        assert!(
+            decisions[2].accepted,
+            "different relation on same pair should be accepted when valid"
+        );
     }
 }

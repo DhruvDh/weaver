@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use rerun::{
     GraphEdges, GraphNodes, RecordingStream, RecordingStreamBuilder, archetypes::TextLog,
@@ -9,37 +9,9 @@ use uuid::Uuid;
 
 use crate::{
     edge_synth::truncate_sentence,
+    events::DomainEvent,
     model::{NodeKind, Relation},
 };
-
-/// Events emitted by the GraphAdder for visualization purposes.
-#[derive(Debug, Clone)]
-pub enum Event {
-    NodeAccepted {
-        id:    Uuid,
-        kind:  NodeKind,
-        level: u8,
-        tags:  Option<Vec<String>>,
-        text:  String,
-    },
-    NodeRejected {
-        text:   String,
-        reason: String,
-    },
-    EdgeAccepted {
-        relation:  Relation,
-        from:      Uuid,
-        to:        Uuid,
-        rationale: String,
-    },
-    EdgeRejected {
-        relation: Relation,
-        reason:   String,
-    },
-    SummaryLine {
-        message: String,
-    },
-}
 
 #[derive(Debug, Clone)]
 struct NodeCache {
@@ -55,10 +27,10 @@ struct NodeCache {
 /// Rerun-backed visualizer actor state.
 #[derive(Debug)]
 pub struct Viz {
-    stream:       Option<RecordingStream>,
-    nodes:        HashMap<Uuid, NodeCache>,
-    edges:        Vec<(Uuid, Uuid, Relation, String)>,
-    level_counts: HashMap<u8, usize>,
+    stream:     Option<RecordingStream>,
+    nodes:      HashMap<Uuid, NodeCache>,
+    edges:      Vec<(Uuid, Uuid, Relation, String)>,
+    next_order: usize,
 }
 
 impl Viz {
@@ -73,42 +45,47 @@ impl Viz {
             stream,
             nodes: HashMap::new(),
             edges: Vec::new(),
-            level_counts: HashMap::new(),
+            next_order: 0,
         }
     }
 
-    pub async fn run(mut self, mut rx: UnboundedReceiver<Event>) {
+    pub async fn run(mut self, mut rx: UnboundedReceiver<DomainEvent>) {
         while let Some(event) = rx.recv().await {
             self.handle_event(event);
         }
     }
 
-    fn handle_event(&mut self, event: Event) {
+    fn handle_event(&mut self, event: DomainEvent) {
         match event {
-            Event::NodeAccepted {
+            DomainEvent::NodeAccepted {
                 id,
                 kind,
                 level,
                 tags,
                 text,
             } => self.handle_node_accepted(id, kind, level, tags, text),
-            Event::NodeRejected { text, reason } => self.log_text(
-                "graph/nodes_rejected",
-                TextLogLevel::WARN,
-                format!("REJECT node {}: {reason}", truncate_sentence(&text)),
-            ),
-            Event::EdgeAccepted {
+            DomainEvent::NodeRejected { proposal, reason } => {
+                let text = truncate_sentence(&proposal.text);
+                self.log_text(
+                    "graph/nodes_rejected",
+                    TextLogLevel::WARN,
+                    format!("REJECT node {}: {reason}", text),
+                );
+            }
+            DomainEvent::EdgeAccepted {
                 relation,
                 from,
                 to,
                 rationale,
             } => self.handle_edge_accepted(relation, from, to, rationale),
-            Event::EdgeRejected { relation, reason } => self.log_text(
-                "graph/edges_rejected",
-                TextLogLevel::WARN,
-                format!("REJECT edge {:?}: {reason}", relation),
-            ),
-            Event::SummaryLine { message } => {
+            DomainEvent::EdgeRejected { proposal, reason } => {
+                self.log_text(
+                    "graph/edges_rejected",
+                    TextLogLevel::WARN,
+                    format!("REJECT edge {:?}: {reason}", proposal.relation),
+                );
+            }
+            DomainEvent::SummaryLine { message } => {
                 self.log_text("graph/summary", TextLogLevel::INFO, message);
             }
         }
@@ -125,9 +102,8 @@ impl Viz {
         let order = match self.nodes.get(&id) {
             Some(cache) => cache.order,
             None => {
-                let entry = self.level_counts.entry(level).or_insert(0);
-                let current = *entry;
-                *entry += 1;
+                let current = self.next_order;
+                self.next_order += 1;
                 current
             }
         };
@@ -195,12 +171,25 @@ impl Viz {
             return;
         }
 
+        let ranks = compute_prerequisite_ranks(
+            self.nodes.keys().copied(),
+            self.edges.iter().filter_map(|(from, to, relation, _)| {
+                if matches!(relation, Relation::PrerequisiteFor) {
+                    Some((*from, *to))
+                } else {
+                    None
+                }
+            }),
+        );
+
         let mut entries: Vec<_> = self.nodes.iter().collect();
         entries.sort_by(|(id_a, cache_a), (id_b, cache_b)| {
-            cache_a
-                .level
-                .cmp(&cache_b.level)
+            let rank_a = ranks.get(id_a).copied().unwrap_or(0);
+            let rank_b = ranks.get(id_b).copied().unwrap_or(0);
+            rank_a
+                .cmp(&rank_b)
                 .then_with(|| cache_a.order.cmp(&cache_b.order))
+                .then_with(|| cache_a.level.cmp(&cache_b.level))
                 .then_with(|| id_a.as_bytes().cmp(id_b.as_bytes()))
         });
 
@@ -243,5 +232,111 @@ impl Viz {
             let _ = stream
                 .log("graph/edges_supports", &GraphEdges::new(supports).with_undirected_edges());
         }
+    }
+}
+
+pub(crate) fn compute_prerequisite_ranks(
+    node_ids: impl IntoIterator<Item = Uuid>,
+    prereq_edges: impl IntoIterator<Item = (Uuid, Uuid)>,
+) -> HashMap<Uuid, usize> {
+    let mut indegree: HashMap<Uuid, usize> = HashMap::new();
+    let mut predecessors: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+    let mut successors: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+
+    for id in node_ids {
+        indegree.entry(id).or_insert(0);
+        predecessors.entry(id).or_insert_with(Vec::new);
+        successors.entry(id).or_insert_with(Vec::new);
+    }
+
+    for (from, to) in prereq_edges {
+        indegree.entry(from).or_insert(0);
+        indegree.entry(to).or_insert(0);
+        predecessors.entry(from).or_insert_with(Vec::new);
+        predecessors.entry(to).or_insert_with(Vec::new);
+        successors.entry(from).or_insert_with(Vec::new).push(to);
+        predecessors.entry(to).or_insert_with(Vec::new).push(from);
+        if let Some(entry) = indegree.get_mut(&to) {
+            *entry += 1;
+        }
+    }
+
+    let mut initial: Vec<Uuid> = indegree
+        .iter()
+        .filter_map(|(node, &deg)| if deg == 0 { Some(*node) } else { None })
+        .collect();
+    initial.sort_unstable();
+    let mut queue: VecDeque<Uuid> = initial.into();
+
+    let mut ranks: HashMap<Uuid, usize> = HashMap::new();
+
+    while let Some(node) = queue.pop_front() {
+        let rank = predecessors
+            .get(&node)
+            .map(|parents| {
+                parents
+                    .iter()
+                    .filter_map(|parent| ranks.get(parent).map(|parent_rank| parent_rank + 1))
+                    .max()
+            })
+            .flatten()
+            .unwrap_or(0);
+        ranks.insert(node, rank);
+
+        if let Some(children) = successors.get(&node) {
+            let mut newly_zero = Vec::new();
+            for child in children {
+                if let Some(entry) = indegree.get_mut(child) {
+                    if *entry > 0 {
+                        *entry -= 1;
+                        if *entry == 0 {
+                            newly_zero.push(*child);
+                        }
+                    }
+                }
+            }
+            if !newly_zero.is_empty() {
+                newly_zero.sort_unstable();
+                for child in newly_zero {
+                    queue.push_back(child);
+                }
+            }
+        }
+    }
+
+    for node in indegree.keys() {
+        ranks.entry(*node).or_insert(0);
+    }
+
+    ranks
+}
+
+#[cfg(test)]
+mod tests {
+    use uuid::Uuid;
+
+    use super::*;
+
+    #[test]
+    fn compute_prerequisite_ranks_orders_chain() {
+        let a = Uuid::from_u128(1);
+        let b = Uuid::from_u128(2);
+        let c = Uuid::from_u128(3);
+
+        let ranks = compute_prerequisite_ranks(vec![a, b, c], vec![(a, b), (b, c)]);
+        assert_eq!(ranks.get(&a), Some(&0));
+        assert_eq!(ranks.get(&b), Some(&1));
+        assert_eq!(ranks.get(&c), Some(&2));
+    }
+
+    #[test]
+    fn compute_prerequisite_ranks_defaults_to_zero_without_edges() {
+        let a = Uuid::from_u128(10);
+        let b = Uuid::from_u128(20);
+
+        let ranks = compute_prerequisite_ranks(vec![a, b], std::iter::empty());
+        assert_eq!(ranks.get(&a), Some(&0));
+        assert_eq!(ranks.get(&b), Some(&0));
+        assert_eq!(ranks.len(), 2);
     }
 }
