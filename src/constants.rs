@@ -1,5 +1,6 @@
 /// Default temperature applied to LLM requests.
-pub const DEFAULT_TEMPERATURE: f32 = 0.7;
+// TODO: Change to 0.7 before final run.
+pub const DEFAULT_TEMPERATURE: f32 = 1.0;
 
 /// Default nucleus sampling value applied to LLM requests.
 pub const DEFAULT_TOP_P: f32 = 1.0;

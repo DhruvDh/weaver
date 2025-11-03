@@ -1,8 +1,6 @@
 use std::{
     env,
-    future::Future,
     path::{Path, PathBuf},
-    pin::Pin,
     time::{Duration, Instant},
 };
 
@@ -39,7 +37,7 @@ const SYSTEM_PROMPT_TEMPLATE: &str = r#"You are Weaver's file-reading assistant 
 Always stay within the UNCC CS2 PreTeXt workspace and rely on the provided tools to inspect files.
 The primary course content lives under `./uncc_cs2-pretext-project/`; call `list_directory` whenever you need to confirm the current structure.
 Never assume content from file names alone—use `read_file_full` or `read_file_range` to inspect source material before describing or citing it.
-When tasks can be partitioned, prefer launching delegate subtasks in parallel. The `delegate_subtask` tool accepts either a single `subtask` string or a `subtasks` array, and it is recommended to batch independent subtasks so they run concurrently. The runtime executes up to 4 subtasks concurrently.
+When tasks can be partitioned, prefer launching delegate subtasks in parallel. The `delegate_subtask` tool accepts a `subtasks` array; wrap a single instruction in an array when needed. The runtime executes up to 4 subtasks concurrently.
 Only answer after gathering the necessary context via tool calls, and reference the specific files you actually examined."#;
 
 #[derive(Clone, Copy, Debug)]
@@ -73,8 +71,8 @@ impl ToolName {
             }
             ToolName::SearchText => "Run a regex search (ripgrep-style) within the workspace.",
             ToolName::DelegateSubtask => {
-                "Delegate one or more subtasks to child FileReader agents. This is preferred for \
-                 parallelizable work."
+                "Delegate one or more subtasks to child FileReader agents via the `subtasks` \
+                 array. Wrap single subtasks in an array when needed."
             }
         }
     }
@@ -134,6 +132,7 @@ impl ToolName {
             }),
             ToolName::DelegateSubtask => json!({
                 "type": "object",
+                "required": ["subtasks"],
                 "properties": {
                     "subtask": {
                         "type": "string",
@@ -142,13 +141,9 @@ impl ToolName {
                     "subtasks": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Precise description with motivation of subtasks to delegate in parallel."
+                        "description": "Precise, educational description with motivation and acceptance criteria of subtasks to delegate in parallel."
                     }
-                },
-                "anyOf": [
-                    {"required": ["subtask"]},
-                    {"required": ["subtasks"]}
-                ]
+                }
             }),
         }
     }
@@ -172,6 +167,16 @@ const TOOL_NAMES: [ToolName; 5] = [
     ToolName::SearchText,
     ToolName::DelegateSubtask,
 ];
+
+fn push_trimmed_subtask(dest: &mut Vec<String>, text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        false
+    } else {
+        dest.push(trimmed.to_string());
+        true
+    }
+}
 
 /// Actor that exposes local filesystem utilities to LLM collaborators.
 #[derive(Actor)]
@@ -551,53 +556,30 @@ impl FileReader {
                 }
                 let mut subtasks = Vec::new();
 
-                if let Some(subtask) = args.get("subtask").and_then(Value::as_str) {
-                    let trimmed = subtask.trim();
-                    if !trimmed.is_empty() {
-                        subtasks.push(trimmed.to_string());
-                    }
+                if let Some(single) = args.get("subtask") {
+                    let text = single
+                        .as_str()
+                        .ok_or_else(|| anyhow!("`subtask` must be a string"))?;
+                    let _ = push_trimmed_subtask(&mut subtasks, text);
                 }
 
-                if let Some(value) = args.get("subtasks") {
-                    let arr = value
-                        .as_array()
-                        .ok_or_else(|| anyhow!("`subtasks` must be an array of strings"))?;
-                    for entry in arr {
-                        let text = entry
-                            .as_str()
-                            .ok_or_else(|| anyhow!("`subtasks` must contain only strings"))?;
-                        let trimmed = text.trim();
-                        if !trimmed.is_empty() {
-                            subtasks.push(trimmed.to_string());
-                        }
-                    }
-                }
+                let subtasks_value = args
+                    .get("subtasks")
+                    .ok_or_else(|| anyhow!("delegate_subtask requires `subtasks`"))?;
+                let arr = subtasks_value
+                    .as_array()
+                    .ok_or_else(|| anyhow!("`subtasks` must be an array of strings"))?;
 
-                if subtasks.is_empty() {
-                    if let Some(prompt) = args.get("prompt").and_then(Value::as_str) {
-                        let trimmed = prompt.trim();
-                        if !trimmed.is_empty() {
-                            subtasks.push(trimmed.to_string());
-                        }
-                    }
-                    if let Some(value) = args.get("prompts") {
-                        let arr = value
-                            .as_array()
-                            .ok_or_else(|| anyhow!("`prompts` must be an array of strings"))?;
-                        for entry in arr {
-                            let text = entry
-                                .as_str()
-                                .ok_or_else(|| anyhow!("`prompts` must contain only strings"))?;
-                            let trimmed = text.trim();
-                            if !trimmed.is_empty() {
-                                subtasks.push(trimmed.to_string());
-                            }
-                        }
-                    }
+                subtasks.reserve(arr.len());
+                for entry in arr {
+                    let text = entry
+                        .as_str()
+                        .ok_or_else(|| anyhow!("`subtasks` must contain only strings"))?;
+                    let _ = push_trimmed_subtask(&mut subtasks, text);
                 }
 
                 if subtasks.is_empty() {
-                    bail!("delegate_subtask requires `subtask` or a non-empty `subtasks` array");
+                    bail!("delegate_subtask requires at least one non-empty subtask");
                 }
 
                 info!(
@@ -615,159 +597,153 @@ impl FileReader {
         }
     }
 
-    fn run_conversation(
+    async fn run_conversation(
         &self,
         mut messages: Vec<ChatCompletionRequestMessage>,
-    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + '_>> {
-        Box::pin(async move {
-            let timeout_duration = Duration::from_secs(REQUEST_TIMEOUT_SECS);
-            'retry: for iteration in 0..MAX_TOOL_ITERATIONS {
-                debug!(iteration, "Starting LLM tool iteration");
-                let request = CreateChatCompletionRequestArgs::default()
-                    .model(self.model.clone())
-                    .messages(messages.clone())
-                    .temperature(DEFAULT_TEMPERATURE)
-                    .top_p(DEFAULT_TOP_P)
-                    .tools(self.tool_specs())
-                    .build()?;
-                info!(
-                    "llm_request_start depth={} iteration={} messages={}",
-                    self.depth,
-                    iteration,
-                    messages.len()
-                );
-                let start = Instant::now();
-                let response_res =
-                    timeout(timeout_duration, self.client.chat().create(request)).await;
-                let response = match response_res {
-                    Ok(Ok(resp)) => {
-                        info!(
-                            "llm_request_ok depth={} iteration={} elapsed_ms={}",
-                            self.depth,
-                            iteration,
-                            start.elapsed().as_millis()
-                        );
-                        resp
-                    }
-                    Ok(Err(err)) => {
-                        warn!(
-                            "llm_request_error depth={} iteration={} error={}",
-                            self.depth, iteration, err
-                        );
-                        self.sleep_backoff(iteration).await;
-                        continue 'retry;
-                    }
-                    Err(_) => {
-                        warn!(
-                            "llm_request_timeout depth={} iteration={} timeout_secs={}",
-                            self.depth,
-                            iteration,
-                            timeout_duration.as_secs()
-                        );
-                        self.sleep_backoff(iteration).await;
-                        continue 'retry;
-                    }
-                };
-                let mut choices = response.choices.into_iter();
-                let message = choices
-                    .next()
-                    .ok_or_else(|| anyhow!("chat completion returned no choices"))?
-                    .message;
+    ) -> Result<String> {
+        let timeout_duration = Duration::from_secs(REQUEST_TIMEOUT_SECS);
+        'retry: for iteration in 0..MAX_TOOL_ITERATIONS {
+            debug!(iteration, "Starting LLM tool iteration");
+            let request = CreateChatCompletionRequestArgs::default()
+                .model(self.model.clone())
+                .messages(messages.clone())
+                .temperature(DEFAULT_TEMPERATURE)
+                .top_p(DEFAULT_TOP_P)
+                .tools(self.tool_specs())
+                .build()?;
+            info!(
+                "llm_request_start depth={} iteration={} messages={}",
+                self.depth,
+                iteration,
+                messages.len()
+            );
+            let start = Instant::now();
+            let response_res = timeout(timeout_duration, self.client.chat().create(request)).await;
+            let response = match response_res {
+                Ok(Ok(resp)) => {
+                    info!(
+                        "llm_request_ok depth={} iteration={} elapsed_ms={}",
+                        self.depth,
+                        iteration,
+                        start.elapsed().as_millis()
+                    );
+                    resp
+                }
+                Ok(Err(err)) => {
+                    warn!(
+                        "llm_request_error depth={} iteration={} error={}",
+                        self.depth, iteration, err
+                    );
+                    self.sleep_backoff(iteration).await;
+                    continue 'retry;
+                }
+                Err(_) => {
+                    warn!(
+                        "llm_request_timeout depth={} iteration={} timeout_secs={}",
+                        self.depth,
+                        iteration,
+                        timeout_duration.as_secs()
+                    );
+                    self.sleep_backoff(iteration).await;
+                    continue 'retry;
+                }
+            };
+            let mut choices = response.choices.into_iter();
+            let message = choices
+                .next()
+                .ok_or_else(|| anyhow!("chat completion returned no choices"))?
+                .message;
 
-                debug!(
-                    iteration,
-                    role = ?message.role,
-                    has_content = message.content.as_ref().map(|c| !c.trim().is_empty()),
-                    tool_call_count = message.tool_calls.as_ref().map(|c| c.len()),
-                    content = ?message.content,
-                    refusal = ?message.refusal,
-                    "Assistant message received"
-                );
+            debug!(
+                iteration,
+                role = ?message.role,
+                has_content = message.content.as_ref().map(|c| !c.trim().is_empty()),
+                tool_call_count = message.tool_calls.as_ref().map(|c| c.len()),
+                content = ?message.content,
+                refusal = ?message.refusal,
+                "Assistant message received"
+            );
 
-                match message.tool_calls {
-                    Some(tool_calls) if !tool_calls.is_empty() => {
+            match message.tool_calls {
+                Some(tool_calls) if !tool_calls.is_empty() => {
+                    debug!(
+                        iteration,
+                        tool_call_count = tool_calls.len(),
+                        "Assistant requested tool calls"
+                    );
+                    let assistant_msg = ChatCompletionRequestAssistantMessageArgs::default()
+                        .tool_calls(tool_calls.clone())
+                        .build()?
+                        .into();
+                    messages.push(assistant_msg);
+
+                    for tool_call in tool_calls {
                         debug!(
                             iteration,
-                            tool_call_count = tool_calls.len(),
-                            "Assistant requested tool calls"
+                            tool = tool_call.function.name.as_str(),
+                            "Executing assistant-requested tool"
                         );
-                        let assistant_msg = ChatCompletionRequestAssistantMessageArgs::default()
-                            .tool_calls(tool_calls.clone())
-                            .build()?
-                            .into();
-                        messages.push(assistant_msg);
-
-                        for tool_call in tool_calls {
-                            debug!(
-                                iteration,
-                                tool = tool_call.function.name.as_str(),
-                                "Executing assistant-requested tool"
-                            );
-                            let tool_name = tool_call.function.name.clone();
-                            let tool_msg = match self.execute_tool(&tool_call).await {
-                                Ok(result) => ChatCompletionRequestToolMessageArgs::default()
+                        let tool_name = tool_call.function.name.clone();
+                        let tool_msg = match self.execute_tool(&tool_call).await {
+                            Ok(result) => ChatCompletionRequestToolMessageArgs::default()
+                                .tool_call_id(tool_call.id.clone())
+                                .content(result.to_string())
+                                .build()?
+                                .into(),
+                            Err(err) => {
+                                warn!(
+                                    "tool_error tool={} iteration={} error={}",
+                                    tool_name, iteration, err
+                                );
+                                let args_json: Value =
+                                    serde_json::from_str(&tool_call.function.arguments)
+                                        .unwrap_or_else(|_| {
+                                            Value::String(tool_call.function.arguments.clone())
+                                        });
+                                let error_payload = json!({
+                                    "type": "tool_error",
+                                    "tool": tool_name,
+                                    "arguments": args_json,
+                                    "message": err.to_string(),
+                                });
+                                ChatCompletionRequestToolMessageArgs::default()
                                     .tool_call_id(tool_call.id.clone())
-                                    .content(result.to_string())
+                                    .content(error_payload.to_string())
                                     .build()?
-                                    .into(),
-                                Err(err) => {
-                                    warn!(
-                                        "tool_error tool={} iteration={} error={}",
-                                        tool_name, iteration, err
-                                    );
-                                    let args_json: Value =
-                                        serde_json::from_str(&tool_call.function.arguments)
-                                            .unwrap_or_else(|_| {
-                                                Value::String(tool_call.function.arguments.clone())
-                                            });
-                                    let error_payload = json!({
-                                        "type": "tool_error",
-                                        "tool": tool_name,
-                                        "arguments": args_json,
-                                        "message": err.to_string(),
-                                    });
-                                    ChatCompletionRequestToolMessageArgs::default()
-                                        .tool_call_id(tool_call.id.clone())
-                                        .content(error_payload.to_string())
-                                        .build()?
-                                        .into()
-                                }
-                            };
-                            messages.push(tool_msg);
-                        }
-                        continue;
+                                    .into()
+                            }
+                        };
+                        messages.push(tool_msg);
                     }
-                    Some(empty_calls) => {
-                        debug!(
-                            iteration,
-                            tool_call_count = empty_calls.len(),
-                            "Assistant returned empty tool call list; treating as no tool calls"
-                        );
-                    }
-                    None => {}
+                    continue;
                 }
-
-                if let Some(content) = message.content {
-                    let trimmed = content.trim();
-                    if trimmed.is_empty() {
-                        debug!(iteration, "Assistant content was empty; continuing");
-                    } else {
-                        debug!(iteration, "Assistant returned final content");
-                        return Ok(content);
-                    }
+                Some(empty_calls) => {
+                    debug!(
+                        iteration,
+                        tool_call_count = empty_calls.len(),
+                        "Assistant returned empty tool call list; treating as no tool calls"
+                    );
                 }
-
-                debug!(
-                    iteration,
-                    "Assistant response had no tool calls and no content; continuing"
-                );
+                None => {}
             }
 
-            bail!(
-                "LLM tool loop did not terminate with a message after {} iterations",
-                MAX_TOOL_ITERATIONS
-            );
-        })
+            if let Some(content) = message.content {
+                let trimmed = content.trim();
+                if trimmed.is_empty() {
+                    debug!(iteration, "Assistant content was empty; continuing");
+                } else {
+                    debug!(iteration, "Assistant returned final content");
+                    return Ok(content);
+                }
+            }
+
+            debug!(iteration, "Assistant response had no tool calls and no content; continuing");
+        }
+
+        bail!(
+            "LLM tool loop did not terminate with a message after {} iterations",
+            MAX_TOOL_ITERATIONS
+        );
     }
 }
 

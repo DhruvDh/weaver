@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use tokio::fs;
 
 /// A simplified view of a directory entry.
@@ -51,17 +51,31 @@ impl DirEntryKind {
 
 /// List directory entries similarly to `ls`.
 pub async fn list_dir(path: impl AsRef<Path>) -> Result<Vec<DirEntryInfo>> {
-    let mut reader = fs::read_dir(path).await?;
+    let path = path.as_ref();
+    let mut reader = fs::read_dir(path)
+        .await
+        .with_context(|| format!("failed to read directory {}", path.display()))?;
     let mut entries = Vec::new();
 
-    while let Some(entry) = reader.next_entry().await? {
-        let file_type = entry.file_type().await?;
-        let metadata = entry.metadata().await.ok();
+    while let Some(entry) = reader
+        .next_entry()
+        .await
+        .with_context(|| format!("failed to iterate directory {}", path.display()))?
+    {
+        let entry_path = entry.path();
+        let file_type = entry
+            .file_type()
+            .await
+            .with_context(|| format!("failed to read file type for {}", entry_path.display()))?;
+        let metadata = match entry.metadata().await {
+            Ok(meta) => Some(meta),
+            Err(_) => None,
+        };
         entries.push(DirEntryInfo {
             name: entry.file_name().to_string_lossy().into_owned(),
-            path: entry.path(),
+            path: entry_path,
             kind: DirEntryKind::from(file_type),
-            size: metadata.map(|m| m.len()),
+            size: metadata.as_ref().map(|m| m.len()),
         });
     }
 
@@ -71,7 +85,9 @@ pub async fn list_dir(path: impl AsRef<Path>) -> Result<Vec<DirEntryInfo>> {
 
 /// Read an entire file into memory.
 pub async fn read_file_full(path: impl AsRef<Path>) -> Result<String> {
-    let bytes = fs::read(path).await?;
+    let bytes = fs::read(path.as_ref())
+        .await
+        .with_context(|| format!("failed to read file {}", path.as_ref().display()))?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
@@ -98,7 +114,9 @@ pub async fn read_file_range(
     }
 
     let path_buf = path.as_ref().to_path_buf();
-    let bytes = fs::read(&path_buf).await?;
+    let bytes = fs::read(&path_buf)
+        .await
+        .with_context(|| format!("failed to read file {}", path_buf.display()))?;
     let content = String::from_utf8_lossy(&bytes);
 
     let mut extracted = String::new();
@@ -134,10 +152,16 @@ pub async fn read_file_range(
         extracted.pop();
     }
 
+    let first_line = first_line.ok_or_else(|| {
+        anyhow!("extracted range missing starting line for {}", path_buf.display())
+    })?;
+    let last_line = last_line
+        .ok_or_else(|| anyhow!("extracted range missing ending line for {}", path_buf.display()))?;
+
     Ok(FileRange {
         path:       path_buf,
-        start_line: first_line.unwrap(),
-        end_line:   last_line.unwrap(),
+        start_line: first_line,
+        end_line:   last_line,
         text:       extracted,
     })
 }

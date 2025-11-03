@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use kameo::prelude::*;
 use tracing::debug;
 use tracing_subscriber::EnvFilter;
@@ -11,7 +11,8 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_timer(tracing_subscriber::fmt::time::ChronoLocal::new("%Y-%m-%d %H:%M:%S%.3f".into()))
         .with_env_filter(filter)
-        .init();
+        .try_init()
+        .map_err(|err| anyhow!("failed to initialize tracing subscriber: {err}"))?;
 
     debug!("FileReader demo starting");
 

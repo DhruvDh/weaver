@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result, anyhow};
 use grep_regex::RegexMatcher;
 use grep_searcher::{BinaryDetection, SearcherBuilder, sinks::Lossy};
 use walkdir::WalkDir;
@@ -22,14 +22,16 @@ pub async fn search_recursive(root: impl AsRef<Path>, pattern: &str) -> Result<V
     let pattern = pattern.to_owned();
 
     let matches = tokio::task::spawn_blocking(move || -> Result<Vec<SearchMatch>> {
-        let matcher = RegexMatcher::new_line_matcher(&pattern)?;
+        let matcher = RegexMatcher::new_line_matcher(&pattern)
+            .with_context(|| format!("failed to compile search pattern `{pattern}`"))?;
         let mut searcher = SearcherBuilder::new()
             .line_number(true)
             .binary_detection(BinaryDetection::quit(b'\x00'))
             .build();
 
         let mut results = Vec::new();
-        for entry in WalkDir::new(&root).into_iter().filter_map(|e| e.ok()) {
+        for entry in WalkDir::new(&root) {
+            let entry = entry.with_context(|| format!("failed to traverse {}", root.display()))?;
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -42,17 +44,19 @@ pub async fn search_recursive(root: impl AsRef<Path>, pattern: &str) -> Result<V
                 });
                 Ok(true)
             });
-            if let Err(err) = searcher.search_path(&matcher, &path, &mut sink) {
-                if err.kind() == ErrorKind::InvalidData {
-                    continue;
+            match searcher.search_path(&matcher, &path, &mut sink) {
+                Ok(()) => {}
+                Err(err) if err.kind() == ErrorKind::InvalidData => continue,
+                Err(err) => {
+                    return Err(anyhow!("failed to search {}: {}", path.display(), err));
                 }
-                return Err(err.into());
             }
         }
 
         Ok(results)
     })
-    .await??;
+    .await
+    .context("blocking regex search task panicked")??;
 
     Ok(matches)
 }
