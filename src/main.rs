@@ -2,7 +2,10 @@ use anyhow::{Result, anyhow};
 use kameo::prelude::*;
 use tracing::debug;
 use tracing_subscriber::EnvFilter;
-use weaver::file_reader::{FileReader, FileReaderQuery};
+use weaver::{
+    file_reader::{FileReader, FileReaderQuery},
+    llm_gateway::LLMGateway,
+};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
@@ -16,7 +19,9 @@ async fn main() -> Result<()> {
 
     debug!("FileReader demo starting");
 
-    let actor = match FileReader::from_env(".") {
+    let gateway = LLMGateway::spawn(LLMGateway::from_env()?);
+
+    let actor = match FileReader::from_env(".", gateway.clone()) {
         Ok(actor) => actor,
         Err(err) => {
             debug!(

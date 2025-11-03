@@ -5,16 +5,12 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use async_openai::{
-    Client,
-    config::OpenAIConfig,
-    types::{
-        ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessageArgs,
-        ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
-        ChatCompletionRequestToolMessageArgs, ChatCompletionRequestUserMessageArgs,
-        ChatCompletionTool, ChatCompletionToolArgs, ChatCompletionToolType,
-        CreateChatCompletionRequestArgs, FunctionObjectArgs,
-    },
+use async_openai::types::{
+    ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessageArgs,
+    ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
+    ChatCompletionRequestToolMessageArgs, ChatCompletionRequestUserMessageArgs, ChatCompletionTool,
+    ChatCompletionToolArgs, ChatCompletionToolType, CreateChatCompletionRequest,
+    CreateChatCompletionRequestArgs, CreateChatCompletionResponse, FunctionObjectArgs,
 };
 use kameo::prelude::*;
 use serde_json::{Value, json};
@@ -30,6 +26,7 @@ use crate::{
         DEFAULT_TOP_P, MAX_PARALLEL_DELEGATIONS, MAX_TOOL_ITERATIONS, PRETEXT_SUBDIR,
         REQUEST_TIMEOUT_SECS, RETRY_BASE_DELAY_MS, RETRY_MAX_EXP, RETRY_MAX_JITTER_MS,
     },
+    llm_gateway::{ChatCompletionRequest, LLMGateway},
     tools::{filesystem, search},
 };
 
@@ -168,6 +165,8 @@ const TOOL_NAMES: [ToolName; 5] = [
     ToolName::DelegateSubtask,
 ];
 
+const MASKED_PATH: &str = "<path-unavailable>";
+
 fn push_trimmed_subtask(dest: &mut Vec<String>, text: &str) -> bool {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -181,7 +180,7 @@ fn push_trimmed_subtask(dest: &mut Vec<String>, text: &str) -> bool {
 /// Actor that exposes local filesystem utilities to LLM collaborators.
 #[derive(Actor)]
 pub struct FileReader {
-    client:             Client<OpenAIConfig>,
+    gateway:            ActorRef<LLMGateway>,
     model:              String,
     root:               PathBuf,
     depth:              usize,
@@ -190,38 +189,36 @@ pub struct FileReader {
 
 impl FileReader {
     /// Build a new [`FileReader`] using `OPENAI_MODEL`/`OPENAI_API_BASE`.
-    pub fn from_env(root: impl AsRef<Path>) -> Result<Self> {
-        Self::from_env_with_limit(root, DEFAULT_MAX_SUBDELEGATIONS)
+    pub fn from_env(root: impl AsRef<Path>, gateway: ActorRef<LLMGateway>) -> Result<Self> {
+        Self::from_env_with_limit(root, gateway, DEFAULT_MAX_SUBDELEGATIONS)
     }
 
     /// Build a new [`FileReader`] with a custom delegation limit.
-    pub fn from_env_with_limit(root: impl AsRef<Path>, max_subdelegations: usize) -> Result<Self> {
+    pub fn from_env_with_limit(
+        root: impl AsRef<Path>,
+        gateway: ActorRef<LLMGateway>,
+        max_subdelegations: usize,
+    ) -> Result<Self> {
         let model = env::var("OPENAI_MODEL")
             .map_err(|_| anyhow!("OPENAI_MODEL environment variable must be set"))?;
-
-        let mut config = OpenAIConfig::default();
-        if let Ok(url) = env::var("OPENAI_API_BASE") {
-            config = config.with_api_base(url);
-        }
 
         let root = root
             .as_ref()
             .canonicalize()
             .with_context(|| format!("failed to canonicalize root {}", root.as_ref().display()))?;
 
-        let client = Client::with_config(config);
-        Ok(Self::new(client, model, root, 0, max_subdelegations))
+        Ok(Self::new(gateway, model, root, 0, max_subdelegations))
     }
 
     fn new(
-        client: Client<OpenAIConfig>,
+        gateway: ActorRef<LLMGateway>,
         model: String,
         root: PathBuf,
         depth: usize,
         max_subdelegations: usize,
     ) -> Self {
         Self {
-            client,
+            gateway,
             model,
             root,
             depth,
@@ -248,7 +245,7 @@ impl FileReader {
 
     fn spawn_child_reader(&self) -> FileReader {
         FileReader::new(
-            self.client.clone(),
+            self.gateway.clone(),
             self.model.clone(),
             self.root.clone(),
             self.depth + 1,
@@ -357,10 +354,7 @@ impl FileReader {
 
     async fn sleep_backoff(&self, iteration: usize) {
         let exp = (iteration as u32).min(RETRY_MAX_EXP);
-        let multiplier = match 1u64.checked_shl(exp) {
-            Some(m) => m,
-            None => u64::MAX,
-        };
+        let multiplier = 1u64.checked_shl(exp).unwrap_or(u64::MAX);
         let base_delay = RETRY_BASE_DELAY_MS.saturating_mul(multiplier).min(60_000);
         let jitter = (iteration as u64 * 137) % (RETRY_MAX_JITTER_MS + 1);
         let delay_ms = base_delay + jitter;
@@ -403,6 +397,12 @@ impl FileReader {
         Ok(canonical)
     }
 
+    fn render_relative_path(&self, path: &Path) -> String {
+        pathdiff::diff_paths(path, &self.root)
+            .and_then(|p| p.to_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| MASKED_PATH.to_string())
+    }
+
     async fn execute_tool(&self, call: &ChatCompletionMessageToolCall) -> Result<Value> {
         let args: Value = serde_json::from_str(&call.function.arguments)
             .with_context(|| format!("invalid JSON arguments for {}", call.function.name))?;
@@ -428,9 +428,7 @@ impl FileReader {
                     .map(|entry| {
                         json!({
                             "name": entry.name,
-                            "path": pathdiff::diff_paths(&entry.path, &self.root)
-                                .and_then(|p| p.to_str().map(|s| s.to_string()))
-                                .unwrap_or_else(|| entry.path.display().to_string()),
+                            "path": self.render_relative_path(&entry.path),
                             "kind": entry.kind.as_str(),
                             "size": entry.size,
                         })
@@ -451,12 +449,10 @@ impl FileReader {
                     "tool_call read_file_full depth={} path={} bytes={}",
                     self.depth,
                     path.display(),
-                    content.as_bytes().len()
+                    content.len()
                 );
                 Ok(json!({
-                    "path": pathdiff::diff_paths(&path, &self.root)
-                        .and_then(|p| p.to_str().map(|s| s.to_string()))
-                        .unwrap_or_else(|| path.display().to_string()),
+                    "path": self.render_relative_path(&path),
                     "content": content,
                 }))
             }
@@ -496,9 +492,7 @@ impl FileReader {
                     range.end_line.saturating_sub(range.start_line) + 1
                 );
                 Ok(json!({
-                    "path": pathdiff::diff_paths(&range.path, &self.root)
-                        .and_then(|p| p.to_str().map(|s| s.to_string()))
-                        .unwrap_or_else(|| range.path.display().to_string()),
+                    "path": self.render_relative_path(&range.path),
                     "start_line": range.start_line,
                     "end_line": range.end_line,
                     "content": range.text,
@@ -536,9 +530,7 @@ impl FileReader {
                     .into_iter()
                     .map(|m| {
                         json!({
-                            "path": pathdiff::diff_paths(m.path, &self.root)
-                                .and_then(|p| p.to_str().map(|s| s.to_string()))
-                                .unwrap_or_else(|| "".to_string()),
+                            "path": self.render_relative_path(&m.path),
                             "line_number": m.line_number,
                             "line": m.context,
                         })
@@ -604,7 +596,7 @@ impl FileReader {
         let timeout_duration = Duration::from_secs(REQUEST_TIMEOUT_SECS);
         'retry: for iteration in 0..MAX_TOOL_ITERATIONS {
             debug!(iteration, "Starting LLM tool iteration");
-            let request = CreateChatCompletionRequestArgs::default()
+            let request: CreateChatCompletionRequest = CreateChatCompletionRequestArgs::default()
                 .model(self.model.clone())
                 .messages(messages.clone())
                 .temperature(DEFAULT_TEMPERATURE)
@@ -618,8 +610,9 @@ impl FileReader {
                 messages.len()
             );
             let start = Instant::now();
-            let response_res = timeout(timeout_duration, self.client.chat().create(request)).await;
-            let response = match response_res {
+            let response_future = self.gateway.ask(ChatCompletionRequest { request });
+            let response_res = timeout(timeout_duration, response_future).await;
+            let response: CreateChatCompletionResponse = match response_res {
                 Ok(Ok(resp)) => {
                     info!(
                         "llm_request_ok depth={} iteration={} elapsed_ms={}",

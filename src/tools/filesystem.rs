@@ -67,10 +67,7 @@ pub async fn list_dir(path: impl AsRef<Path>) -> Result<Vec<DirEntryInfo>> {
             .file_type()
             .await
             .with_context(|| format!("failed to read file type for {}", entry_path.display()))?;
-        let metadata = match entry.metadata().await {
-            Ok(meta) => Some(meta),
-            Err(_) => None,
-        };
+        let metadata = entry.metadata().await.ok();
         entries.push(DirEntryInfo {
             name: entry.file_name().to_string_lossy().into_owned(),
             path: entry_path,
