@@ -13,17 +13,13 @@ pub const PRETEXT_SUBDIR: &str = "uncc_cs2-pretext-project";
 pub const MAX_TOOL_ITERATIONS: usize = 60;
 
 /// Maximum depth of recursive delegation for FileReader agents.
-pub const DEFAULT_MAX_SUBDELEGATIONS: usize = 2;
+pub const DEFAULT_MAX_SUBDELEGATIONS: usize = 6;
 
-/// Default number of delegate subtasks to run in parallel when using the
-/// `subtasks` array form.
-pub const DEFAULT_PARALLEL_DELEGATIONS: usize = 4;
-
-/// Hard ceiling on delegate subtask parallelism to prevent runaway fan-out.
+/// Hard ceiling on delegate task parallelism to prevent runaway fan-out.
 pub const MAX_PARALLEL_DELEGATIONS: usize = 8;
 
 /// Maximum number of in-flight OpenAI requests handled by the gateway.
-pub const LLM_MAX_CONCURRENT_REQUESTS: usize = 128;
+pub const LLM_MAX_CONCURRENT_REQUESTS: usize = 256;
 
 /// Maximum number of retry attempts for a single OpenAI request.
 pub const LLM_MAX_RETRIES: usize = 5;

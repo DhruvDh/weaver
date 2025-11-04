@@ -1139,6 +1139,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "bon"
+version = "3.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ebeb9aaf9329dff6ceb65c689ca3db33dbf15f324909c60e4e5eef5701ce31b1"
+dependencies = [
+ "bon-macros",
+ "rustversion",
+]
+
+[[package]]
+name = "bon-macros"
+version = "3.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77e9d642a7e3a318e37c2c9427b5a6a48aa1ad55dcd986f3034ab2239045a645"
+dependencies = [
+ "darling 0.21.3",
+ "ident_case",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "rustversion",
+ "syn 2.0.108",
+]
+
+[[package]]
 name = "bpaf"
 version = "0.9.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1841,6 +1866,7 @@ dependencies = [
  "ident_case",
  "proc-macro2",
  "quote",
+ "strsim",
  "syn 2.0.108",
 ]
 
@@ -9901,26 +9927,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "typed-builder"
-version = "0.23.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d0dd654273fc253fde1df4172c31fb6615cf8b041d3a4008a028ef8b1119e66"
-dependencies = [
- "typed-builder-macro",
-]
-
-[[package]]
-name = "typed-builder-macro"
-version = "0.23.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "016c26257f448222014296978b2c8456e2cad4de308c35bdb1e383acd569ef5b"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.108",
-]
-
-[[package]]
 name = "typenum"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10356,10 +10362,13 @@ dependencies = [
  "anyhow",
  "async-openai",
  "async-trait",
+ "bon",
  "bpaf",
+ "futures",
  "grep-regex",
  "grep-searcher",
  "kameo",
+ "once_cell",
  "pathdiff",
  "petgraph",
  "rand 0.8.5",
@@ -10371,7 +10380,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "typed-builder",
  "uuid",
  "walkdir",
 ]

@@ -32,10 +32,7 @@ async fn main() -> Result<()> {
         }
     };
 
-    let tool_names: Vec<&'static str> = FileReader::tool_names()
-        .iter()
-        .map(|tool| tool.identifier())
-        .collect();
+    let tool_names = FileReader::tool_identifiers();
 
     debug!(
         workspace = %actor.workspace_root().display(),
@@ -47,7 +44,8 @@ async fn main() -> Result<()> {
 
     let prompt = "Summarize the key goals of the UNCC CS2 PreTeXt project. Highlight any modules \
                   in the `uncc_cs2-pretext-project/source/` tree that look important. Please do \
-                  so by calling `delegate_subtask` on individual chapters.";
+                  make effective use of the `delegate_tasks` tools for all tasks, in parrallel if \
+                  possible.";
     debug!(prompt, "Dispatching FileReaderQuery with LLM tool access");
 
     match reader

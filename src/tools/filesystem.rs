@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use tokio::fs;
 
 /// A simplified view of a directory entry.
@@ -115,28 +115,9 @@ pub async fn read_file_range(
         .await
         .with_context(|| format!("failed to read file {}", path_buf.display()))?;
     let content = String::from_utf8_lossy(&bytes);
+    let total_lines = content.lines().count();
 
-    let mut extracted = String::new();
-    let mut first_line = None;
-    let mut last_line = None;
-
-    for (idx, line) in content.lines().enumerate() {
-        let line_no = idx + 1;
-        if line_no < start_line {
-            continue;
-        }
-        if line_no > end_line {
-            break;
-        }
-        if first_line.is_none() {
-            first_line = Some(line_no);
-        }
-        last_line = Some(line_no);
-        extracted.push_str(line);
-        extracted.push('\n');
-    }
-
-    if first_line.is_none() {
+    if start_line > total_lines {
         bail!(
             "requested range {}-{} is outside the bounds of {}",
             start_line,
@@ -145,20 +126,25 @@ pub async fn read_file_range(
         );
     }
 
-    if extracted.ends_with('\n') {
-        extracted.pop();
+    let count = end_line - start_line + 1;
+    let lines: Vec<&str> = content.lines().skip(start_line - 1).take(count).collect();
+
+    if lines.is_empty() {
+        bail!(
+            "requested range {}-{} is outside the bounds of {}",
+            start_line,
+            end_line,
+            path_buf.display()
+        );
     }
 
-    let first_line = first_line.ok_or_else(|| {
-        anyhow!("extracted range missing starting line for {}", path_buf.display())
-    })?;
-    let last_line = last_line
-        .ok_or_else(|| anyhow!("extracted range missing ending line for {}", path_buf.display()))?;
+    let extracted = lines.join("\n");
+    let last_line = start_line + lines.len() - 1;
 
     Ok(FileRange {
-        path:       path_buf,
-        start_line: first_line,
-        end_line:   last_line,
-        text:       extracted,
+        path: path_buf,
+        start_line,
+        end_line: last_line,
+        text: extracted,
     })
 }

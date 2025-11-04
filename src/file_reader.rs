@@ -1,6 +1,7 @@
 use std::{
     env,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -8,45 +9,39 @@ use async_openai::types::{
     ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
     ChatCompletionRequestUserMessageArgs,
 };
-use async_trait::async_trait;
+use futures::{StreamExt, stream};
 use kameo::{prelude::*, reply::DelegatedReply};
 use serde_json::{Value, json};
-use tokio::task::JoinSet;
 
 use crate::{
     constants::{
-        DEFAULT_MAX_SUBDELEGATIONS, DEFAULT_PARALLEL_DELEGATIONS, DEFAULT_TEMPERATURE,
-        DEFAULT_TOP_P, MAX_PARALLEL_DELEGATIONS, MAX_TOOL_ITERATIONS, PRETEXT_SUBDIR,
+        DEFAULT_MAX_SUBDELEGATIONS, DEFAULT_TEMPERATURE, DEFAULT_TOP_P, MAX_PARALLEL_DELEGATIONS,
+        MAX_TOOL_ITERATIONS, PRETEXT_SUBDIR,
     },
     llm_gateway::{ChatCompletionRequest, LLMGateway},
-    tools::{
-        filesystem,
-        llm::{self, ToolInvocation, ToolName},
-        search,
-    },
+    tools::llm::{self, CallState},
 };
 
 const SYSTEM_PROMPT_TEMPLATE: &str = r#"You are Weaver's file-reading assistant assigned to explore the UNCC CS2 PreTeXt project.
 Always stay within the UNCC CS2 PreTeXt workspace and rely on the provided tools to inspect files.
 The primary course content lives under `./uncc_cs2-pretext-project/`; call `list_directory` whenever you need to confirm the current structure.
 Never assume content from file names alone—use `read_file_full` or `read_file_range` to inspect source material before describing or citing it.
-When tasks can be partitioned, prefer launching delegate subtasks in parallel. The `delegate_subtask` tool accepts a `subtasks` array; wrap a single instruction in an array when needed. The runtime executes up to 4 subtasks concurrently.
+When tasks can be partitioned, prefer launching delegated tasks in parallel. The `delegate_tasks` tool accepts a `tasks` array; wrap a single instruction in an array when needed. The runtime executes up to 8 tasks concurrently.
 Only answer after gathering the necessary context via tool calls, and reference the specific files you actually examined."#;
-
-const MASKED_PATH: &str = "<path-unavailable>";
 
 /// Message used by the LLM gateway to execute a tool invocation within the
 /// file reader context.
 pub struct ExecuteTool {
-    pub invocation: llm::ToolInvocation,
+    pub identifier: String,
+    pub arguments:  Value,
 }
 
 /// Actor that exposes local filesystem utilities to LLM collaborators.
 #[derive(Actor)]
 pub struct FileReader {
     gateway:            ActorRef<LLMGateway>,
-    model:              String,
-    root:               PathBuf,
+    model:              Arc<String>,
+    root:               Arc<PathBuf>,
     depth:              usize,
     max_subdelegations: usize,
 }
@@ -63,21 +58,23 @@ impl FileReader {
         gateway: ActorRef<LLMGateway>,
         max_subdelegations: usize,
     ) -> Result<Self> {
-        let model = env::var("OPENAI_MODEL")
-            .map_err(|_| anyhow!("OPENAI_MODEL environment variable must be set"))?;
+        let model = Arc::new(
+            env::var("OPENAI_MODEL")
+                .map_err(|_| anyhow!("OPENAI_MODEL environment variable must be set"))?,
+        );
 
-        let root = root
-            .as_ref()
-            .canonicalize()
-            .with_context(|| format!("failed to canonicalize root {}", root.as_ref().display()))?;
+        let root =
+            Arc::new(root.as_ref().canonicalize().with_context(|| {
+                format!("failed to canonicalize root {}", root.as_ref().display())
+            })?);
 
         Ok(Self::new(gateway, model, root, 0, max_subdelegations))
     }
 
     fn new(
         gateway: ActorRef<LLMGateway>,
-        model: String,
-        root: PathBuf,
+        model: Arc<String>,
+        root: Arc<PathBuf>,
         depth: usize,
         max_subdelegations: usize,
     ) -> Self {
@@ -100,217 +97,68 @@ impl FileReader {
     }
 
     pub fn workspace_root(&self) -> &Path {
-        &self.root
+        self.root.as_ref()
     }
 
-    pub fn tool_names() -> &'static [ToolName] {
-        llm::all_tools()
-    }
-
-    fn spawn_child_reader(&self) -> FileReader {
-        FileReader::new(
-            self.gateway.clone(),
-            self.model.clone(),
-            self.root.clone(),
-            self.depth + 1,
-            self.max_subdelegations,
-        )
-    }
-
-    fn spawn_delegate_task(
-        &self,
-        join_set: &mut JoinSet<(usize, String, Result<String>)>,
-        idx: usize,
-        subtask: String,
-    ) -> Result<()> {
-        let child = self.spawn_child_reader();
-        let actor = FileReader::spawn(child);
-        join_set.spawn(async move {
-            let outcome = match actor
-                .ask(FileReaderQuery {
-                    prompt: subtask.clone(),
-                })
-                .await
-            {
-                Ok(content) => Ok(content),
-                Err(err) => Err(anyhow!(err)),
-            };
-            (idx, subtask, outcome)
-        });
-        Ok(())
-    }
-
-    async fn run_delegate_batch(
-        &self,
-        subtasks: Vec<String>,
-        max_concurrency: usize,
-    ) -> Result<Value> {
-        let total = subtasks.len();
-        if total == 0 {
-            bail!("delegate_subtask requires at least one subtask");
-        }
-
-        let limit = max_concurrency
-            .clamp(1, MAX_PARALLEL_DELEGATIONS)
-            .min(total);
-
-        let mut join_set: JoinSet<(usize, String, Result<String>)> = JoinSet::new();
-        let mut pending = subtasks.into_iter().enumerate();
-        let mut active = 0usize;
-
-        for _ in 0..limit {
-            if let Some((idx, subtask)) = pending.next() {
-                self.spawn_delegate_task(&mut join_set, idx, subtask)?;
-                active += 1;
-            }
-        }
-
-        let mut results: Vec<Option<Value>> = vec![None; total];
-
-        while active > 0 {
-            if let Some(res) = join_set.join_next().await {
-                active -= 1;
-                match res {
-                    Ok((idx, subtask, outcome)) => {
-                        let entry = match outcome {
-                            Ok(content) => json!({
-                                "subtask": subtask,
-                                "status": "ok",
-                                "content": content,
-                            }),
-                            Err(err) => json!({
-                                "subtask": subtask,
-                                "status": "error",
-                                "error": err.to_string(),
-                            }),
-                        };
-                        results[idx] = Some(entry);
-                    }
-                    Err(join_err) => {
-                        bail!("delegate subtask panicked: {join_err}");
-                    }
-                }
-            }
-
-            if let Some((idx, subtask)) = pending.next() {
-                self.spawn_delegate_task(&mut join_set, idx, subtask)?;
-                active += 1;
-            }
-        }
-
-        if results.iter().any(|entry| entry.is_none()) {
-            bail!("missing delegate results after execution");
-        }
-
-        let collected: Vec<Value> = results
-            .into_iter()
-            .map(|entry| entry.expect("guarded above"))
-            .collect();
-
-        Ok(json!({
-            "type": "delegation_batch_result",
-            "depth": self.depth + 1,
-            "requested": collected.len(),
-            "max_concurrency": limit,
-            "results": collected,
-        }))
-    }
-
-    fn resolve_workspace_path(&self, relative: impl AsRef<Path>) -> Result<PathBuf> {
-        let rel = relative.as_ref();
-        let candidate = if rel.is_absolute() {
-            rel.to_path_buf()
-        } else {
-            self.root.join(rel)
-        };
-        let canonical = candidate.canonicalize().with_context(|| {
-            format!("failed to canonicalize resolved path {}", candidate.display())
-        })?;
-        if !canonical.starts_with(&self.root) {
-            bail!("path {} escapes workspace root {}", canonical.display(), self.root.display());
-        }
-        Ok(canonical)
-    }
-
-    fn render_workspace_relative_path(&self, path: &Path) -> String {
-        pathdiff::diff_paths(path, &self.root)
-            .and_then(|p| p.to_str().map(|s| s.to_string()))
-            .unwrap_or_else(|| MASKED_PATH.to_string())
-    }
-
-    async fn execute_invocation(&self, invocation: ToolInvocation) -> Result<Value> {
-        invocation.into_action().execute(self).await
+    pub fn tool_identifiers() -> Vec<&'static str> {
+        llm::all_tools().iter().map(|meta| meta.id).collect()
     }
 }
 
-#[async_trait]
-impl llm::ToolHost for FileReader {
-    fn depth(&self) -> usize {
-        self.depth
+pub(crate) async fn run_delegate_batch_with_state(
+    gateway: ActorRef<LLMGateway>,
+    model: Arc<String>,
+    workspace_root: Arc<PathBuf>,
+    depth: usize,
+    max_subdelegations: usize,
+    tasks: Vec<String>,
+) -> Result<Value> {
+    let total = tasks.len();
+    if total == 0 {
+        bail!("delegate_tasks requires at least one task");
     }
 
-    fn max_subdelegations(&self) -> usize {
-        self.max_subdelegations
-    }
+    let limit = MAX_PARALLEL_DELEGATIONS.min(total);
 
-    fn workspace_root(&self) -> &Path {
-        &self.root
-    }
+    let results = stream::iter(tasks.into_iter())
+        .map(|task| {
+            let gateway = gateway.clone();
+            let model = Arc::clone(&model);
+            let root = Arc::clone(&workspace_root);
+            async move {
+                let child =
+                    FileReader::new(gateway.clone(), model, root, depth + 1, max_subdelegations);
+                let actor = FileReader::spawn(child);
+                let prompt = task.clone();
+                match actor.ask(FileReaderQuery { prompt }).await {
+                    Ok(content) => {
+                        json!({
+                            "task": task,
+                            "status": "ok",
+                            "content": content,
+                        })
+                    }
+                    Err(err) => {
+                        json!({
+                            "task": task,
+                            "status": "error",
+                            "error": err.to_string(),
+                        })
+                    }
+                }
+            }
+        })
+        .buffered(limit)
+        .collect::<Vec<Value>>()
+        .await;
 
-    fn resolve_path(&self, relative: &str) -> Result<PathBuf> {
-        self.resolve_workspace_path(relative)
-    }
-
-    fn render_relative_path(&self, path: &Path) -> String {
-        self.render_workspace_relative_path(path)
-    }
-
-    async fn list_directory(&self, path: &Path) -> Result<Vec<filesystem::DirEntryInfo>> {
-        filesystem::list_dir(path)
-            .await
-            .with_context(|| format!("list_directory failed for {}", path.display()))
-    }
-
-    async fn read_file_full(&self, path: &Path) -> Result<String> {
-        filesystem::read_file_full(path)
-            .await
-            .with_context(|| format!("read_file_full failed for {}", path.display()))
-    }
-
-    async fn read_file_range(
-        &self,
-        path: &Path,
-        start_line: usize,
-        end_line: usize,
-    ) -> Result<filesystem::FileRange> {
-        filesystem::read_file_range(path, start_line, end_line)
-            .await
-            .with_context(|| {
-                format!(
-                    "read_file_range failed for {} ({}-{})",
-                    path.display(),
-                    start_line,
-                    end_line
-                )
-            })
-    }
-
-    async fn search_recursive(
-        &self,
-        scope: &Path,
-        pattern: &str,
-    ) -> Result<Vec<search::SearchMatch>> {
-        search::search_recursive(scope, pattern)
-            .await
-            .with_context(|| {
-                format!("search_text failed for pattern `{}` in {}", pattern, scope.display())
-            })
-    }
-
-    async fn delegate_subtasks(&self, subtasks: Vec<String>) -> Result<Value> {
-        self.run_delegate_batch(subtasks, DEFAULT_PARALLEL_DELEGATIONS)
-            .await
-    }
+    Ok(json!({
+        "type": "delegation_batch_result",
+        "depth": depth + 1,
+        "requested": total,
+        "max_concurrency": limit,
+        "results": results,
+    }))
 }
 
 /// Primary message for querying the file reader via LLM tools.
@@ -330,7 +178,7 @@ impl Message<FileReaderQuery> for FileReader {
         let gateway = self.gateway.clone();
         let system_prompt = self.system_prompt();
         let model = self.model.clone();
-        let tool_names = Self::tool_names().to_vec();
+        let tool_ids = Self::tool_identifiers();
 
         ctx.spawn(async move {
             let system_msg: ChatCompletionRequestMessage =
@@ -350,7 +198,7 @@ impl Message<FileReaderQuery> for FileReader {
                 messages: vec![system_msg, user_msg],
                 temperature: DEFAULT_TEMPERATURE,
                 top_p: DEFAULT_TOP_P,
-                tool_names,
+                tool_ids,
                 max_iterations: MAX_TOOL_ITERATIONS,
                 tool_host,
             };
@@ -366,9 +214,24 @@ impl Message<ExecuteTool> for FileReader {
 
     async fn handle(
         &mut self,
-        ExecuteTool { invocation }: ExecuteTool,
+        ExecuteTool {
+            identifier,
+            arguments,
+        }: ExecuteTool,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.execute_invocation(invocation).await
+        let meta = llm::lookup_tool(&identifier)
+            .ok_or_else(|| anyhow!(llm::unsupported_tool(&identifier)))?;
+
+        let state = CallState {
+            depth:              self.depth,
+            max_subdelegations: self.max_subdelegations,
+            workspace_root:     Arc::clone(&self.root),
+            gateway:            self.gateway.clone(),
+            model:              Arc::clone(&self.model),
+        };
+
+        let tool = (meta.parse)(arguments, &state).map_err(|err| anyhow!(err))?;
+        tool.execute().await
     }
 }

@@ -12,7 +12,7 @@ use async_openai::{
     types::{
         ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
         ChatCompletionRequestToolMessageArgs, ChatCompletionTool, CreateChatCompletionRequest,
-        CreateChatCompletionRequestArgs,
+        CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
     },
 };
 use kameo::{error::SendError, prelude::*, reply::DelegatedReply};
@@ -22,7 +22,7 @@ use tokio::{
     sync::Semaphore,
     time::{sleep, timeout},
 };
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     constants::{
@@ -30,7 +30,7 @@ use crate::{
         RETRY_MAX_EXP, RETRY_MAX_JITTER_MS,
     },
     file_reader::{ExecuteTool, FileReader},
-    tools::llm::{self, ToolName},
+    tools::llm,
 };
 
 #[derive(Clone)]
@@ -52,11 +52,60 @@ impl Default for GatewayConfig {
     }
 }
 
+pub trait GatewayMetrics: Send + Sync {
+    fn record_completion(
+        &self,
+        model: &str,
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        total_tokens: u32,
+        latency: Duration,
+    );
+}
+
+#[derive(Default)]
+struct NoopMetrics;
+
+impl GatewayMetrics for NoopMetrics {
+    fn record_completion(
+        &self,
+        _model: &str,
+        _prompt_tokens: u32,
+        _completion_tokens: u32,
+        _total_tokens: u32,
+        _latency: Duration,
+    ) {
+    }
+}
+
+pub struct LoggingMetrics;
+
+impl GatewayMetrics for LoggingMetrics {
+    fn record_completion(
+        &self,
+        model: &str,
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        total_tokens: u32,
+        latency: Duration,
+    ) {
+        info!(
+            model,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            latency_ms = latency.as_millis(),
+            "llm_gateway completion metrics"
+        );
+    }
+}
+
 #[derive(Actor)]
 pub struct LLMGateway {
     client:    Client<OpenAIConfig>,
     semaphore: Arc<Semaphore>,
     config:    GatewayConfig,
+    metrics:   Arc<dyn GatewayMetrics>,
 }
 
 impl LLMGateway {
@@ -71,7 +120,13 @@ impl LLMGateway {
             client,
             semaphore: Arc::new(Semaphore::new(LLM_MAX_CONCURRENT_REQUESTS)),
             config: GatewayConfig::default(),
+            metrics: Arc::new(NoopMetrics),
         })
+    }
+
+    pub fn with_metrics(mut self, metrics: Arc<dyn GatewayMetrics>) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     fn build_request(
@@ -114,77 +169,154 @@ impl LLMGateway {
                 }
                 false
             }
-            OpenAIError::ApiError(_) => false,
+            OpenAIError::ApiError(api_err) => {
+                // async-openai surfaces HTTP status failures (including 429/5xx)
+                // via ApiError without exposing the numeric status code. Prefer
+                // to treat these as retryable unless the error code clearly
+                // indicates a caller-side issue.
+                let non_retryable = [
+                    "invalid_api_key",
+                    "account_deactivated",
+                    "invalid_request_error",
+                    "context_length_exceeded",
+                    "insufficient_quota",
+                    "billing_not_active",
+                ];
+                api_err
+                    .code
+                    .as_deref()
+                    .into_iter()
+                    .chain(api_err.r#type.as_deref())
+                    .all(|value| !non_retryable.contains(&value))
+            }
             OpenAIError::JSONDeserialize(_, _) => false,
             OpenAIError::InvalidArgument(_) => false,
             _ => true,
         }
     }
 
+    async fn call_with_retry<F>(
+        client: &Client<OpenAIConfig>,
+        config: &GatewayConfig,
+        metrics: &Arc<dyn GatewayMetrics>,
+        iteration: usize,
+        model: &str,
+        mut build_payload: F,
+    ) -> Result<CreateChatCompletionResponse>
+    where
+        F: FnMut() -> Result<CreateChatCompletionRequest>,
+    {
+        let mut attempt = 0usize;
+        loop {
+            attempt += 1;
+            let payload = build_payload()?;
+            let started = Instant::now();
+            let call = timeout(config.timeout, client.chat().create(payload)).await;
+            match call {
+                Ok(Ok(resp)) => {
+                    if let Some(usage) = resp.usage.as_ref() {
+                        metrics.record_completion(
+                            model,
+                            usage.prompt_tokens,
+                            usage.completion_tokens,
+                            usage.total_tokens,
+                            started.elapsed(),
+                        );
+                        debug!(
+                            prompt_tokens = usage.prompt_tokens,
+                            completion_tokens = usage.completion_tokens,
+                            total_tokens = usage.total_tokens,
+                            "llm_gateway usage"
+                        );
+                    }
+                    debug!(
+                        elapsed_ms = started.elapsed().as_millis(),
+                        iteration, attempt, "llm_gateway request ok"
+                    );
+                    return Ok(resp);
+                }
+                Ok(Err(err)) => {
+                    warn!(iteration, attempt, error = %err, "llm_gateway request error");
+                    if attempt >= config.max_retries || !Self::should_retry(&err) {
+                        return Err(anyhow!(err));
+                    }
+                }
+                Err(_) => {
+                    warn!(
+                        iteration,
+                        attempt,
+                        timeout_secs = config.timeout.as_secs(),
+                        "llm_gateway timeout"
+                    );
+                    if attempt >= config.max_retries {
+                        return Err(anyhow!(
+                            "chat completion timed out after {} attempts",
+                            attempt
+                        ));
+                    }
+                }
+            }
+            let backoff = Self::compute_backoff_ms(attempt, config);
+            sleep(Duration::from_millis(backoff)).await;
+        }
+    }
+
+    fn push_tool_payload(
+        messages: &mut Vec<ChatCompletionRequestMessage>,
+        call_id: &str,
+        payload: serde_json::Value,
+    ) -> Result<()> {
+        let tool_msg = ChatCompletionRequestToolMessageArgs::default()
+            .tool_call_id(call_id.to_string())
+            .content(payload.to_string())
+            .build()
+            .context("failed to build tool response message")?
+            .into();
+        messages.push(tool_msg);
+        Ok(())
+    }
+
+    fn tool_error_payload(
+        tool: &str,
+        arguments: serde_json::Value,
+        message: impl Into<String>,
+    ) -> serde_json::Value {
+        json!({
+            "type": "tool_error",
+            "tool": tool,
+            "arguments": arguments,
+            "message": message.into(),
+        })
+    }
+
     async fn run_conversation(
         client: Client<OpenAIConfig>,
         request: ChatCompletionRequest,
         config: GatewayConfig,
+        metrics: Arc<dyn GatewayMetrics>,
     ) -> Result<String> {
         let mut messages = request.messages.clone();
+        let tools = llm::tool_specs(&request.tool_ids)
+            .context("failed to render tool specifications for request")?;
         for iteration in 0..request.max_iterations {
             debug!(iteration, "Starting LLM tool iteration");
-            let mut attempt = 0usize;
-            let response = loop {
-                attempt += 1;
-                let tools = llm::tool_specs(&request.tool_names)
-                    .context("failed to render tool specifications for request")?;
-                let payload = Self::build_request(
-                    &request.model,
-                    &messages,
-                    request.temperature,
-                    request.top_p,
-                    tools,
-                )?;
-                let started = Instant::now();
-                let call = timeout(config.timeout, client.chat().create(payload)).await;
-                match call {
-                    Ok(Ok(resp)) => {
-                        if let Some(usage) = resp.usage.as_ref() {
-                            debug!(
-                                prompt_tokens = usage.prompt_tokens,
-                                completion_tokens = usage.completion_tokens,
-                                total_tokens = usage.total_tokens,
-                                "llm_gateway usage" // TODO: integrate with metrics sink
-                            );
-                        }
-                        debug!(
-                            elapsed_ms = started.elapsed().as_millis(),
-                            iteration, "llm_gateway request ok"
-                        );
-                        break resp;
-                    }
-                    Ok(Err(err)) => {
-                        warn!(iteration, attempt, error = %err, "llm_gateway request error");
-                        if attempt >= config.max_retries || !Self::should_retry(&err) {
-                            return Err(anyhow!(err));
-                        }
-                        let backoff = Self::compute_backoff_ms(attempt, &config);
-                        sleep(Duration::from_millis(backoff)).await;
-                    }
-                    Err(_) => {
-                        warn!(
-                            iteration,
-                            attempt,
-                            timeout_secs = config.timeout.as_secs(),
-                            "llm_gateway timeout"
-                        );
-                        if attempt >= config.max_retries {
-                            return Err(anyhow!(
-                                "chat completion timed out after {} attempts",
-                                attempt
-                            ));
-                        }
-                        let backoff = Self::compute_backoff_ms(attempt, &config);
-                        sleep(Duration::from_millis(backoff)).await;
-                    }
-                }
-            };
+            let response = Self::call_with_retry(
+                &client,
+                &config,
+                &metrics,
+                iteration,
+                request.model.as_str(),
+                || {
+                    Self::build_request(
+                        request.model.as_str(),
+                        &messages,
+                        request.temperature,
+                        request.top_p,
+                        tools.clone(),
+                    )
+                },
+            )
+            .await?;
 
             let mut choices = response.choices.into_iter();
             let message = choices
@@ -214,6 +346,7 @@ impl LLMGateway {
 
                 for call in tool_calls {
                     let tool_name = call.function.name.clone();
+                    let call_id = call.id.clone();
                     let raw_arguments = call.function.arguments.clone();
                     let parsed_args =
                         match serde_json::from_str::<serde_json::Value>(&raw_arguments) {
@@ -225,58 +358,43 @@ impl LLMGateway {
                                     error = %err,
                                     "tool arguments were not valid JSON"
                                 );
-                                let payload = json!({
-                                    "type": "tool_error",
-                                    "tool": tool_name,
-                                    "arguments": raw_arguments,
-                                    "message": format!("invalid JSON arguments: {err}"),
-                                });
-                                let tool_msg = ChatCompletionRequestToolMessageArgs::default()
-                                    .tool_call_id(call.id.clone())
-                                    .content(payload.to_string())
-                                    .build()
-                                    .context("failed to build tool response message")?
-                                    .into();
-                                messages.push(tool_msg);
+                                let payload = Self::tool_error_payload(
+                                    &tool_name,
+                                    json!(raw_arguments),
+                                    format!("invalid JSON arguments: {err}"),
+                                );
+                                Self::push_tool_payload(&mut messages, &call_id, payload)?;
                                 continue;
                             }
                         };
 
-                    let invocation = match llm::parse_invocation(
-                        call.function.name.as_str(),
-                        parsed_args.clone(),
-                    ) {
-                        Ok(invocation) => invocation,
-                        Err(err) => {
-                            warn!(
-                                iteration,
-                                tool = tool_name.as_str(),
-                                error = %err,
-                                "tool argument validation failed"
-                            );
-                            let payload = json!({
-                                "type": "tool_error",
-                                "tool": tool_name,
-                                "arguments": parsed_args,
-                                "message": err.to_string(),
-                            });
-                            let tool_msg = ChatCompletionRequestToolMessageArgs::default()
-                                .tool_call_id(call.id.clone())
-                                .content(payload.to_string())
-                                .build()
-                                .context("failed to build tool response message")?
-                                .into();
-                            messages.push(tool_msg);
-                            continue;
-                        }
-                    };
+                    if llm::lookup_tool(tool_name.as_str()).is_none() {
+                        warn!(
+                            iteration,
+                            tool = tool_name.as_str(),
+                            "tool identifier not registered"
+                        );
+                        let payload = Self::tool_error_payload(
+                            &tool_name,
+                            parsed_args.clone(),
+                            format!("unsupported tool: {}", tool_name),
+                        );
+                        Self::push_tool_payload(&mut messages, &call_id, payload)?;
+                        continue;
+                    }
 
                     debug!(
                         iteration,
                         tool = tool_name.as_str(),
                         "Executing assistant-requested tool"
                     );
-                    let result = request.tool_host.ask(ExecuteTool { invocation }).await;
+                    let result = request
+                        .tool_host
+                        .ask(ExecuteTool {
+                            identifier: tool_name.clone(),
+                            arguments:  parsed_args.clone(),
+                        })
+                        .await;
                     let payload = match result {
                         Ok(value) => value,
                         Err(SendError::HandlerError(err)) => {
@@ -286,24 +404,13 @@ impl LLMGateway {
                                 error = %err,
                                 "tool execution failed"
                             );
-                            json!({
-                                "type": "tool_error",
-                                "tool": tool_name,
-                                "arguments": parsed_args,
-                                "message": err.to_string(),
-                            })
+                            Self::tool_error_payload(&tool_name, parsed_args, err.to_string())
                         }
                         Err(other) => {
                             return Err(anyhow!(other));
                         }
                     };
-                    let tool_msg = ChatCompletionRequestToolMessageArgs::default()
-                        .tool_call_id(call.id.clone())
-                        .content(payload.to_string())
-                        .build()
-                        .context("failed to build tool response message")?
-                        .into();
-                    messages.push(tool_msg);
+                    Self::push_tool_payload(&mut messages, &call_id, payload)?;
                 }
                 continue;
             }
@@ -330,11 +437,11 @@ impl LLMGateway {
 
 #[derive(Clone, Debug)]
 pub struct ChatCompletionRequest {
-    pub model:          String,
+    pub model:          Arc<String>,
     pub messages:       Vec<ChatCompletionRequestMessage>,
     pub temperature:    f32,
     pub top_p:          f32,
-    pub tool_names:     Vec<ToolName>,
+    pub tool_ids:       Vec<&'static str>,
     pub max_iterations: usize,
     pub tool_host:      ActorRef<FileReader>,
 }
@@ -350,12 +457,13 @@ impl Message<ChatCompletionRequest> for LLMGateway {
         let client = self.client.clone();
         let semaphore = Arc::clone(&self.semaphore);
         let config = self.config.clone();
+        let metrics = Arc::clone(&self.metrics);
         ctx.spawn(async move {
             let _permit = semaphore
                 .acquire_owned()
                 .await
                 .map_err(|_| anyhow!("llm gateway shutting down"))?;
-            Self::run_conversation(client, msg, config).await
+            Self::run_conversation(client, msg, config, metrics).await
         })
     }
 }
