@@ -1,6 +1,5 @@
 use std::{path::PathBuf, sync::Arc};
 
-use anyhow::Result;
 use async_trait::async_trait;
 use bon::Builder;
 use kameo::prelude::ActorRef;
@@ -10,8 +9,8 @@ use serde_json::Value;
 use tracing::info;
 
 use super::{
-    CallState, Tool, ToolInputError, ToolInputResult, ToolMeta, depth_exceeded, schema_for_args,
-    trim_optional,
+    CallState, ToolExecutionError, ToolInputError, ToolInputResult, ToolInstance, ToolPrototype,
+    depth_exceeded, schema_for_args, trim_optional,
 };
 use crate::{
     constants::MAX_PARALLEL_DELEGATIONS, file_reader::run_delegate_batch_with_state,
@@ -53,8 +52,8 @@ struct DelegateTasksPayload {
     tasks: Vec<String>,
 }
 
-pub(super) fn delegate_tasks_meta() -> ToolMeta {
-    ToolMeta {
+pub(super) fn delegate_tasks_meta() -> ToolPrototype {
+    ToolPrototype {
         id:          IDENTIFIER,
         description: DESCRIPTION,
         schema:      schema_for_args::<DelegateTasksArgs>(),
@@ -62,7 +61,7 @@ pub(super) fn delegate_tasks_meta() -> ToolMeta {
     }
 }
 
-fn parse_delegate_tasks(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn Tool>> {
+fn parse_delegate_tasks(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
     if state.depth >= state.max_subdelegations {
         return Err(depth_exceeded(IDENTIFIER, state.depth, state.max_subdelegations));
     }
@@ -95,12 +94,8 @@ struct DelegateTasksTool {
 }
 
 #[async_trait]
-impl Tool for DelegateTasksTool {
-    fn id(&self) -> &'static str {
-        IDENTIFIER
-    }
-
-    async fn execute(&self) -> Result<Value> {
+impl ToolInstance for DelegateTasksTool {
+    async fn execute(&self) -> Result<Value, ToolExecutionError> {
         let next_depth = self.depth + 1;
         info!(
             "tool_call delegate_tasks depth={} tasks={} max_concurrency={}",
@@ -109,7 +104,7 @@ impl Tool for DelegateTasksTool {
             MAX_PARALLEL_DELEGATIONS
         );
 
-        run_delegate_batch_with_state(
+        let result = run_delegate_batch_with_state(
             self.gateway.clone(),
             Arc::clone(&self.model),
             Arc::clone(&self.workspace_root),
@@ -117,6 +112,8 @@ impl Tool for DelegateTasksTool {
             self.max_subdelegations,
             self.args.tasks.clone(),
         )
-        .await
+        .await?;
+
+        Ok(result)
     }
 }

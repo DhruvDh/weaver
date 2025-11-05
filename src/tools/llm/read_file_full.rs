@@ -1,6 +1,6 @@
 use std::{path::PathBuf, sync::Arc};
 
-use anyhow::{Context, Result};
+use anyhow::Context;
 use async_trait::async_trait;
 use bon::Builder;
 use schemars::JsonSchema;
@@ -9,8 +9,8 @@ use serde_json::{Value, json};
 use tracing::info;
 
 use super::{
-    CallState, Tool, ToolInputError, ToolInputResult, ToolMeta, render_relative_path,
-    resolve_workspace_path, schema_for_args,
+    CallState, ToolExecutionError, ToolInputError, ToolInputResult, ToolInstance, ToolPrototype,
+    render_relative_path, resolve_workspace_path, schema_for_args,
 };
 use crate::tools::filesystem;
 
@@ -33,8 +33,8 @@ struct ReadFileFullPayload {
     path: String,
 }
 
-pub(super) fn read_file_full_meta() -> ToolMeta {
-    ToolMeta {
+pub(super) fn read_file_full_meta() -> ToolPrototype {
+    ToolPrototype {
         id:          IDENTIFIER,
         description: DESCRIPTION,
         schema:      schema_for_args::<ReadFileFullArgs>(),
@@ -42,7 +42,7 @@ pub(super) fn read_file_full_meta() -> ToolMeta {
     }
 }
 
-fn parse_read_file_full(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn Tool>> {
+fn parse_read_file_full(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
     let payload: ReadFileFullPayload =
         serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
             tool:    IDENTIFIER,
@@ -65,13 +65,10 @@ struct ReadFileFullTool {
 }
 
 #[async_trait]
-impl Tool for ReadFileFullTool {
-    fn id(&self) -> &'static str {
-        IDENTIFIER
-    }
-
-    async fn execute(&self) -> Result<Value> {
-        let resolved = resolve_workspace_path(self.workspace_root.as_ref(), &self.args.path)?;
+impl ToolInstance for ReadFileFullTool {
+    async fn execute(&self) -> Result<Value, ToolExecutionError> {
+        let resolved =
+            resolve_workspace_path(self.workspace_root.as_ref(), &self.args.path, IDENTIFIER)?;
         let content = filesystem::read_file_full(&resolved)
             .await
             .with_context(|| format!("read_file_full failed for {}", resolved.display()))?;

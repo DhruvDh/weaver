@@ -1,6 +1,6 @@
 use std::{path::PathBuf, sync::Arc};
 
-use anyhow::{Context, Result};
+use anyhow::Context;
 use async_trait::async_trait;
 use bon::Builder;
 use schemars::JsonSchema;
@@ -9,8 +9,8 @@ use serde_json::{Value, json};
 use tracing::info;
 
 use super::{
-    CallState, Tool, ToolInputError, ToolInputResult, ToolMeta, render_relative_path,
-    resolve_workspace_path, schema_for_args, trim_optional,
+    CallState, ToolExecutionError, ToolInputError, ToolInputResult, ToolInstance, ToolPrototype,
+    render_relative_path, resolve_workspace_path, schema_for_args, trim_optional,
 };
 use crate::tools::filesystem;
 
@@ -35,8 +35,8 @@ struct ListDirectoryPayload {
     path: Option<String>,
 }
 
-pub(super) fn list_directory_meta() -> ToolMeta {
-    ToolMeta {
+pub(super) fn list_directory_meta() -> ToolPrototype {
+    ToolPrototype {
         id:          IDENTIFIER,
         description: DESCRIPTION,
         schema:      schema_for_args::<ListDirectoryArgs>(),
@@ -44,7 +44,7 @@ pub(super) fn list_directory_meta() -> ToolMeta {
     }
 }
 
-fn parse_list_directory(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn Tool>> {
+fn parse_list_directory(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
     let payload: ListDirectoryPayload =
         serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
             tool:    IDENTIFIER,
@@ -70,14 +70,10 @@ struct ListDirectoryTool {
 }
 
 #[async_trait]
-impl Tool for ListDirectoryTool {
-    fn id(&self) -> &'static str {
-        IDENTIFIER
-    }
-
-    async fn execute(&self) -> Result<Value> {
+impl ToolInstance for ListDirectoryTool {
+    async fn execute(&self) -> Result<Value, ToolExecutionError> {
         let relative = self.args.path.as_deref().unwrap_or(".");
-        let resolved = resolve_workspace_path(self.workspace_root.as_ref(), relative)?;
+        let resolved = resolve_workspace_path(self.workspace_root.as_ref(), relative, IDENTIFIER)?;
         let entries = filesystem::list_dir(&resolved)
             .await
             .with_context(|| format!("list_directory failed for {}", resolved.display()))?;

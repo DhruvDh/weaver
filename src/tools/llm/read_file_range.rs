@@ -1,6 +1,6 @@
 use std::{path::PathBuf, sync::Arc};
 
-use anyhow::{Context, Result};
+use anyhow::Context;
 use async_trait::async_trait;
 use bon::Builder;
 use schemars::JsonSchema;
@@ -9,8 +9,8 @@ use serde_json::{Value, json};
 use tracing::info;
 
 use super::{
-    CallState, Tool, ToolInputError, ToolInputResult, ToolMeta, ensure_ordering,
-    render_relative_path, resolve_workspace_path, schema_for_args,
+    CallState, ToolExecutionError, ToolInputError, ToolInputResult, ToolInstance, ToolPrototype,
+    ensure_ordering, render_relative_path, resolve_workspace_path, schema_for_args,
 };
 use crate::tools::filesystem;
 
@@ -45,8 +45,8 @@ struct ReadFileRangePayload {
     end_line:   usize,
 }
 
-pub(super) fn read_file_range_meta() -> ToolMeta {
-    ToolMeta {
+pub(super) fn read_file_range_meta() -> ToolPrototype {
+    ToolPrototype {
         id:          IDENTIFIER,
         description: DESCRIPTION,
         schema:      schema_for_args::<ReadFileRangeArgs>(),
@@ -54,7 +54,7 @@ pub(super) fn read_file_range_meta() -> ToolMeta {
     }
 }
 
-fn parse_read_file_range(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn Tool>> {
+fn parse_read_file_range(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
     let payload: ReadFileRangePayload =
         serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
             tool:    IDENTIFIER,
@@ -83,13 +83,10 @@ struct ReadFileRangeTool {
 }
 
 #[async_trait]
-impl Tool for ReadFileRangeTool {
-    fn id(&self) -> &'static str {
-        IDENTIFIER
-    }
-
-    async fn execute(&self) -> Result<Value> {
-        let resolved = resolve_workspace_path(self.workspace_root.as_ref(), &self.args.path)?;
+impl ToolInstance for ReadFileRangeTool {
+    async fn execute(&self) -> Result<Value, ToolExecutionError> {
+        let resolved =
+            resolve_workspace_path(self.workspace_root.as_ref(), &self.args.path, IDENTIFIER)?;
         let range =
             filesystem::read_file_range(&resolved, self.args.start_line, self.args.end_line)
                 .await

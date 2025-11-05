@@ -4,7 +4,7 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use async_openai::types::{
     ChatCompletionTool, ChatCompletionToolArgs, ChatCompletionToolType, FunctionObjectArgs,
 };
@@ -14,6 +14,7 @@ use once_cell::sync::Lazy;
 use schemars::{JsonSchema, schema_for};
 use serde_json::{self, Value};
 use thiserror::Error;
+use tracing::warn;
 
 use self::{
     delegate_tasks::delegate_tasks_meta, list_directory::list_directory_meta,
@@ -30,33 +31,74 @@ mod search_text;
 
 const MASKED_PATH: &str = "<path-unavailable>";
 
-#[async_trait]
-pub trait Tool: Send + Sync {
-    fn id(&self) -> &'static str;
-    async fn execute(&self) -> Result<Value>;
+#[derive(Debug)]
+pub enum ToolExecutionError {
+    Input(ToolInputError),
+    Internal(anyhow::Error),
 }
 
-pub type ToolParser = fn(Value, &CallState) -> ToolInputResult<Box<dyn Tool>>;
+impl ToolExecutionError {
+    pub fn user(err: ToolInputError) -> Self {
+        Self::Input(err)
+    }
 
-pub struct ToolMeta {
+    pub fn system(err: anyhow::Error) -> Self {
+        Self::Internal(err)
+    }
+}
+
+impl From<anyhow::Error> for ToolExecutionError {
+    fn from(err: anyhow::Error) -> Self {
+        ToolExecutionError::Internal(err)
+    }
+}
+impl From<ToolInputError> for ToolExecutionError {
+    fn from(err: ToolInputError) -> Self {
+        ToolExecutionError::Input(err)
+    }
+}
+
+pub type ToolExecutionResult = Result<Value, ToolExecutionError>;
+
+#[async_trait]
+pub trait ToolInstance: Send {
+    async fn execute(&self) -> ToolExecutionResult;
+}
+
+pub type ToolParser = fn(Value, &CallState) -> ToolInputResult<Box<dyn ToolInstance>>;
+
+pub struct ToolPrototype {
     pub id:          &'static str,
     pub description: &'static str,
     pub schema:      Value,
     pub parse:       ToolParser,
 }
 
-static TOOL_METADATA: Lazy<Vec<ToolMeta>> = Lazy::new(|| {
-    vec![
+static TOOL_PROTOTYPES: Lazy<Vec<ToolPrototype>> = Lazy::new(|| {
+    let metas = vec![
         list_directory_meta(),
         read_file_full_meta(),
         read_file_range_meta(),
         search_text_meta(),
         delegate_tasks_meta(),
-    ]
+    ];
+
+    let mut seen = HashMap::new();
+    for meta in &metas {
+        if let Some(existing) = seen.insert(meta.id, meta.description) {
+            panic!(
+                "duplicate tool identifier `{}` detected (existing description: `{}`, new \
+                 description: `{}`)",
+                meta.id, existing, meta.description,
+            );
+        }
+    }
+
+    metas
 });
 
-static TOOL_INDEX: Lazy<HashMap<&'static str, &'static ToolMeta>> =
-    Lazy::new(|| TOOL_METADATA.iter().map(|meta| (meta.id, meta)).collect());
+static TOOL_PROTOTYPE_INDEX: Lazy<HashMap<&'static str, &'static ToolPrototype>> =
+    Lazy::new(|| TOOL_PROTOTYPES.iter().map(|meta| (meta.id, meta)).collect());
 
 #[derive(Clone)]
 pub struct CallState {
@@ -67,25 +109,31 @@ pub struct CallState {
     pub model:              Arc<String>,
 }
 
-pub fn all_tools() -> &'static [ToolMeta] {
-    &TOOL_METADATA
+pub fn all_tools() -> &'static [ToolPrototype] {
+    &TOOL_PROTOTYPES
 }
 
-pub fn lookup_tool(id: &str) -> Option<&'static ToolMeta> {
-    TOOL_INDEX.get(id).copied()
+pub fn lookup_tool(id: &str) -> Option<&'static ToolPrototype> {
+    TOOL_PROTOTYPE_INDEX.get(id).copied()
 }
 
 pub fn tool_specs(ids: &[&str]) -> Result<Vec<ChatCompletionTool>> {
-    let metas: Vec<&ToolMeta> = if ids.is_empty() {
-        TOOL_METADATA.iter().collect()
+    let metas: Vec<&ToolPrototype> = if ids.is_empty() {
+        TOOL_PROTOTYPES.iter().collect()
     } else {
         let mut selected = Vec::with_capacity(ids.len());
         for id in ids {
-            let meta = lookup_tool(id).ok_or_else(|| anyhow!(unsupported_tool(id)))?;
-            selected.push(meta);
+            match lookup_tool(id) {
+                Some(meta) => selected.push(meta),
+                None => warn!(tool = *id, "tool identifier not registered; skipping"),
+            }
         }
         selected
     };
+
+    if metas.is_empty() {
+        bail!("no registered tools available for schema generation");
+    }
 
     metas
         .into_iter()
@@ -106,7 +154,11 @@ pub fn tool_specs(ids: &[&str]) -> Result<Vec<ChatCompletionTool>> {
         .collect()
 }
 
-pub fn resolve_workspace_path(root: &Path, relative: impl AsRef<Path>) -> Result<PathBuf> {
+pub fn resolve_workspace_path(
+    root: &Path,
+    relative: impl AsRef<Path>,
+    tool: &'static str,
+) -> ToolInputResult<PathBuf> {
     let rel = relative.as_ref();
     let candidate = if rel.is_absolute() {
         rel.to_path_buf()
@@ -115,9 +167,17 @@ pub fn resolve_workspace_path(root: &Path, relative: impl AsRef<Path>) -> Result
     };
     let canonical = candidate
         .canonicalize()
-        .with_context(|| format!("failed to canonicalize resolved path {}", candidate.display()))?;
+        .map_err(|err| ToolInputError::InvalidPath {
+            tool,
+            path: candidate.display().to_string(),
+            message: err.to_string(),
+        })?;
     if !canonical.starts_with(root) {
-        bail!("path {} escapes workspace root {}", canonical.display(), root.display());
+        return Err(ToolInputError::InvalidPath {
+            tool,
+            path: canonical.display().to_string(),
+            message: format!("escapes workspace root {}", root.display()),
+        });
     }
     Ok(canonical)
 }
@@ -171,6 +231,12 @@ pub enum ToolInputError {
         tool:  &'static str,
         depth: usize,
         limit: usize,
+    },
+    #[error("{tool} path `{path}` is invalid: {message}")]
+    InvalidPath {
+        tool:    &'static str,
+        path:    String,
+        message: String,
     },
 }
 

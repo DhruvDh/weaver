@@ -4,7 +4,7 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{Context as _, Result, anyhow, bail};
+use anyhow::{Context as _, Result, anyhow};
 use async_openai::types::{
     ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
     ChatCompletionRequestUserMessageArgs,
@@ -19,7 +19,7 @@ use crate::{
         MAX_TOOL_ITERATIONS, PRETEXT_SUBDIR,
     },
     llm_gateway::{ChatCompletionRequest, LLMGateway},
-    tools::llm::{self, CallState},
+    tools::llm::{self, CallState, ToolExecutionError},
 };
 
 const SYSTEM_PROMPT_TEMPLATE: &str = r#"You are Weaver's file-reading assistant assigned to explore the UNCC CS2 PreTeXt project.
@@ -113,11 +113,17 @@ pub(crate) async fn run_delegate_batch_with_state(
     max_subdelegations: usize,
     tasks: Vec<String>,
 ) -> Result<Value> {
-    let total = tasks.len();
-    if total == 0 {
-        bail!("delegate_tasks requires at least one task");
+    if tasks.is_empty() {
+        return Ok(json!({
+            "type": "delegation_batch_result",
+            "depth": depth + 1,
+            "requested": 0,
+            "max_concurrency": 0,
+            "results": [],
+        }));
     }
 
+    let total = tasks.len();
     let limit = MAX_PARALLEL_DELEGATIONS.min(total);
 
     let results = stream::iter(tasks.into_iter())
@@ -184,14 +190,12 @@ impl Message<FileReaderQuery> for FileReader {
             let system_msg: ChatCompletionRequestMessage =
                 ChatCompletionRequestSystemMessageArgs::default()
                     .content(system_prompt)
-                    .build()
-                    .map_err(|err| anyhow!(err))?
+                    .build()?
                     .into();
             let user_msg: ChatCompletionRequestMessage =
                 ChatCompletionRequestUserMessageArgs::default()
                     .content(prompt)
-                    .build()
-                    .map_err(|err| anyhow!(err))?
+                    .build()?
                     .into();
             let request = ChatCompletionRequest {
                 model,
@@ -203,14 +207,14 @@ impl Message<FileReaderQuery> for FileReader {
                 tool_host,
             };
 
-            let response = gateway.ask(request).await.map_err(|err| anyhow!(err))?;
+            let response = gateway.ask(request).await?;
             Ok(response)
         })
     }
 }
 
 impl Message<ExecuteTool> for FileReader {
-    type Reply = Result<Value>;
+    type Reply = Result<Value, ToolExecutionError>;
 
     async fn handle(
         &mut self,
@@ -220,8 +224,10 @@ impl Message<ExecuteTool> for FileReader {
         }: ExecuteTool,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let meta = llm::lookup_tool(&identifier)
-            .ok_or_else(|| anyhow!(llm::unsupported_tool(&identifier)))?;
+        let meta = match llm::lookup_tool(&identifier) {
+            Some(meta) => meta,
+            None => return Err(llm::unsupported_tool(&identifier).into()),
+        };
 
         let state = CallState {
             depth:              self.depth,
@@ -231,7 +237,8 @@ impl Message<ExecuteTool> for FileReader {
             model:              Arc::clone(&self.model),
         };
 
-        let tool = (meta.parse)(arguments, &state).map_err(|err| anyhow!(err))?;
+        let tool = (meta.parse)(arguments, &state).map_err(ToolExecutionError::from)?;
+
         tool.execute().await
     }
 }

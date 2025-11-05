@@ -1,6 +1,6 @@
 use std::{path::PathBuf, sync::Arc};
 
-use anyhow::{Context, Result};
+use anyhow::Context;
 use async_trait::async_trait;
 use bon::Builder;
 use schemars::JsonSchema;
@@ -9,8 +9,8 @@ use serde_json::{Value, json};
 use tracing::info;
 
 use super::{
-    CallState, Tool, ToolInputError, ToolInputResult, ToolMeta, render_relative_path,
-    resolve_workspace_path, schema_for_args, trim_optional,
+    CallState, ToolExecutionError, ToolInputError, ToolInputResult, ToolInstance, ToolPrototype,
+    render_relative_path, resolve_workspace_path, schema_for_args, trim_optional,
 };
 use crate::tools::search;
 
@@ -41,8 +41,8 @@ struct SearchTextPayload {
     path:    Option<String>,
 }
 
-pub(super) fn search_text_meta() -> ToolMeta {
-    ToolMeta {
+pub(super) fn search_text_meta() -> ToolPrototype {
+    ToolPrototype {
         id:          IDENTIFIER,
         description: DESCRIPTION,
         schema:      schema_for_args::<SearchTextArgs>(),
@@ -50,7 +50,7 @@ pub(super) fn search_text_meta() -> ToolMeta {
     }
 }
 
-fn parse_search_text(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn Tool>> {
+fn parse_search_text(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
     let payload: SearchTextPayload =
         serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
             tool:    IDENTIFIER,
@@ -79,14 +79,12 @@ struct SearchTextTool {
 }
 
 #[async_trait]
-impl Tool for SearchTextTool {
-    fn id(&self) -> &'static str {
-        IDENTIFIER
-    }
-
-    async fn execute(&self) -> Result<Value> {
+impl ToolInstance for SearchTextTool {
+    async fn execute(&self) -> Result<Value, ToolExecutionError> {
         let scope = match self.args.path.as_deref() {
-            Some(relative) => resolve_workspace_path(self.workspace_root.as_ref(), relative)?,
+            Some(relative) => {
+                resolve_workspace_path(self.workspace_root.as_ref(), relative, IDENTIFIER)?
+            }
             None => (*self.workspace_root).clone(),
         };
 

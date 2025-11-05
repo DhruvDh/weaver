@@ -1,6 +1,9 @@
 use std::{
     env,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -22,7 +25,7 @@ use tokio::{
     sync::Semaphore,
     time::{sleep, timeout},
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, error, warn};
 
 use crate::{
     constants::{
@@ -52,52 +55,52 @@ impl Default for GatewayConfig {
     }
 }
 
-pub trait GatewayMetrics: Send + Sync {
-    fn record_completion(
-        &self,
-        model: &str,
-        prompt_tokens: u32,
-        completion_tokens: u32,
-        total_tokens: u32,
-        latency: Duration,
-    );
+#[derive(Default, Debug)]
+pub struct GatewayMetrics {
+    total_calls:       AtomicU64,
+    total_tokens:      AtomicU64,
+    prompt_tokens:     AtomicU64,
+    completion_tokens: AtomicU64,
+    last_latency_ms:   AtomicU64,
 }
 
-#[derive(Default)]
-struct NoopMetrics;
-
-impl GatewayMetrics for NoopMetrics {
-    fn record_completion(
-        &self,
-        _model: &str,
-        _prompt_tokens: u32,
-        _completion_tokens: u32,
-        _total_tokens: u32,
-        _latency: Duration,
-    ) {
-    }
-}
-
-pub struct LoggingMetrics;
-
-impl GatewayMetrics for LoggingMetrics {
-    fn record_completion(
-        &self,
-        model: &str,
-        prompt_tokens: u32,
-        completion_tokens: u32,
-        total_tokens: u32,
-        latency: Duration,
-    ) {
-        info!(
-            model,
-            prompt_tokens,
-            completion_tokens,
-            total_tokens,
+impl GatewayMetrics {
+    fn record_completion(&self, prompt: u32, completion: u32, total: u32, latency: Duration) {
+        self.total_calls.fetch_add(1, Ordering::Relaxed);
+        self.prompt_tokens
+            .fetch_add(prompt as u64, Ordering::Relaxed);
+        self.completion_tokens
+            .fetch_add(completion as u64, Ordering::Relaxed);
+        self.total_tokens.fetch_add(total as u64, Ordering::Relaxed);
+        self.last_latency_ms
+            .store(latency.as_millis() as u64, Ordering::Relaxed);
+        debug!(
+            prompt_tokens = prompt,
+            completion_tokens = completion,
+            total_tokens = total,
             latency_ms = latency.as_millis(),
-            "llm_gateway completion metrics"
+            "llm_gateway completion"
         );
     }
+
+    pub fn snapshot(&self) -> GatewayMetricsSnapshot {
+        GatewayMetricsSnapshot {
+            total_calls:       self.total_calls.load(Ordering::Relaxed),
+            total_tokens:      self.total_tokens.load(Ordering::Relaxed),
+            prompt_tokens:     self.prompt_tokens.load(Ordering::Relaxed),
+            completion_tokens: self.completion_tokens.load(Ordering::Relaxed),
+            last_latency_ms:   self.last_latency_ms.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct GatewayMetricsSnapshot {
+    pub total_calls:       u64,
+    pub total_tokens:      u64,
+    pub prompt_tokens:     u64,
+    pub completion_tokens: u64,
+    pub last_latency_ms:   u64,
 }
 
 #[derive(Actor)]
@@ -105,7 +108,7 @@ pub struct LLMGateway {
     client:    Client<OpenAIConfig>,
     semaphore: Arc<Semaphore>,
     config:    GatewayConfig,
-    metrics:   Arc<dyn GatewayMetrics>,
+    metrics:   Arc<GatewayMetrics>,
 }
 
 impl LLMGateway {
@@ -120,13 +123,17 @@ impl LLMGateway {
             client,
             semaphore: Arc::new(Semaphore::new(LLM_MAX_CONCURRENT_REQUESTS)),
             config: GatewayConfig::default(),
-            metrics: Arc::new(NoopMetrics),
+            metrics: Arc::new(Default::default()),
         })
     }
 
-    pub fn with_metrics(mut self, metrics: Arc<dyn GatewayMetrics>) -> Self {
+    pub fn with_metrics(mut self, metrics: Arc<GatewayMetrics>) -> Self {
         self.metrics = metrics;
         self
+    }
+
+    pub fn metrics(&self) -> Arc<GatewayMetrics> {
+        Arc::clone(&self.metrics)
     }
 
     fn build_request(
@@ -198,9 +205,8 @@ impl LLMGateway {
     async fn call_with_retry<F>(
         client: &Client<OpenAIConfig>,
         config: &GatewayConfig,
-        metrics: &Arc<dyn GatewayMetrics>,
+        metrics: &Arc<GatewayMetrics>,
         iteration: usize,
-        model: &str,
         mut build_payload: F,
     ) -> Result<CreateChatCompletionResponse>
     where
@@ -216,7 +222,6 @@ impl LLMGateway {
                 Ok(Ok(resp)) => {
                     if let Some(usage) = resp.usage.as_ref() {
                         metrics.record_completion(
-                            model,
                             usage.prompt_tokens,
                             usage.completion_tokens,
                             usage.total_tokens,
@@ -278,12 +283,14 @@ impl LLMGateway {
 
     fn tool_error_payload(
         tool: &str,
+        code: &str,
         arguments: serde_json::Value,
         message: impl Into<String>,
     ) -> serde_json::Value {
         json!({
             "type": "tool_error",
             "tool": tool,
+            "code": code,
             "arguments": arguments,
             "message": message.into(),
         })
@@ -293,29 +300,22 @@ impl LLMGateway {
         client: Client<OpenAIConfig>,
         request: ChatCompletionRequest,
         config: GatewayConfig,
-        metrics: Arc<dyn GatewayMetrics>,
+        metrics: Arc<GatewayMetrics>,
     ) -> Result<String> {
         let mut messages = request.messages.clone();
         let tools = llm::tool_specs(&request.tool_ids)
             .context("failed to render tool specifications for request")?;
         for iteration in 0..request.max_iterations {
             debug!(iteration, "Starting LLM tool iteration");
-            let response = Self::call_with_retry(
-                &client,
-                &config,
-                &metrics,
-                iteration,
-                request.model.as_str(),
-                || {
-                    Self::build_request(
-                        request.model.as_str(),
-                        &messages,
-                        request.temperature,
-                        request.top_p,
-                        tools.clone(),
-                    )
-                },
-            )
+            let response = Self::call_with_retry(&client, &config, &metrics, iteration, || {
+                Self::build_request(
+                    request.model.as_str(),
+                    &messages,
+                    request.temperature,
+                    request.top_p,
+                    tools.clone(),
+                )
+            })
             .await?;
 
             let mut choices = response.choices.into_iter();
@@ -360,6 +360,7 @@ impl LLMGateway {
                                 );
                                 let payload = Self::tool_error_payload(
                                     &tool_name,
+                                    "invalid_json",
                                     json!(raw_arguments),
                                     format!("invalid JSON arguments: {err}"),
                                 );
@@ -376,6 +377,7 @@ impl LLMGateway {
                         );
                         let payload = Self::tool_error_payload(
                             &tool_name,
+                            "unsupported_tool",
                             parsed_args.clone(),
                             format!("unsupported tool: {}", tool_name),
                         );
@@ -397,17 +399,58 @@ impl LLMGateway {
                         .await;
                     let payload = match result {
                         Ok(value) => value,
-                        Err(SendError::HandlerError(err)) => {
-                            warn!(
-                                iteration,
-                                tool = tool_name.as_str(),
-                                error = %err,
-                                "tool execution failed"
-                            );
-                            Self::tool_error_payload(&tool_name, parsed_args, err.to_string())
-                        }
+                        Err(SendError::HandlerError(err)) => match err {
+                            llm::ToolExecutionError::Input(input_err) => {
+                                warn!(
+                                    iteration,
+                                    tool = tool_name.as_str(),
+                                    error = %input_err,
+                                    "tool reported invalid input"
+                                );
+                                Self::tool_error_payload(
+                                    &tool_name,
+                                    match &input_err {
+                                        llm::ToolInputError::MissingField { .. } => "missing_field",
+                                        llm::ToolInputError::EmptyField { .. } => "empty_field",
+                                        llm::ToolInputError::BelowMinimum { .. } => "below_minimum",
+                                        llm::ToolInputError::InvalidRange { .. } => "invalid_range",
+                                        llm::ToolInputError::EmptyCollection { .. } => {
+                                            "empty_collection"
+                                        }
+                                        llm::ToolInputError::UnsupportedTool { .. } => {
+                                            "unsupported_tool"
+                                        }
+                                        llm::ToolInputError::InvalidPayload { .. } => {
+                                            "invalid_payload"
+                                        }
+                                        llm::ToolInputError::DepthExceeded { .. } => {
+                                            "depth_exceeded"
+                                        }
+                                        llm::ToolInputError::InvalidPath { .. } => "invalid_path",
+                                    },
+                                    parsed_args.clone(),
+                                    input_err.to_string(),
+                                )
+                            }
+                            llm::ToolExecutionError::Internal(internal_err) => {
+                                error!(
+                                    iteration,
+                                    tool = tool_name.as_str(),
+                                    error = ?internal_err,
+                                    "tool execution failed"
+                                );
+                                let payload = Self::tool_error_payload(
+                                    &tool_name,
+                                    "internal_error",
+                                    parsed_args.clone(),
+                                    internal_err.to_string(),
+                                );
+                                Self::push_tool_payload(&mut messages, &call_id, payload)?;
+                                continue;
+                            }
+                        },
                         Err(other) => {
-                            return Err(anyhow!(other));
+                            return Err(anyhow!("tool host communication failed: {other:?}"));
                         }
                     };
                     Self::push_tool_payload(&mut messages, &call_id, payload)?;
