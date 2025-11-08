@@ -93,7 +93,7 @@ impl ToolInstance for ReadFileFullTool {
             .await
             .with_context(|| format!("read_file_full failed for {}", resolved.display()))?;
 
-        let file_bytes = content.as_bytes().len() as u64;
+        let file_bytes = content.len() as u64;
         let line_count = content.lines().count() as u64;
         let token_estimates =
             prepare_payload_estimates(&self.metrics, self.model.as_str(), file_bytes);

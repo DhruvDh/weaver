@@ -3,7 +3,7 @@ use std::{path::PathBuf, sync::Arc};
 use anyhow::{Result, anyhow};
 use bpaf::{OptionParser, Parser, construct, positional};
 use kameo::prelude::*;
-use tracing::debug;
+use tracing::{debug, error};
 use tracing_subscriber::EnvFilter;
 use weaver::{
     constants::PRETEXT_SUBDIR,
@@ -43,11 +43,11 @@ async fn main() -> Result<()> {
     let actor = match FileReader::from_env(workspace, gateway.clone(), Arc::clone(&metrics)) {
         Ok(actor) => actor,
         Err(err) => {
-            debug!(
+            error!(
                 error = %err,
-                "Skipping FileReader demo; set OPENAI_MODEL to enable LLM tools"
+                "Failed to initialize FileReader; set OPENAI_MODEL to enable LLM tools"
             );
-            return Ok(());
+            return Err(err);
         }
     };
 

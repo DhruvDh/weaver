@@ -119,7 +119,7 @@ impl ToolInstance for ReadFileRangeTool {
                 })?;
 
         let line_count = range.end_line.saturating_sub(range.start_line) + 1;
-        let range_bytes = range.text.as_bytes().len() as u64;
+        let range_bytes = range.text.len() as u64;
         let token_estimates =
             prepare_payload_estimates(&self.metrics, self.model.as_str(), range_bytes);
         let safe_tokens = token_estimates.safe_tokens;
