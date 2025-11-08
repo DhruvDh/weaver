@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     env,
     sync::{
         Arc,
@@ -19,13 +20,15 @@ use async_openai::{
     },
 };
 use kameo::{error::SendError, prelude::*, reply::DelegatedReply};
+use once_cell::sync::Lazy;
+use parking_lot::RwLock;
 use rand::{Rng, thread_rng};
 use serde_json::{self, json};
 use tokio::{
     sync::Semaphore,
     time::{sleep, timeout},
 };
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     constants::{
@@ -33,7 +36,7 @@ use crate::{
         RETRY_MAX_EXP, RETRY_MAX_JITTER_MS,
     },
     file_reader::{ExecuteTool, FileReader},
-    tools::llm,
+    tools::llm::{self, ToolOutput},
 };
 
 #[derive(Clone)]
@@ -55,13 +58,47 @@ impl Default for GatewayConfig {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct TokenEstimator {
+    observed_bytes:  u64,
+    observed_tokens: u64,
+}
+
+impl TokenEstimator {
+    fn update(&mut self, bytes: u64, tokens: u64) {
+        self.observed_bytes = self.observed_bytes.saturating_add(bytes);
+        self.observed_tokens = self.observed_tokens.saturating_add(tokens);
+    }
+
+    fn predict(&self, bytes: u64) -> Option<u64> {
+        if self.observed_bytes == 0 || bytes == 0 {
+            return None;
+        }
+        let numerator = (self.observed_tokens as u128).saturating_mul(bytes as u128);
+        let denominator = self.observed_bytes as u128;
+        Some((numerator / denominator) as u64)
+    }
+}
+
+#[derive(Default, Debug)]
+struct ConversationAccumulator {
+    total_tokens: u64,
+    count:        u64,
+}
+
 #[derive(Default, Debug)]
 pub struct GatewayMetrics {
-    total_calls:       AtomicU64,
-    total_tokens:      AtomicU64,
-    prompt_tokens:     AtomicU64,
-    completion_tokens: AtomicU64,
-    last_latency_ms:   AtomicU64,
+    total_calls:                AtomicU64,
+    total_tokens:               AtomicU64,
+    prompt_tokens:              AtomicU64,
+    completion_tokens:          AtomicU64,
+    last_latency_ms:            AtomicU64,
+    last_prompt_tokens:         AtomicU64,
+    last_completion_tokens:     AtomicU64,
+    estimators:                 RwLock<HashMap<String, TokenEstimator>>,
+    conversation_stats:         RwLock<HashMap<String, ConversationAccumulator>>,
+    conversation_prompt_tokens: RwLock<HashMap<String, u64>>,
+    context_limits:             RwLock<HashMap<String, u32>>,
 }
 
 impl GatewayMetrics {
@@ -74,6 +111,10 @@ impl GatewayMetrics {
         self.total_tokens.fetch_add(total as u64, Ordering::Relaxed);
         self.last_latency_ms
             .store(latency.as_millis() as u64, Ordering::Relaxed);
+        self.last_prompt_tokens
+            .store(prompt as u64, Ordering::Relaxed);
+        self.last_completion_tokens
+            .store(completion as u64, Ordering::Relaxed);
         debug!(
             prompt_tokens = prompt,
             completion_tokens = completion,
@@ -83,25 +124,117 @@ impl GatewayMetrics {
         );
     }
 
-    pub fn snapshot(&self) -> GatewayMetricsSnapshot {
-        GatewayMetricsSnapshot {
-            total_calls:       self.total_calls.load(Ordering::Relaxed),
-            total_tokens:      self.total_tokens.load(Ordering::Relaxed),
-            prompt_tokens:     self.prompt_tokens.load(Ordering::Relaxed),
-            completion_tokens: self.completion_tokens.load(Ordering::Relaxed),
-            last_latency_ms:   self.last_latency_ms.load(Ordering::Relaxed),
+    pub fn latest_prompt_tokens(&self) -> Option<u64> {
+        let tokens = self.last_prompt_tokens.load(Ordering::Relaxed);
+        if tokens == 0 { None } else { Some(tokens) }
+    }
+
+    pub fn reset_conversation_prompt_tokens(&self, conversation: &str) {
+        let mut guard = self.conversation_prompt_tokens.write();
+        guard.remove(conversation);
+    }
+
+    pub fn record_conversation_prompt_tokens(&self, conversation: &str, tokens: u64) {
+        let mut guard = self.conversation_prompt_tokens.write();
+        guard.insert(conversation.to_string(), tokens);
+    }
+
+    pub fn latest_prompt_tokens_for_conversation(&self, conversation: &str) -> Option<u64> {
+        self.conversation_prompt_tokens
+            .read()
+            .get(conversation)
+            .copied()
+            .filter(|value| *value > 0)
+    }
+
+    fn observe_payload_bytes(&self, model: &str, bytes: u64, prompt_delta: u64) {
+        if bytes == 0 || prompt_delta == 0 {
+            return;
+        }
+        let mut estimators = self.estimators.write();
+        let estimator = estimators.entry(model.to_string()).or_default();
+        estimator.update(bytes, prompt_delta);
+    }
+
+    pub fn estimate_tokens(&self, model: &str, bytes: u64) -> Option<u64> {
+        if bytes == 0 {
+            return None;
+        }
+        let estimators = self.estimators.read();
+        estimators
+            .get(model)
+            .and_then(|estimator| estimator.predict(bytes))
+    }
+
+    fn record_conversation_tokens(&self, actor: &str, tokens: u64) {
+        let mut stats = self.conversation_stats.write();
+        let entry = stats.entry(actor.to_string()).or_default();
+        entry.total_tokens = entry.total_tokens.saturating_add(tokens);
+        entry.count = entry.count.saturating_add(1);
+    }
+
+    pub fn log_summary(&self) {
+        let total_calls = self.total_calls.load(Ordering::Relaxed);
+        let total_tokens = self.total_tokens.load(Ordering::Relaxed);
+        let prompt_tokens = self.prompt_tokens.load(Ordering::Relaxed);
+        let completion_tokens = self.completion_tokens.load(Ordering::Relaxed);
+        info!(
+            total_calls,
+            total_tokens, prompt_tokens, completion_tokens, "llm_gateway summary"
+        );
+        let stats = self.conversation_stats.read();
+        for (actor, acc) in stats.iter() {
+            if acc.count == 0 {
+                continue;
+            }
+            let avg = (acc.total_tokens as f64) / (acc.count as f64);
+            info!(
+                actor = actor.as_str(),
+                conversations = acc.count,
+                total_tokens = acc.total_tokens,
+                avg_tokens = avg,
+                "llm_gateway conversation usage"
+            );
+        }
+    }
+
+    pub fn context_limit(&self, model: &str) -> u32 {
+        if let Some(limit) = self.context_limits.read().get(model) {
+            return *limit;
+        }
+        let fallback = *DEFAULT_CONTEXT_LIMIT;
+        let mut guard = self.context_limits.write();
+        *guard.entry(model.to_string()).or_insert(fallback)
+    }
+}
+
+struct ConversationPromptGuard {
+    metrics: Arc<GatewayMetrics>,
+    conversation_id: String,
+}
+
+impl ConversationPromptGuard {
+    fn new(metrics: Arc<GatewayMetrics>, conversation_id: String) -> Self {
+        Self {
+            metrics,
+            conversation_id,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct GatewayMetricsSnapshot {
-    pub total_calls:       u64,
-    pub total_tokens:      u64,
-    pub prompt_tokens:     u64,
-    pub completion_tokens: u64,
-    pub last_latency_ms:   u64,
+impl Drop for ConversationPromptGuard {
+    fn drop(&mut self) {
+        self.metrics
+            .reset_conversation_prompt_tokens(&self.conversation_id);
+    }
 }
+
+static DEFAULT_CONTEXT_LIMIT: Lazy<u32> = Lazy::new(|| {
+    env::var("WEAVER_CONTEXT_LIMIT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(131_072)
+});
 
 #[derive(Actor)]
 pub struct LLMGateway {
@@ -270,15 +403,17 @@ impl LLMGateway {
         messages: &mut Vec<ChatCompletionRequestMessage>,
         call_id: &str,
         payload: serde_json::Value,
-    ) -> Result<()> {
+    ) -> Result<u64> {
+        let content = payload.to_string();
+        let bytes = content.len() as u64;
         let tool_msg = ChatCompletionRequestToolMessageArgs::default()
             .tool_call_id(call_id.to_string())
-            .content(payload.to_string())
+            .content(content)
             .build()
             .context("failed to build tool response message")?
             .into();
         messages.push(tool_msg);
-        Ok(())
+        Ok(bytes)
     }
 
     fn tool_error_payload(
@@ -303,6 +438,14 @@ impl LLMGateway {
         metrics: Arc<GatewayMetrics>,
     ) -> Result<String> {
         let mut messages = request.messages.clone();
+        let actor_name = request.actor_name.clone();
+        let conversation_id = request.conversation_id.clone();
+        metrics.reset_conversation_prompt_tokens(&conversation_id);
+        let _prompt_guard =
+            ConversationPromptGuard::new(Arc::clone(&metrics), conversation_id.clone());
+        let mut pending_bytes: u64 = 0;
+        let mut latest_total_tokens: u64 = 0;
+        let mut last_prompt_total: u32 = 0;
         let tools = llm::tool_specs(&request.tool_ids)
             .context("failed to render tool specifications for request")?;
         for iteration in 0..request.max_iterations {
@@ -317,6 +460,22 @@ impl LLMGateway {
                 )
             })
             .await?;
+
+            if let Some(usage) = response.usage.as_ref() {
+                latest_total_tokens = usage.total_tokens as u64;
+                let prompt_total = usage.prompt_tokens;
+                let prompt_delta = prompt_total.saturating_sub(last_prompt_total);
+                last_prompt_total = prompt_total;
+                metrics.record_conversation_prompt_tokens(&conversation_id, prompt_total as u64);
+                if prompt_delta > 0 && pending_bytes > 0 {
+                    metrics.observe_payload_bytes(
+                        request.model.as_str(),
+                        pending_bytes,
+                        prompt_delta as u64,
+                    );
+                    pending_bytes = 0;
+                }
+            }
 
             let mut choices = response.choices.into_iter();
             let message = choices
@@ -364,7 +523,9 @@ impl LLMGateway {
                                     json!(raw_arguments),
                                     format!("invalid JSON arguments: {err}"),
                                 );
-                                Self::push_tool_payload(&mut messages, &call_id, payload)?;
+                                let bytes =
+                                    Self::push_tool_payload(&mut messages, &call_id, payload)?;
+                                pending_bytes = pending_bytes.saturating_add(bytes);
                                 continue;
                             }
                         };
@@ -381,7 +542,8 @@ impl LLMGateway {
                             parsed_args.clone(),
                             format!("unsupported tool: {}", tool_name),
                         );
-                        Self::push_tool_payload(&mut messages, &call_id, payload)?;
+                        let bytes = Self::push_tool_payload(&mut messages, &call_id, payload)?;
+                        pending_bytes = pending_bytes.saturating_add(bytes);
                         continue;
                     }
 
@@ -397,7 +559,7 @@ impl LLMGateway {
                             arguments:  parsed_args.clone(),
                         })
                         .await;
-                    let payload = match result {
+                    let tool_output = match result {
                         Ok(value) => value,
                         Err(SendError::HandlerError(err)) => match err {
                             llm::ToolExecutionError::Input(input_err) => {
@@ -407,7 +569,7 @@ impl LLMGateway {
                                     error = %input_err,
                                     "tool reported invalid input"
                                 );
-                                Self::tool_error_payload(
+                                let payload = Self::tool_error_payload(
                                     &tool_name,
                                     match &input_err {
                                         llm::ToolInputError::MissingField { .. } => "missing_field",
@@ -430,7 +592,8 @@ impl LLMGateway {
                                     },
                                     parsed_args.clone(),
                                     input_err.to_string(),
-                                )
+                                );
+                                ToolOutput::new(payload)
                             }
                             llm::ToolExecutionError::Internal(internal_err) => {
                                 error!(
@@ -445,15 +608,18 @@ impl LLMGateway {
                                     parsed_args.clone(),
                                     internal_err.to_string(),
                                 );
-                                Self::push_tool_payload(&mut messages, &call_id, payload)?;
-                                continue;
+                                ToolOutput::new(payload)
                             }
                         },
                         Err(other) => {
                             return Err(anyhow!("tool host communication failed: {other:?}"));
                         }
                     };
-                    Self::push_tool_payload(&mut messages, &call_id, payload)?;
+                    let contribution_hint = tool_output.byte_hint;
+                    let payload = tool_output.payload;
+                    let measured = Self::push_tool_payload(&mut messages, &call_id, payload)?;
+                    let contribution = contribution_hint.unwrap_or(measured);
+                    pending_bytes = pending_bytes.saturating_add(contribution);
                 }
                 continue;
             }
@@ -464,6 +630,7 @@ impl LLMGateway {
                     debug!(iteration, "Assistant content was empty; continuing");
                 } else {
                     debug!(iteration, "Assistant returned final content");
+                    metrics.record_conversation_tokens(&actor_name, latest_total_tokens);
                     return Ok(content);
                 }
             }
@@ -480,13 +647,15 @@ impl LLMGateway {
 
 #[derive(Clone, Debug)]
 pub struct ChatCompletionRequest {
-    pub model:          Arc<String>,
-    pub messages:       Vec<ChatCompletionRequestMessage>,
-    pub temperature:    f32,
-    pub top_p:          f32,
-    pub tool_ids:       Vec<&'static str>,
-    pub max_iterations: usize,
-    pub tool_host:      ActorRef<FileReader>,
+    pub model:           Arc<String>,
+    pub messages:        Vec<ChatCompletionRequestMessage>,
+    pub temperature:     f32,
+    pub top_p:           f32,
+    pub tool_ids:        Vec<&'static str>,
+    pub max_iterations:  usize,
+    pub tool_host:       ActorRef<FileReader>,
+    pub actor_name:      String,
+    pub conversation_id: String,
 }
 
 impl Message<ChatCompletionRequest> for LLMGateway {

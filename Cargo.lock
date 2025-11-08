@@ -10368,6 +10368,7 @@ dependencies = [
  "grep-searcher",
  "kameo",
  "once_cell",
+ "parking_lot",
  "pathdiff",
  "petgraph",
  "rand 0.8.5",

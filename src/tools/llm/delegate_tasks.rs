@@ -9,12 +9,13 @@ use serde_json::Value;
 use tracing::info;
 
 use super::{
-    CallState, ToolExecutionError, ToolInputError, ToolInputResult, ToolInstance, ToolPrototype,
-    depth_exceeded, schema_for_args, trim_optional,
+    CallState, ToolExecutionError, ToolInputError, ToolInputResult, ToolInstance, ToolOutput,
+    ToolPrototype, depth_exceeded, schema_for_args, trim_optional,
 };
 use crate::{
-    constants::MAX_PARALLEL_DELEGATIONS, file_reader::run_delegate_batch_with_state,
-    llm_gateway::LLMGateway,
+    constants::MAX_PARALLEL_DELEGATIONS,
+    file_reader::run_delegate_batch_with_state,
+    llm_gateway::{GatewayMetrics, LLMGateway},
 };
 
 const IDENTIFIER: &str = "delegate_tasks";
@@ -81,6 +82,7 @@ fn parse_delegate_tasks(raw: Value, state: &CallState) -> ToolInputResult<Box<dy
         workspace_root: Arc::clone(&state.workspace_root),
         gateway: state.gateway.clone(),
         model: Arc::clone(&state.model),
+        metrics: Arc::clone(&state.metrics),
     }))
 }
 
@@ -91,11 +93,12 @@ struct DelegateTasksTool {
     workspace_root:     Arc<PathBuf>,
     gateway:            ActorRef<LLMGateway>,
     model:              Arc<String>,
+    metrics:            Arc<GatewayMetrics>,
 }
 
 #[async_trait]
 impl ToolInstance for DelegateTasksTool {
-    async fn execute(&self) -> Result<Value, ToolExecutionError> {
+    async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
         let next_depth = self.depth + 1;
         info!(
             "tool_call delegate_tasks depth={} tasks={} max_concurrency={}",
@@ -108,12 +111,13 @@ impl ToolInstance for DelegateTasksTool {
             self.gateway.clone(),
             Arc::clone(&self.model),
             Arc::clone(&self.workspace_root),
+            Arc::clone(&self.metrics),
             self.depth,
             self.max_subdelegations,
             self.args.tasks.clone(),
         )
         .await?;
 
-        Ok(result)
+        Ok(ToolOutput::new(result))
     }
 }

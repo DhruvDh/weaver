@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use kameo::prelude::ActorRef;
 use once_cell::sync::Lazy;
 use schemars::{JsonSchema, schema_for};
-use serde_json::{self, Value};
+use serde_json::{self, Value, json};
 use thiserror::Error;
 use tracing::warn;
 
@@ -21,7 +21,7 @@ use self::{
     read_file_full::read_file_full_meta, read_file_range::read_file_range_meta,
     search_text::search_text_meta,
 };
-use crate::llm_gateway::LLMGateway;
+use crate::llm_gateway::{GatewayMetrics, LLMGateway};
 
 mod delegate_tasks;
 mod list_directory;
@@ -58,7 +58,28 @@ impl From<ToolInputError> for ToolExecutionError {
     }
 }
 
-pub type ToolExecutionResult = Result<Value, ToolExecutionError>;
+pub struct ToolOutput {
+    pub payload:   Value,
+    pub byte_hint: Option<u64>,
+}
+
+impl ToolOutput {
+    pub fn new(payload: Value) -> Self {
+        Self {
+            payload,
+            byte_hint: None,
+        }
+    }
+
+    pub fn with_byte_hint(payload: Value, byte_hint: u64) -> Self {
+        Self {
+            payload,
+            byte_hint: Some(byte_hint),
+        }
+    }
+}
+
+pub type ToolExecutionResult = Result<ToolOutput, ToolExecutionError>;
 
 #[async_trait]
 pub trait ToolInstance: Send {
@@ -72,6 +93,119 @@ pub struct ToolPrototype {
     pub description: &'static str,
     pub schema:      Value,
     pub parse:       ToolParser,
+}
+
+/// Mode selected for a tool payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolPayloadMode {
+    Preview,
+    Body,
+}
+
+impl ToolPayloadMode {
+    pub fn from_fetch_flag(fetch_body: bool) -> Self {
+        match fetch_body {
+            true => ToolPayloadMode::Body,
+            false => ToolPayloadMode::Preview,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ToolPayloadMode::Preview => "preview",
+            ToolPayloadMode::Body => "body",
+        }
+    }
+}
+
+pub fn estimate_tokens_from_characters(characters: usize) -> u64 {
+    let chars = characters as u64;
+    // Heuristic: ~4 characters per token for English text; ensure at least one
+    // token for non-empty inputs.
+    if chars == 0 {
+        0
+    } else {
+        chars.div_ceil(4).max(1)
+    }
+}
+#[derive(Debug, Clone, Copy)]
+pub struct PayloadEstimates {
+    pub safe_tokens: Option<u64>,
+}
+
+pub fn prepare_payload_estimates(
+    metrics: &GatewayMetrics,
+    model: &str,
+    bytes: u64,
+) -> PayloadEstimates {
+    let heuristic = if bytes == 0 {
+        None
+    } else {
+        Some(estimate_tokens_from_characters(bytes as usize))
+    };
+    let approx = metrics.estimate_tokens(model, bytes).or(heuristic);
+    let safe = apply_safety_margin(approx);
+    PayloadEstimates { safe_tokens: safe }
+}
+
+pub fn apply_safety_margin(tokens: Option<u64>) -> Option<u64> {
+    tokens.map(|value| value + value.saturating_div(5) + 1)
+}
+
+pub fn payload_size_bytes(value: &Value) -> u64 {
+    serde_json::to_vec(value)
+        .map(|buffer| buffer.len() as u64)
+        .unwrap_or(0)
+}
+
+pub fn build_cost_preview(
+    tool: &'static str,
+    bytes_total: u64,
+    approx_tokens: Option<u64>,
+    hints: Vec<String>,
+) -> Value {
+    json!({
+        "type": "preview",
+        "mode": "preview",
+        "tool": tool,
+        "cost": {
+            "bytes_total": bytes_total,
+            "approx_tokens": approx_tokens,
+            "preview_tokens": Value::Null,
+            "remaining_tokens": Value::Null,
+            "remaining_ratio": Value::Null,
+        },
+        "hints": hints,
+    })
+}
+
+pub fn apply_preview_cost(
+    payload: &mut Value,
+    metrics: &GatewayMetrics,
+    model: &str,
+    conversation: &str,
+    preview_tokens: u64,
+    future_tokens: Option<u64>,
+) {
+    let context_limit = metrics.context_limit(model) as u64;
+    let used_tokens = metrics
+        .latest_prompt_tokens_for_conversation(conversation)
+        .unwrap_or(0);
+    let mut remaining = context_limit.saturating_sub(used_tokens);
+    remaining = remaining.saturating_sub(preview_tokens);
+    if let Some(cost) = future_tokens {
+        remaining = remaining.saturating_sub(cost);
+    }
+    let ratio = if context_limit == 0 {
+        0.0
+    } else {
+        (remaining as f64 / context_limit as f64).clamp(0.0, 1.0)
+    };
+    if let Some(cost) = payload.get_mut("cost").and_then(|c| c.as_object_mut()) {
+        cost.insert("preview_tokens".to_string(), json!(preview_tokens));
+        cost.insert("remaining_tokens".to_string(), json!(remaining));
+        cost.insert("remaining_ratio".to_string(), json!(ratio));
+    }
 }
 
 static TOOL_PROTOTYPES: Lazy<Vec<ToolPrototype>> = Lazy::new(|| {
@@ -107,6 +241,13 @@ pub struct CallState {
     pub workspace_root:     Arc<PathBuf>,
     pub gateway:            ActorRef<LLMGateway>,
     pub model:              Arc<String>,
+    pub metrics:            Arc<GatewayMetrics>,
+    pub actor_name:         Arc<String>,
+    pub conversation_id:    Arc<String>,
+}
+
+pub const fn default_false() -> bool {
+    false
 }
 
 pub fn all_tools() -> &'static [ToolPrototype] {

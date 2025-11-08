@@ -1,7 +1,10 @@
 use std::{
     env,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use anyhow::{Context as _, Result, anyhow};
@@ -16,17 +19,18 @@ use serde_json::{Value, json};
 use crate::{
     constants::{
         DEFAULT_MAX_SUBDELEGATIONS, DEFAULT_TEMPERATURE, DEFAULT_TOP_P, MAX_PARALLEL_DELEGATIONS,
-        MAX_TOOL_ITERATIONS, PRETEXT_SUBDIR,
+        MAX_TOOL_ITERATIONS,
     },
-    llm_gateway::{ChatCompletionRequest, LLMGateway},
-    tools::llm::{self, CallState, ToolExecutionError},
+    llm_gateway::{ChatCompletionRequest, GatewayMetrics, LLMGateway},
+    tools::llm::{self, CallState, ToolExecutionError, ToolOutput},
 };
 
 const SYSTEM_PROMPT_TEMPLATE: &str = r#"You are Weaver's file-reading assistant assigned to explore the UNCC CS2 PreTeXt project.
-Always stay within the UNCC CS2 PreTeXt workspace and rely on the provided tools to inspect files.
-The primary course content lives under `./uncc_cs2-pretext-project/`; call `list_directory` whenever you need to confirm the current structure.
+Always stay within the provided workspace root and rely on the available tools to inspect files.
+Call `list_directory` whenever you need to confirm the current structure instead of inferring it from file names.
 Never assume content from file names alone—use `read_file_full` or `read_file_range` to inspect source material before describing or citing it.
 When tasks can be partitioned, prefer launching delegated tasks in parallel. The `delegate_tasks` tool accepts a `tasks` array; wrap a single instruction in an array when needed. The runtime executes up to 8 tasks concurrently.
+Large-result tools return a preview header first. Examine the reported size and token estimates, refine your arguments (e.g., smaller line ranges or narrower regex scopes), or delegate a summarisation task before opting into full payloads. Only set `fetch_body` to true when you are confident the resulting content fits within the conversation budget.
 Only answer after gathering the necessary context via tool calls, and reference the specific files you actually examined."#;
 
 /// Message used by the LLM gateway to execute a tool invocation within the
@@ -37,25 +41,35 @@ pub struct ExecuteTool {
 }
 
 /// Actor that exposes local filesystem utilities to LLM collaborators.
+static NEXT_FILE_READER_ID: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Actor)]
 pub struct FileReader {
     gateway:            ActorRef<LLMGateway>,
     model:              Arc<String>,
     root:               Arc<PathBuf>,
+    metrics:            Arc<GatewayMetrics>,
     depth:              usize,
     max_subdelegations: usize,
+    actor_name:         Arc<String>,
+    conversation_id:    Arc<String>,
 }
 
 impl FileReader {
     /// Build a new [`FileReader`] using `OPENAI_MODEL`/`OPENAI_API_BASE`.
-    pub fn from_env(root: impl AsRef<Path>, gateway: ActorRef<LLMGateway>) -> Result<Self> {
-        Self::from_env_with_limit(root, gateway, DEFAULT_MAX_SUBDELEGATIONS)
+    pub fn from_env(
+        root: impl AsRef<Path>,
+        gateway: ActorRef<LLMGateway>,
+        metrics: Arc<GatewayMetrics>,
+    ) -> Result<Self> {
+        Self::from_env_with_limit(root, gateway, metrics, DEFAULT_MAX_SUBDELEGATIONS)
     }
 
     /// Build a new [`FileReader`] with a custom delegation limit.
     pub fn from_env_with_limit(
         root: impl AsRef<Path>,
         gateway: ActorRef<LLMGateway>,
+        metrics: Arc<GatewayMetrics>,
         max_subdelegations: usize,
     ) -> Result<Self> {
         let model = Arc::new(
@@ -68,32 +82,38 @@ impl FileReader {
                 format!("failed to canonicalize root {}", root.as_ref().display())
             })?);
 
-        Ok(Self::new(gateway, model, root, 0, max_subdelegations))
+        Ok(Self::new(gateway, model, root, metrics, 0, max_subdelegations))
     }
 
     fn new(
         gateway: ActorRef<LLMGateway>,
         model: Arc<String>,
         root: Arc<PathBuf>,
+        metrics: Arc<GatewayMetrics>,
         depth: usize,
         max_subdelegations: usize,
     ) -> Self {
+        let actor_name = if depth == 0 {
+            "FileReader/Root".to_string()
+        } else {
+            format!("FileReader/Delegate{}", depth)
+        };
+        let id = NEXT_FILE_READER_ID.fetch_add(1, Ordering::Relaxed);
+        let conversation_id = format!("{}#{}", actor_name, id);
         Self {
             gateway,
             model,
             root,
+            metrics,
             depth,
             max_subdelegations,
+            actor_name: Arc::new(actor_name),
+            conversation_id: Arc::new(conversation_id),
         }
     }
 
     fn system_prompt(&self) -> String {
-        format!(
-            "{SYSTEM_PROMPT_TEMPLATE}\n\nWorkspace root: {root}\nPreTeXt project path: \
-             {root}/{subdir}",
-            root = self.root.display(),
-            subdir = PRETEXT_SUBDIR
-        )
+        format!("{SYSTEM_PROMPT_TEMPLATE}\n\nWorkspace root: {root}", root = self.root.display())
     }
 
     pub fn workspace_root(&self) -> &Path {
@@ -109,6 +129,7 @@ pub(crate) async fn run_delegate_batch_with_state(
     gateway: ActorRef<LLMGateway>,
     model: Arc<String>,
     workspace_root: Arc<PathBuf>,
+    metrics: Arc<GatewayMetrics>,
     depth: usize,
     max_subdelegations: usize,
     tasks: Vec<String>,
@@ -131,9 +152,16 @@ pub(crate) async fn run_delegate_batch_with_state(
             let gateway = gateway.clone();
             let model = Arc::clone(&model);
             let root = Arc::clone(&workspace_root);
+            let metrics = Arc::clone(&metrics);
             async move {
-                let child =
-                    FileReader::new(gateway.clone(), model, root, depth + 1, max_subdelegations);
+                let child = FileReader::new(
+                    gateway.clone(),
+                    model,
+                    root,
+                    metrics,
+                    depth + 1,
+                    max_subdelegations,
+                );
                 let actor = FileReader::spawn(child);
                 let prompt = task.clone();
                 match actor.ask(FileReaderQuery { prompt }).await {
@@ -185,6 +213,8 @@ impl Message<FileReaderQuery> for FileReader {
         let system_prompt = self.system_prompt();
         let model = self.model.clone();
         let tool_ids = Self::tool_identifiers();
+        let actor_name = (*self.actor_name).clone();
+        let conversation_id = (*self.conversation_id).clone();
 
         ctx.spawn(async move {
             let system_msg: ChatCompletionRequestMessage =
@@ -205,6 +235,8 @@ impl Message<FileReaderQuery> for FileReader {
                 tool_ids,
                 max_iterations: MAX_TOOL_ITERATIONS,
                 tool_host,
+                actor_name,
+                conversation_id,
             };
 
             let response = gateway.ask(request).await?;
@@ -214,7 +246,7 @@ impl Message<FileReaderQuery> for FileReader {
 }
 
 impl Message<ExecuteTool> for FileReader {
-    type Reply = Result<Value, ToolExecutionError>;
+    type Reply = Result<ToolOutput, ToolExecutionError>;
 
     async fn handle(
         &mut self,
@@ -235,6 +267,9 @@ impl Message<ExecuteTool> for FileReader {
             workspace_root:     Arc::clone(&self.root),
             gateway:            self.gateway.clone(),
             model:              Arc::clone(&self.model),
+            metrics:            Arc::clone(&self.metrics),
+            actor_name:         Arc::clone(&self.actor_name),
+            conversation_id:    Arc::clone(&self.conversation_id),
         };
 
         let tool = (meta.parse)(arguments, &state).map_err(ToolExecutionError::from)?;

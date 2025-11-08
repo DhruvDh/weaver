@@ -9,8 +9,8 @@ use serde_json::{Value, json};
 use tracing::info;
 
 use super::{
-    CallState, ToolExecutionError, ToolInputError, ToolInputResult, ToolInstance, ToolPrototype,
-    render_relative_path, resolve_workspace_path, schema_for_args, trim_optional,
+    CallState, ToolExecutionError, ToolInputError, ToolInputResult, ToolInstance, ToolOutput,
+    ToolPrototype, render_relative_path, resolve_workspace_path, schema_for_args, trim_optional,
 };
 use crate::tools::filesystem;
 
@@ -71,7 +71,7 @@ struct ListDirectoryTool {
 
 #[async_trait]
 impl ToolInstance for ListDirectoryTool {
-    async fn execute(&self) -> Result<Value, ToolExecutionError> {
+    async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
         let relative = self.args.path.as_deref().unwrap_or(".");
         let resolved = resolve_workspace_path(self.workspace_root.as_ref(), relative, IDENTIFIER)?;
         let entries = filesystem::list_dir(&resolved)
@@ -94,6 +94,6 @@ impl ToolInstance for ListDirectoryTool {
                 })
             })
             .collect::<Vec<_>>();
-        Ok(json!({ "entries": rendered }))
+        Ok(ToolOutput::new(json!({ "entries": rendered })))
     }
 }

@@ -1,14 +1,31 @@
+use std::{path::PathBuf, sync::Arc};
+
 use anyhow::{Result, anyhow};
+use bpaf::{OptionParser, Parser, construct, positional};
 use kameo::prelude::*;
 use tracing::debug;
 use tracing_subscriber::EnvFilter;
 use weaver::{
+    constants::PRETEXT_SUBDIR,
     file_reader::{FileReader, FileReaderQuery},
     llm_gateway::LLMGateway,
 };
 
+#[derive(Clone, Debug)]
+struct Cli {
+    workspace: PathBuf,
+}
+
+fn cli() -> OptionParser<Cli> {
+    let workspace = positional::<PathBuf>("workspace")
+        .help("Workspace root to expose to the assistant")
+        .fallback(PathBuf::from(PRETEXT_SUBDIR));
+    construct! { Cli { workspace } }.to_options()
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
+    let Cli { workspace } = cli().run();
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     tracing_subscriber::fmt()
@@ -19,9 +36,11 @@ async fn main() -> Result<()> {
 
     debug!("FileReader demo starting");
 
-    let gateway = LLMGateway::spawn(LLMGateway::from_env()?);
+    let gateway_instance = LLMGateway::from_env()?;
+    let metrics = gateway_instance.metrics();
+    let gateway = LLMGateway::spawn(gateway_instance);
 
-    let actor = match FileReader::from_env(".", gateway.clone()) {
+    let actor = match FileReader::from_env(workspace, gateway.clone(), Arc::clone(&metrics)) {
         Ok(actor) => actor,
         Err(err) => {
             debug!(
@@ -43,9 +62,8 @@ async fn main() -> Result<()> {
     let reader = FileReader::spawn(actor);
 
     let prompt = "Summarize the key goals of the UNCC CS2 PreTeXt project. Highlight any modules \
-                  in the `uncc_cs2-pretext-project/source/` tree that look important. Please do \
-                  make effective use of the `delegate_tasks` tools for all tasks, in parrallel if \
-                  possible.";
+                  in the `source/` tree that look important. Please do make effective use of the \
+                  `delegate_tasks` tools for all tasks, in parallel if possible.";
     debug!(prompt, "Dispatching FileReaderQuery with LLM tool access");
 
     match reader
@@ -61,6 +79,8 @@ async fn main() -> Result<()> {
             eprintln!("FileReader query failed: {err}");
         }
     }
+
+    metrics.log_summary();
 
     Ok(())
 }
