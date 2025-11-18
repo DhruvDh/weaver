@@ -14,15 +14,17 @@ use async_openai::{
     config::OpenAIConfig,
     error::OpenAIError,
     types::{
-        ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
-        ChatCompletionRequestToolMessageArgs, ChatCompletionTool, CreateChatCompletionRequest,
-        CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
+        ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessageArgs,
+        ChatCompletionRequestMessage, ChatCompletionRequestToolMessageArgs,
+        ChatCompletionResponseMessage, ChatCompletionTool, CompletionUsage,
+        CreateChatCompletionRequest, CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
     },
 };
 use kameo::{error::SendError, prelude::*, reply::DelegatedReply};
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 use rand::{Rng, thread_rng};
+use reqwest::Client as HttpClient;
 use serde_json::{self, json};
 use tokio::{
     sync::Semaphore,
@@ -33,7 +35,7 @@ use tracing::{debug, error, info, warn};
 use crate::{
     constants::{
         LLM_MAX_CONCURRENT_REQUESTS, LLM_MAX_RETRIES, REQUEST_TIMEOUT_SECS, RETRY_BASE_DELAY_MS,
-        RETRY_MAX_EXP, RETRY_MAX_JITTER_MS,
+        RETRY_MAX_BACKOFF_MS, RETRY_MAX_EXP,
     },
     file_reader::{ExecuteTool, FileReader},
     tools::llm::{self, ToolOutput},
@@ -43,7 +45,6 @@ use crate::{
 struct GatewayConfig {
     max_retries:   usize,
     base_delay_ms: u64,
-    max_jitter_ms: u64,
     timeout:       Duration,
 }
 
@@ -52,9 +53,49 @@ impl Default for GatewayConfig {
         Self {
             max_retries:   LLM_MAX_RETRIES,
             base_delay_ms: RETRY_BASE_DELAY_MS,
-            max_jitter_ms: RETRY_MAX_JITTER_MS,
             timeout:       Duration::from_secs(REQUEST_TIMEOUT_SECS),
         }
+    }
+}
+
+#[derive(Default)]
+struct IterationState {
+    pending_bytes:       u64,
+    latest_total_tokens: u64,
+    last_prompt_total:   u32,
+}
+
+impl IterationState {
+    fn record_usage(
+        &mut self,
+        metrics: &GatewayMetrics,
+        conversation_id: &str,
+        model: &str,
+        usage: &CompletionUsage,
+    ) {
+        self.latest_total_tokens = usage.total_tokens as u64;
+        let prompt_total = usage.prompt_tokens;
+        let prompt_delta = prompt_total.saturating_sub(self.last_prompt_total);
+        self.last_prompt_total = prompt_total;
+        metrics.record_conversation_prompt_tokens(conversation_id, prompt_total as u64);
+        if prompt_delta > 0 && self.pending_bytes > 0 {
+            metrics.observe_payload_bytes(model, self.pending_bytes, prompt_delta as u64);
+            self.pending_bytes = 0;
+        }
+    }
+
+    fn finalize_content(
+        &self,
+        metrics: &GatewayMetrics,
+        actor_name: &str,
+        message: &ChatCompletionResponseMessage,
+    ) -> Option<String> {
+        let content = message.content.as_ref()?.trim();
+        if content.is_empty() {
+            return None;
+        }
+        metrics.record_conversation_tokens(actor_name, self.latest_total_tokens);
+        message.content.clone()
     }
 }
 
@@ -209,7 +250,7 @@ impl GatewayMetrics {
 }
 
 struct ConversationPromptGuard {
-    metrics: Arc<GatewayMetrics>,
+    metrics:         Arc<GatewayMetrics>,
     conversation_id: String,
 }
 
@@ -251,7 +292,11 @@ impl LLMGateway {
         if let Ok(url) = env::var("OPENAI_API_BASE") {
             config = config.with_api_base(url);
         }
-        let client = Client::with_config(config);
+        let http_client = HttpClient::builder()
+            .user_agent("weaver-llm-gateway")
+            .build()
+            .context("failed to build http client")?;
+        let client = Client::with_config(config).with_http_client(http_client);
         Ok(Self {
             client,
             semaphore: Arc::new(Semaphore::new(LLM_MAX_CONCURRENT_REQUESTS)),
@@ -287,25 +332,31 @@ impl LLMGateway {
     }
 
     fn compute_backoff_ms(attempt: usize, cfg: &GatewayConfig) -> u64 {
-        let exp = (attempt as u32).min(RETRY_MAX_EXP);
+        let exp = attempt.saturating_sub(1).min(RETRY_MAX_EXP as usize) as u32;
         let multiplier = 1u64.checked_shl(exp).unwrap_or(u64::MAX);
-        let base = cfg.base_delay_ms.saturating_mul(multiplier).min(60_000);
-        if cfg.max_jitter_ms == 0 {
-            base
-        } else {
-            let jitter = thread_rng().gen_range(0..=cfg.max_jitter_ms);
-            base.saturating_add(jitter)
+        let cap = cfg
+            .base_delay_ms
+            .saturating_mul(multiplier)
+            .min(RETRY_MAX_BACKOFF_MS);
+        if cap == 0 {
+            return 0;
         }
+        thread_rng().gen_range(0..=cap)
     }
 
     fn should_retry(err: &OpenAIError) -> bool {
         match err {
             OpenAIError::Reqwest(req_err) => {
-                if req_err.is_timeout() || req_err.is_connect() {
+                if req_err.is_timeout()
+                    || req_err.is_connect()
+                    || req_err.is_body()
+                    || req_err.is_decode()
+                {
                     return true;
                 }
                 if let Some(status) = req_err.status() {
-                    return status.is_server_error() || status.as_u16() == 429;
+                    let code = status.as_u16();
+                    return status.is_server_error() || code == 429 || code == 408;
                 }
                 false
             }
@@ -329,14 +380,130 @@ impl LLMGateway {
                     .chain(api_err.r#type.as_deref())
                     .all(|value| !non_retryable.contains(&value))
             }
-            OpenAIError::JSONDeserialize(_, _) => false,
+            OpenAIError::JSONDeserialize(_, _) => true,
             OpenAIError::InvalidArgument(_) => false,
             _ => true,
         }
     }
 
+    async fn handle_tool_calls(
+        iteration: usize,
+        tool_host: &ActorRef<FileReader>,
+        tool_calls: Vec<ChatCompletionMessageToolCall>,
+        messages: &mut Vec<ChatCompletionRequestMessage>,
+        state: &mut IterationState,
+    ) -> Result<()> {
+        let assistant_msg = ChatCompletionRequestAssistantMessageArgs::default()
+            .tool_calls(tool_calls.clone())
+            .build()
+            .context("failed to build assistant tool-call message")?
+            .into();
+        messages.push(assistant_msg);
+
+        for call in tool_calls {
+            let tool_name = call.function.name.clone();
+            let call_id = call.id.clone();
+            let raw_arguments = call.function.arguments.clone();
+            let parsed_args = match serde_json::from_str::<serde_json::Value>(&raw_arguments) {
+                Ok(value) => value,
+                Err(err) => {
+                    warn!(
+                        iteration,
+                        tool = tool_name.as_str(),
+                        error = %err,
+                        "tool arguments were not valid JSON"
+                    );
+                    let payload = Self::tool_error_payload(
+                        &tool_name,
+                        "invalid_json",
+                        json!(raw_arguments),
+                        format!("invalid JSON arguments: {err}"),
+                    );
+                    let bytes = Self::push_tool_payload(messages, &call_id, payload)?;
+                    state.pending_bytes = state.pending_bytes.saturating_add(bytes);
+                    continue;
+                }
+            };
+
+            if llm::lookup_tool(tool_name.as_str()).is_none() {
+                warn!(iteration, tool = tool_name.as_str(), "tool identifier not registered");
+                let payload = Self::tool_error_payload(
+                    &tool_name,
+                    "unsupported_tool",
+                    parsed_args.clone(),
+                    format!("unsupported tool: {}", tool_name),
+                );
+                let bytes = Self::push_tool_payload(messages, &call_id, payload)?;
+                state.pending_bytes = state.pending_bytes.saturating_add(bytes);
+                continue;
+            }
+
+            debug!(iteration, tool = tool_name.as_str(), "Executing assistant-requested tool");
+            let result = tool_host
+                .ask(ExecuteTool {
+                    identifier: tool_name.clone(),
+                    arguments:  parsed_args.clone(),
+                })
+                .await;
+            let tool_output = match result {
+                Ok(value) => value,
+                Err(SendError::HandlerError(err)) => match err {
+                    llm::ToolExecutionError::Input(input_err) => {
+                        warn!(
+                            iteration,
+                            tool = tool_name.as_str(),
+                            error = %input_err,
+                            "tool reported invalid input"
+                        );
+                        let payload = Self::tool_error_payload(
+                            &tool_name,
+                            match &input_err {
+                                llm::ToolInputError::MissingField { .. } => "missing_field",
+                                llm::ToolInputError::EmptyField { .. } => "empty_field",
+                                llm::ToolInputError::BelowMinimum { .. } => "below_minimum",
+                                llm::ToolInputError::InvalidRange { .. } => "invalid_range",
+                                llm::ToolInputError::EmptyCollection { .. } => "empty_collection",
+                                llm::ToolInputError::UnsupportedTool { .. } => "unsupported_tool",
+                                llm::ToolInputError::InvalidPayload { .. } => "invalid_payload",
+                                llm::ToolInputError::DepthExceeded { .. } => "depth_exceeded",
+                                llm::ToolInputError::InvalidPath { .. } => "invalid_path",
+                            },
+                            parsed_args.clone(),
+                            input_err.to_string(),
+                        );
+                        ToolOutput::new(payload)
+                    }
+                    llm::ToolExecutionError::Internal(internal_err) => {
+                        error!(
+                            iteration,
+                            tool = tool_name.as_str(),
+                            error = ?internal_err,
+                            "tool execution failed"
+                        );
+                        let payload = Self::tool_error_payload(
+                            &tool_name,
+                            "internal_error",
+                            parsed_args.clone(),
+                            internal_err.to_string(),
+                        );
+                        ToolOutput::new(payload)
+                    }
+                },
+                Err(other) => {
+                    return Err(anyhow!("tool host communication failed: {other:?}"));
+                }
+            };
+            let contribution_hint = tool_output.byte_hint;
+            let payload = tool_output.payload;
+            let measured = Self::push_tool_payload(messages, &call_id, payload)?;
+            let contribution = contribution_hint.unwrap_or(measured);
+            state.pending_bytes = state.pending_bytes.saturating_add(contribution);
+        }
+        Ok(())
+    }
+
     async fn call_with_retry<F>(
-        client: &Client<OpenAIConfig>,
+        client: Client<OpenAIConfig>,
         config: &GatewayConfig,
         metrics: &Arc<GatewayMetrics>,
         iteration: usize,
@@ -350,7 +517,9 @@ impl LLMGateway {
             attempt += 1;
             let payload = build_payload()?;
             let started = Instant::now();
-            let call = timeout(config.timeout, client.chat().create(payload)).await;
+            let client = client.clone();
+            let call =
+                timeout(config.timeout, async move { client.chat().create(payload).await }).await;
             match call {
                 Ok(Ok(resp)) => {
                     if let Some(usage) = resp.usage.as_ref() {
@@ -374,10 +543,18 @@ impl LLMGateway {
                     return Ok(resp);
                 }
                 Ok(Err(err)) => {
-                    warn!(iteration, attempt, error = %err, "llm_gateway request error");
-                    if attempt >= config.max_retries || !Self::should_retry(&err) {
+                    warn!(
+                        iteration,
+                        attempt,
+                        error = %err,
+                        "llm_gateway request error"
+                    );
+                    let retryable = Self::should_retry(&err);
+                    if attempt >= config.max_retries || !retryable {
                         return Err(anyhow!(err));
                     }
+                    let backoff = Self::compute_backoff_ms(attempt, config);
+                    sleep(Duration::from_millis(backoff)).await;
                 }
                 Err(_) => {
                     warn!(
@@ -392,10 +569,11 @@ impl LLMGateway {
                             attempt
                         ));
                     }
+                    // Timeout has no server hint.
+                    let backoff = Self::compute_backoff_ms(attempt, config);
+                    sleep(Duration::from_millis(backoff)).await;
                 }
             }
-            let backoff = Self::compute_backoff_ms(attempt, config);
-            sleep(Duration::from_millis(backoff)).await;
         }
     }
 
@@ -443,38 +621,25 @@ impl LLMGateway {
         metrics.reset_conversation_prompt_tokens(&conversation_id);
         let _prompt_guard =
             ConversationPromptGuard::new(Arc::clone(&metrics), conversation_id.clone());
-        let mut pending_bytes: u64 = 0;
-        let mut latest_total_tokens: u64 = 0;
-        let mut last_prompt_total: u32 = 0;
+        let mut iter_state = IterationState::default();
         let tools = llm::tool_specs(&request.tool_ids)
             .context("failed to render tool specifications for request")?;
         for iteration in 0..request.max_iterations {
             debug!(iteration, "Starting LLM tool iteration");
-            let response = Self::call_with_retry(&client, &config, &metrics, iteration, || {
-                Self::build_request(
-                    request.model.as_str(),
-                    &messages,
-                    request.temperature,
-                    request.top_p,
-                    tools.clone(),
-                )
-            })
-            .await?;
+            let response =
+                Self::call_with_retry(client.clone(), &config, &metrics, iteration, || {
+                    Self::build_request(
+                        request.model.as_str(),
+                        &messages,
+                        request.temperature,
+                        request.top_p,
+                        tools.clone(),
+                    )
+                })
+                .await?;
 
             if let Some(usage) = response.usage.as_ref() {
-                latest_total_tokens = usage.total_tokens as u64;
-                let prompt_total = usage.prompt_tokens;
-                let prompt_delta = prompt_total.saturating_sub(last_prompt_total);
-                last_prompt_total = prompt_total;
-                metrics.record_conversation_prompt_tokens(&conversation_id, prompt_total as u64);
-                if prompt_delta > 0 && pending_bytes > 0 {
-                    metrics.observe_payload_bytes(
-                        request.model.as_str(),
-                        pending_bytes,
-                        prompt_delta as u64,
-                    );
-                    pending_bytes = 0;
-                }
+                iter_state.record_usage(&metrics, &conversation_id, request.model.as_str(), usage);
             }
 
             let mut choices = response.choices.into_iter();
@@ -493,146 +658,21 @@ impl LLMGateway {
                 "Assistant message received"
             );
 
-            if let Some(tool_calls) = message.tool_calls.clone()
-                && !tool_calls.is_empty()
-            {
-                let assistant_msg = ChatCompletionRequestAssistantMessageArgs::default()
-                    .tool_calls(tool_calls.clone())
-                    .build()
-                    .context("failed to build assistant tool-call message")?
-                    .into();
-                messages.push(assistant_msg);
-
-                for call in tool_calls {
-                    let tool_name = call.function.name.clone();
-                    let call_id = call.id.clone();
-                    let raw_arguments = call.function.arguments.clone();
-                    let parsed_args =
-                        match serde_json::from_str::<serde_json::Value>(&raw_arguments) {
-                            Ok(value) => value,
-                            Err(err) => {
-                                warn!(
-                                    iteration,
-                                    tool = tool_name.as_str(),
-                                    error = %err,
-                                    "tool arguments were not valid JSON"
-                                );
-                                let payload = Self::tool_error_payload(
-                                    &tool_name,
-                                    "invalid_json",
-                                    json!(raw_arguments),
-                                    format!("invalid JSON arguments: {err}"),
-                                );
-                                let bytes =
-                                    Self::push_tool_payload(&mut messages, &call_id, payload)?;
-                                pending_bytes = pending_bytes.saturating_add(bytes);
-                                continue;
-                            }
-                        };
-
-                    if llm::lookup_tool(tool_name.as_str()).is_none() {
-                        warn!(
-                            iteration,
-                            tool = tool_name.as_str(),
-                            "tool identifier not registered"
-                        );
-                        let payload = Self::tool_error_payload(
-                            &tool_name,
-                            "unsupported_tool",
-                            parsed_args.clone(),
-                            format!("unsupported tool: {}", tool_name),
-                        );
-                        let bytes = Self::push_tool_payload(&mut messages, &call_id, payload)?;
-                        pending_bytes = pending_bytes.saturating_add(bytes);
-                        continue;
-                    }
-
-                    debug!(
-                        iteration,
-                        tool = tool_name.as_str(),
-                        "Executing assistant-requested tool"
-                    );
-                    let result = request
-                        .tool_host
-                        .ask(ExecuteTool {
-                            identifier: tool_name.clone(),
-                            arguments:  parsed_args.clone(),
-                        })
-                        .await;
-                    let tool_output = match result {
-                        Ok(value) => value,
-                        Err(SendError::HandlerError(err)) => match err {
-                            llm::ToolExecutionError::Input(input_err) => {
-                                warn!(
-                                    iteration,
-                                    tool = tool_name.as_str(),
-                                    error = %input_err,
-                                    "tool reported invalid input"
-                                );
-                                let payload = Self::tool_error_payload(
-                                    &tool_name,
-                                    match &input_err {
-                                        llm::ToolInputError::MissingField { .. } => "missing_field",
-                                        llm::ToolInputError::EmptyField { .. } => "empty_field",
-                                        llm::ToolInputError::BelowMinimum { .. } => "below_minimum",
-                                        llm::ToolInputError::InvalidRange { .. } => "invalid_range",
-                                        llm::ToolInputError::EmptyCollection { .. } => {
-                                            "empty_collection"
-                                        }
-                                        llm::ToolInputError::UnsupportedTool { .. } => {
-                                            "unsupported_tool"
-                                        }
-                                        llm::ToolInputError::InvalidPayload { .. } => {
-                                            "invalid_payload"
-                                        }
-                                        llm::ToolInputError::DepthExceeded { .. } => {
-                                            "depth_exceeded"
-                                        }
-                                        llm::ToolInputError::InvalidPath { .. } => "invalid_path",
-                                    },
-                                    parsed_args.clone(),
-                                    input_err.to_string(),
-                                );
-                                ToolOutput::new(payload)
-                            }
-                            llm::ToolExecutionError::Internal(internal_err) => {
-                                error!(
-                                    iteration,
-                                    tool = tool_name.as_str(),
-                                    error = ?internal_err,
-                                    "tool execution failed"
-                                );
-                                let payload = Self::tool_error_payload(
-                                    &tool_name,
-                                    "internal_error",
-                                    parsed_args.clone(),
-                                    internal_err.to_string(),
-                                );
-                                ToolOutput::new(payload)
-                            }
-                        },
-                        Err(other) => {
-                            return Err(anyhow!("tool host communication failed: {other:?}"));
-                        }
-                    };
-                    let contribution_hint = tool_output.byte_hint;
-                    let payload = tool_output.payload;
-                    let measured = Self::push_tool_payload(&mut messages, &call_id, payload)?;
-                    let contribution = contribution_hint.unwrap_or(measured);
-                    pending_bytes = pending_bytes.saturating_add(contribution);
-                }
+            if let Some(tool_calls) = message.tool_calls.clone().filter(|calls| !calls.is_empty()) {
+                Self::handle_tool_calls(
+                    iteration,
+                    &request.tool_host,
+                    tool_calls,
+                    &mut messages,
+                    &mut iter_state,
+                )
+                .await?;
                 continue;
             }
 
-            if let Some(content) = message.content {
-                let trimmed = content.trim();
-                if trimmed.is_empty() {
-                    debug!(iteration, "Assistant content was empty; continuing");
-                } else {
-                    debug!(iteration, "Assistant returned final content");
-                    metrics.record_conversation_tokens(&actor_name, latest_total_tokens);
-                    return Ok(content);
-                }
+            if let Some(content) = iter_state.finalize_content(&metrics, &actor_name, &message) {
+                debug!(iteration, "Assistant returned final content");
+                return Ok(content);
             }
 
             debug!(iteration, "Assistant response had no tool calls and no content; continuing");

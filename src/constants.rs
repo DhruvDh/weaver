@@ -31,8 +31,8 @@ pub const REQUEST_TIMEOUT_SECS: u64 = 300;
 /// request.
 pub const RETRY_BASE_DELAY_MS: u64 = 250;
 
-/// Maximum jitter (milliseconds) added to each backoff sleep.
-pub const RETRY_MAX_JITTER_MS: u64 = 250;
-
 /// Maximum backoff exponent; backoff is min(iteration, RETRY_MAX_EXP).
 pub const RETRY_MAX_EXP: u32 = 6;
+
+/// Hard cap for exponential backoff waits (milliseconds).
+pub const RETRY_MAX_BACKOFF_MS: u64 = 60_000;
