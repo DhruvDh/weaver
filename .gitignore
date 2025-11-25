@@ -1,5 +1,3 @@
-.helix/
 target/
 *.log
-helix-ql-llms-full.txt
 .envrc/st.envrc
