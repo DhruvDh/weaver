@@ -1,3 +1,18 @@
+//! Read-only analyses over the multiplex curriculum/teaching graph.
+//!
+//! Edge layers (all stored in one `CurriculumGraph`):
+//! - `requires`: knowledge prerequisite DAG (acyclic by construction).
+//! - `supports`: pedagogical supports/examples between knowledge nodes.
+//! - `assesses`: assessment_item -> learning_outcome evidence links.
+//! - `precedes`: discourse ordering between teaching steps (per-episode DAG).
+//! - `anchors`: teaching_step -> knowledge/LO/assessment with impact semantics.
+//!
+//! Provided analyses include DAG/topo checks, first principles, LO
+//! reachability/coverage, extraneous knowledge, example variety, keystone
+//! scores, fadeability, procedural practice gaps, borrow-ahead/discourse
+//! orphans, and alignment gaps. All functions operate on an immutable graph
+//! snapshot and do not mutate state.
+
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use petgraph::{
@@ -186,17 +201,24 @@ pub fn keystone_scores(g: &CurriculumGraph) -> Vec<KeystoneScore> {
 /// Fadeability test: assessments reachable only when supports are treated as
 /// prerequisites.
 pub struct FadeabilityIssue {
-    pub assessment: NodeId,
+    pub assessment:    NodeId,
+    pub support_edges: Vec<petgraph::stable_graph::EdgeIndex<u32>>,
 }
 
 pub fn fadeability_issues(g: &CurriculumGraph) -> Vec<FadeabilityIssue> {
     let fps = first_principles(g);
     let reachable_requires = reachable_assessments_requires_only(g, &fps);
     let reachable_with_supports = reachable_assessments_with_supports(g, &fps);
-    reachable_with_supports
-        .difference(&reachable_requires)
-        .map(|&a| FadeabilityIssue { assessment: a })
-        .collect()
+
+    let mut issues = Vec::new();
+    for &assessment in reachable_with_supports.difference(&reachable_requires) {
+        let support_edges = supports_on_paths_to_assessment(g, &fps, assessment);
+        issues.push(FadeabilityIssue {
+            assessment,
+            support_edges,
+        });
+    }
+    issues
 }
 
 /// Example minimum + variety checks.
@@ -206,7 +228,7 @@ pub struct ExampleGap {
 }
 
 pub fn example_gaps(g: &CurriculumGraph) -> Vec<ExampleGap> {
-    let mut gaps = Vec::new();
+    let mut map: HashMap<NodeId, Vec<String>> = HashMap::new();
     for n in g.node_indices() {
         let node = &g[n];
         let knowledge = match &node.kind {
@@ -236,12 +258,10 @@ pub fn example_gaps(g: &CurriculumGraph) -> Vec<ExampleGap> {
                         && matches!(s.case_tag, Some(CaseTag::Edge | CaseTag::ErrorCase))
                 });
                 if we_total < 2 || !typical || !edge_case {
-                    gaps.push(ExampleGap {
-                        node:        n,
-                        description: "procedural nodes need >=2 worked examples (typical + \
-                                      edge/error)"
+                    map.entry(n).or_default().push(
+                        "procedural nodes need >=2 worked examples (typical + edge/error)"
                             .to_string(),
-                    });
+                    );
                 }
             }
             KnowledgeType::Conceptual => {
@@ -252,11 +272,9 @@ pub fn example_gaps(g: &CurriculumGraph) -> Vec<ExampleGap> {
                     .iter()
                     .any(|s| s.support_kind == SupportKind::Counterexample);
                 if !(has_analogy || has_counter) {
-                    gaps.push(ExampleGap {
-                        node:        n,
-                        description: "conceptual nodes need at least one analogy or counterexample"
-                            .to_string(),
-                    });
+                    map.entry(n).or_default().push(
+                        "conceptual nodes need at least one analogy or counterexample".to_string(),
+                    );
                 }
             }
             KnowledgeType::Factual => {
@@ -265,10 +283,9 @@ pub fn example_gaps(g: &CurriculumGraph) -> Vec<ExampleGap> {
                         || s.support_kind == SupportKind::Counterexample
                 });
                 if !has_example {
-                    gaps.push(ExampleGap {
-                        node:        n,
-                        description: "factual nodes need an example or counterexample".into(),
-                    });
+                    map.entry(n)
+                        .or_default()
+                        .push("factual nodes need an example or counterexample".into());
                 }
             }
             KnowledgeType::Metacognitive => {
@@ -276,10 +293,9 @@ pub fn example_gaps(g: &CurriculumGraph) -> Vec<ExampleGap> {
                     .iter()
                     .any(|s| s.support_kind == SupportKind::StrategyHint);
                 if !has_hint {
-                    gaps.push(ExampleGap {
-                        node:        n,
-                        description: "metacognitive nodes need a strategy hint support".into(),
-                    });
+                    map.entry(n)
+                        .or_default()
+                        .push("metacognitive nodes need a strategy hint support".into());
                 }
             }
             _ => {}
@@ -291,16 +307,23 @@ pub fn example_gaps(g: &CurriculumGraph) -> Vec<ExampleGap> {
             let has_support = !supports.is_empty();
             let has_coverage_tag = supports.iter().any(|s| !s.coverage_tags.is_empty());
             if !has_support || !has_coverage_tag {
-                gaps.push(ExampleGap {
-                    node:        n,
-                    description: "high intrinsic_load nodes should include rich supports with \
-                                  coverage_tags"
+                map.entry(n).or_default().push(
+                    "high intrinsic_load nodes should include rich supports with coverage_tags"
                         .to_string(),
-                });
+                );
             }
         }
     }
-    gaps
+    let mut entries: Vec<_> = map.into_iter().collect();
+    entries.sort_by_key(|(node, _)| node.index());
+
+    entries
+        .into_iter()
+        .map(|(node, descs)| ExampleGap {
+            node,
+            description: descs.join("; "),
+        })
+        .collect()
 }
 
 /// Borrow-ahead detection within an episode.
@@ -375,7 +398,7 @@ pub fn borrow_ahead(g: &CurriculumGraph, episode: &str) -> Vec<BorrowAhead> {
     for &step in &steps_in_episode {
         for edge in g.edges_directed(step, Direction::Outgoing) {
             if let EdgeKind::Anchors(attrs) = &edge.weight().kind
-                && matches!(attrs.impact, AnchorImpact::Use)
+                && matches!(attrs.impact, AnchorImpact::Use | AnchorImpact::Motivate)
             {
                 let target = edge.target();
 
@@ -567,7 +590,7 @@ pub fn discourse_orphans(g: &CurriculumGraph, episode: Option<&str>) -> Vec<Node
 
 // ---------- helpers ----------
 
-fn requires_ancestors(g: &CurriculumGraph, start: NodeId) -> HashSet<NodeId> {
+pub(crate) fn requires_ancestors(g: &CurriculumGraph, start: NodeId) -> HashSet<NodeId> {
     let mut seen = HashSet::new();
     let mut queue = VecDeque::new();
     queue.push_back(start);
@@ -724,6 +747,57 @@ fn reachable_assessments_with_supports(
         }
     }
     reachable
+}
+
+/// Return support edges that participate in at least one path from any first
+/// principle to `assessment` when supports are allowed.
+fn supports_on_paths_to_assessment(
+    g: &CurriculumGraph,
+    first_principles: &[NodeId],
+    assessment: NodeId,
+) -> Vec<petgraph::stable_graph::EdgeIndex<u32>> {
+    use petgraph::Direction;
+    // Nodes forward-reachable from fps via requires/supports.
+    let mut forward = std::collections::HashSet::new();
+    let mut stack = first_principles.to_vec();
+    while let Some(node) = stack.pop() {
+        if !forward.insert(node) {
+            continue;
+        }
+        for edge in g.edges_directed(node, Direction::Outgoing) {
+            if matches!(edge.weight().kind, EdgeKind::Requires(_) | EdgeKind::Supports(_)) {
+                stack.push(edge.target());
+            }
+        }
+    }
+
+    // Nodes that can reach assessment (reverse graph over requires/supports).
+    let mut backward = std::collections::HashSet::new();
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back(assessment);
+    while let Some(node) = queue.pop_front() {
+        if !backward.insert(node) {
+            continue;
+        }
+        for edge in g.edges_directed(node, Direction::Incoming) {
+            if matches!(edge.weight().kind, EdgeKind::Requires(_) | EdgeKind::Supports(_)) {
+                queue.push_back(edge.source());
+            }
+        }
+    }
+
+    // Any support edge whose source is forward-reachable and target is
+    // backward-reachable lies on some fp -> assessment path.
+    g.edge_indices()
+        .filter(|&e| matches!(g[e].kind, EdgeKind::Supports(_)))
+        .filter(|&e| {
+            if let Some((u, v)) = g.edge_endpoints(e) {
+                forward.contains(&u) && backward.contains(&v)
+            } else {
+                false
+            }
+        })
+        .collect()
 }
 
 pub struct ExtraneousReport {

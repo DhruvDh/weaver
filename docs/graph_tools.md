@@ -1,0 +1,47 @@
+# Graph Tool Surface (LLM-facing)
+
+This repo now distinguishes **views** (paged inspection) from **computations** (summaries). All graph tool outputs include `type` and `tool` fields for easy routing:
+
+- `type: "graph_view"` — bounded lists with `limit`, `offset`, `has_more`.
+- `type: "graph_analysis"` — summaries/analytics (often cost‑aware).
+- `type: "graph_command"` — mutating operations.
+
+Pagination defaults: `limit=50`, max `200`; `offset` defaults to `0`.
+
+Cost/preview: summary tools accept `fetch_body` (default `false`). In preview mode they return a cost block; set `fetch_body=true` to receive the body.
+
+## Tool quick reference
+
+| id | kind | purpose | key params |
+| --- | --- | --- | --- |
+| `graph_neighbors` | view | Neighbors of a slug, filtered by edge kind/direction | `slug`, `edge_kind` (requires/supports/assesses/precedes/anchors), `direction` (incoming/outgoing/both), `limit`, `offset` |
+| `graph_first_principles` | view | Paged list of first-principle instructional nodes | `limit`, `offset` |
+| `graph_first_principles_summary` | analysis | Counts of first principles by knowledge type | `fetch_body` |
+| `graph_lo_alignment_summary` | analysis | Compact LO alignment summary (reachability, coverage, anchors) | `lo_slug`, `fetch_body` |
+| `graph_lo_assessments_view` | view | Assessments for an LO with reachability flag | `lo_slug`, `reachable_only` (bool), `limit`, `offset` |
+| `graph_lo_missing_criteria_view` | view | Missing rubric criteria for an LO | `lo_slug`, `limit`, `offset` |
+| `graph_lo_anchors_view` | view | Anchoring teaching steps for an LO | `lo_slug`, `limit`, `offset` |
+| `graph_gap_summary` | analysis | Counts of example gaps, fadeability issues, practice gaps | `fetch_body` |
+| `graph_example_gaps_view` | view | Nodes failing example/variety rules | `limit`, `offset` |
+| `graph_fadeability_view` | view | Assessments that fail fadeability | `limit`, `offset` |
+| `graph_practice_gaps_view` | view | Procedural nodes lacking assessment practice | `limit`, `offset` |
+| `graph_keystone` | analysis | Top keystone scores (capped at 20 entries) | — |
+| `graph_dag_check` | analysis | Requires DAG boolean + topo length | — |
+| `graph_extraneous` | analysis | Extraneous knowledge for assessment vs LO | `assessment_slug`, `lo_slug`, optional `intended_slugs` |
+| `graph_assessment_gaps` | analysis | LOS w/o target assessments; orphan/unreachable assessments | `fetch_body` |
+| `graph_discourse_orphans` | analysis | TeachingSteps lacking precedes links | `episode` (optional) |
+| `graph_borrow_ahead` | analysis | Borrow-ahead uses within an episode | `episode` |
+
+### Commands (mutations)
+All command outputs now follow `{type: "graph_command", tool: <id>, status: "ok", ...}` and may echo key fields (e.g., slugs, path):
+
+- `graph_insert_knowledge`, `graph_update_knowledge`
+- `graph_insert_teaching_step`, `graph_update_teaching_step`
+- `graph_add_requires`, `graph_add_supports`, `graph_add_assesses`, `graph_add_precedes`, `graph_add_anchors`
+- `graph_rename_node`, `graph_remove_node`
+- `graph_save_now`, `graph_load_snapshot`
+
+### Limits and safety notes
+- Views are always bounded (`limit`/`offset`); use `has_more` to paginate.
+- Summaries are compact; heavy tools provide previews unless `fetch_body=true`.
+- Edge kind filters use the `EdgeKindFilter` enum—stringly values are rejected.

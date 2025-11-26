@@ -55,6 +55,11 @@ pub fn validate_requires(
     evidence_refs: &[SourceRef],
 ) -> Result<(), SchemaError> {
     ensure_non_empty(rationale, "requires.rationale")?;
+    if evidence_refs.is_empty() {
+        return Err(SchemaError::EmptyField {
+            field: "requires.evidence_refs",
+        });
+    }
     match strength {
         Strength::Necessary | Strength::Strong | Strength::Helpful => {
             // enum exhaustiveness keeps this expression meaningful.
@@ -86,6 +91,11 @@ pub fn validate_supports(
     intended_effect: IntendedEffect,
     evidence_refs: &[SourceRef],
 ) -> Result<(), SchemaError> {
+    if evidence_refs.is_empty() {
+        return Err(SchemaError::EmptyField {
+            field: "supports.evidence_refs",
+        });
+    }
     if !from.is_instructional_knowledge() {
         return Err(SchemaError::InvalidEdgeFrom {
             edge: "supports",

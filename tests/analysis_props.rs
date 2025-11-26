@@ -1,7 +1,7 @@
 use proptest::prelude::*;
 use weaver::{
     graph::{GraphService, KnowledgeNode, NodeId},
-    schema::types::KnowledgeType,
+    schema::types::{KnowledgeType, SourceRef},
 };
 
 fn mk_kn(title: &str, kt: KnowledgeType) -> KnowledgeNode {
@@ -9,7 +9,12 @@ fn mk_kn(title: &str, kt: KnowledgeType) -> KnowledgeNode {
         title: title.to_string(),
         statement: title.to_string(),
         knowledge_type: kt,
-        source_refs: vec![],
+        source_refs: vec![SourceRef {
+            path:       "dummy".into(),
+            start_line: 1,
+            end_line:   2,
+            revision:   "deadbeef".into(),
+        }],
         confidence: 1.0,
         rubric_criteria: vec![],
         construct_irrelevant_demands: vec![],
@@ -42,8 +47,8 @@ proptest! {
 
         // chain edges n0->n1->...->n{k}
         for win in nodes.windows(2) {
-            svc.add_requires_edge(win[0], win[1],
-                weaver::graph::RequiresAttrs { strength: weaver::schema::types::Strength::Necessary, rationale: "r".into(), evidence_refs: vec![] },
+            svc.add_edge::<weaver::graph::RequiresSpec>(win[0], win[1],
+                weaver::graph::RequiresAttrs { strength: weaver::schema::types::Strength::Necessary, rationale: "r".into(), evidence_refs: vec![SourceRef { path: "dummy".into(), start_line: 1, end_line: 2, revision: "deadbeef".into() }] },
                 1.0).unwrap();
         }
 
@@ -53,8 +58,8 @@ proptest! {
         // adding a back edge to an ancestor should be rejected
         let last = nodes[nodes.len()-1];
         let first = nodes[0];
-        let err = svc.add_requires_edge(last, first,
-            weaver::graph::RequiresAttrs { strength: weaver::schema::types::Strength::Necessary, rationale: "r".into(), evidence_refs: vec![] },
+        let err = svc.add_edge::<weaver::graph::RequiresSpec>(last, first,
+            weaver::graph::RequiresAttrs { strength: weaver::schema::types::Strength::Necessary, rationale: "r".into(), evidence_refs: vec![SourceRef { path: "dummy".into(), start_line: 1, end_line: 2, revision: "deadbeef".into() }] },
             1.0);
         assert!(err.is_err());
     }
@@ -70,8 +75,8 @@ proptest! {
 
         for (a,b) in extra_edges {
             if a < size && b < size && a != b {
-                let _ = svc.add_requires_edge(nodes[a], nodes[b],
-                    weaver::graph::RequiresAttrs { strength: weaver::schema::types::Strength::Necessary, rationale: "r".into(), evidence_refs: vec![] },
+                let _ = svc.add_edge::<weaver::graph::RequiresSpec>(nodes[a], nodes[b],
+                    weaver::graph::RequiresAttrs { strength: weaver::schema::types::Strength::Necessary, rationale: "r".into(), evidence_refs: vec![SourceRef { path: "dummy".into(), start_line: 1, end_line: 2, revision: "deadbeef".into() }] },
                     1.0);
             }
         }

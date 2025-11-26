@@ -103,6 +103,10 @@ impl ToolInstance for ReadFileFullTool {
         match mode {
             ToolPayloadMode::Preview => {
                 let hints = vec![
+                    format!(
+                        "Path: {}",
+                        render_relative_path(self.workspace_root.as_ref(), &resolved)
+                    ),
                     format!("Target file has {} lines.", line_count),
                     "Re-run read_file_full with fetch_body=true if you need the entire file."
                         .to_string(),

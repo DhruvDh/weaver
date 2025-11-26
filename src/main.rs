@@ -11,6 +11,7 @@ use weaver::{
     graph::{
         GraphConfig, GraphService,
         manager::{GraphManager, SaveSnapshot},
+        persist,
     },
     llm_gateway::LLMGateway,
 };
@@ -47,16 +48,44 @@ async fn main() -> Result<()> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(300);
-    let graph_config = GraphConfig {
+    let mut graph_config = GraphConfig {
         course_commit: course_commit.clone(),
         autosave_path: autosave_path.clone().into(),
         autosave_secs,
     };
 
+    // Load snapshot first (if present) to avoid autosaving an empty graph.
+    let snapshot_path: PathBuf = autosave_path.clone().into();
+    let loaded_snapshot = if snapshot_path.exists() {
+        match persist::load_graph(&snapshot_path).await {
+            Ok(snapshot) => {
+                debug!(path = %snapshot_path.display(), "loaded existing graph snapshot");
+                Some(snapshot)
+            }
+            Err(err) => {
+                error!(
+                    error = %err,
+                    path = %snapshot_path.display(),
+                    "failed to load graph snapshot; starting with empty graph"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let service = if let Some(snapshot) = loaded_snapshot {
+        graph_config.course_commit = snapshot.course_commit.clone();
+        GraphService::from_graph(snapshot.graph)
+    } else {
+        GraphService::new()
+    };
+
     let gateway_instance = LLMGateway::from_env()?;
     let metrics = gateway_instance.metrics();
     let gateway = LLMGateway::spawn(gateway_instance);
-    let graph_actor = GraphManager::spawn(GraphManager::new(GraphService::new(), course_commit));
+    let graph_actor = GraphManager::spawn(GraphManager::new(service, graph_config.clone()));
 
     // Autosave the graph periodically to avoid data loss.
     let graph_actor_for_save = graph_actor.clone();

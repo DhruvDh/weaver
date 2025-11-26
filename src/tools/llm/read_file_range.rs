@@ -129,6 +129,10 @@ impl ToolInstance for ReadFileRangeTool {
             ToolPayloadMode::Preview => {
                 let hints = vec![
                     format!(
+                        "Path: {}",
+                        render_relative_path(self.workspace_root.as_ref(), &resolved)
+                    ),
+                    format!(
                         "Span covers {} lines ({}-{}).",
                         line_count, range.start_line, range.end_line
                     ),

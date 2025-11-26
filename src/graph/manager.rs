@@ -3,10 +3,12 @@ use std::{convert::Infallible, path::PathBuf, sync::Arc};
 use anyhow::Result;
 use kameo::prelude::*;
 use petgraph::{Direction, visit::EdgeRef};
+use schemars::JsonSchema;
 
 use crate::graph::{
-    AnchorImpact, AssessesAttrs, CurriculumGraph, EdgeKind, GraphError, GraphService,
-    KnowledgeNode, NodeId, NodePayload, RequiresAttrs, SupportsAttrs, TeachingStepNode, persist,
+    AnchorImpact, AnchorsAttrs, AssessesAttrs, CurriculumGraph, EdgeKind, GraphConfig, GraphError,
+    GraphService, KnowledgeNode, NodeId, NodePayload, PrecedesAttrs, RequiresAttrs, SupportsAttrs,
+    TeachingStepNode, persist,
 };
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -16,18 +18,33 @@ pub struct Neighbor {
     pub direction:     String,
 }
 
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeKindFilter {
+    Requires,
+    Supports,
+    Assesses,
+    Precedes,
+    Anchors,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NeighborDirection {
+    Incoming,
+    Outgoing,
+    Both,
+}
+
 #[derive(Actor)]
 pub struct GraphManager {
-    service:       GraphService,
-    course_commit: String,
+    service: GraphService,
+    config:  GraphConfig,
 }
 
 impl GraphManager {
-    pub fn new(service: GraphService, course_commit: String) -> Self {
-        Self {
-            service,
-            course_commit,
-        }
+    pub fn new(service: GraphService, config: GraphConfig) -> Self {
+        Self { service, config }
     }
 }
 
@@ -41,14 +58,13 @@ fn edge_kind_name(k: &EdgeKind) -> &'static str {
     }
 }
 
-fn edge_kind_matches(kind: &str, edge: &EdgeKind) -> bool {
+fn edge_kind_matches(kind: EdgeKindFilter, edge: &EdgeKind) -> bool {
     match kind {
-        "requires" => matches!(edge, EdgeKind::Requires(_)),
-        "supports" => matches!(edge, EdgeKind::Supports(_)),
-        "assesses" => matches!(edge, EdgeKind::Assesses(_)),
-        "precedes" => matches!(edge, EdgeKind::Precedes(_)),
-        "anchors" => matches!(edge, EdgeKind::Anchors(_)),
-        _ => true,
+        EdgeKindFilter::Requires => matches!(edge, EdgeKind::Requires(_)),
+        EdgeKindFilter::Supports => matches!(edge, EdgeKind::Supports(_)),
+        EdgeKindFilter::Assesses => matches!(edge, EdgeKind::Assesses(_)),
+        EdgeKindFilter::Precedes => matches!(edge, EdgeKind::Precedes(_)),
+        EdgeKindFilter::Anchors => matches!(edge, EdgeKind::Anchors(_)),
     }
 }
 
@@ -78,11 +94,7 @@ impl Message<InsertKnowledge> for GraphManager {
         }: InsertKnowledge,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        if self.service.node_by_slug(&slug).is_ok() {
-            self.service.update_knowledge_node(&slug, payload, tags)
-        } else {
-            self.service.add_knowledge_node(slug, payload, tags)
-        }
+        self.service.add_knowledge_node(slug, payload, tags)
     }
 }
 
@@ -126,11 +138,7 @@ impl Message<InsertTeachingStep> for GraphManager {
         }: InsertTeachingStep,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        if self.service.node_by_slug(&slug).is_ok() {
-            self.service.update_teaching_step(&slug, payload, tags)
-        } else {
-            self.service.add_teaching_step(slug, payload, tags)
-        }
+        self.service.add_teaching_step(slug, payload, tags)
     }
 }
 
@@ -173,7 +181,7 @@ impl Message<AddRequires> for GraphManager {
         let from_id = self.service.node_by_slug(&from)?;
         let to_id = self.service.node_by_slug(&to)?;
         self.service
-            .add_requires_edge(from_id, to_id, attrs, confidence)?;
+            .add_edge::<crate::graph::RequiresSpec>(from_id, to_id, attrs, confidence)?;
         Ok(())
     }
 }
@@ -201,7 +209,7 @@ impl Message<AddSupports> for GraphManager {
         let from_id = self.service.node_by_slug(&from)?;
         let to_id = self.service.node_by_slug(&to)?;
         self.service
-            .add_supports_edge(from_id, to_id, attrs, confidence)?;
+            .add_edge::<crate::graph::SupportsSpec>(from_id, to_id, attrs, confidence)?;
         Ok(())
     }
 }
@@ -229,7 +237,7 @@ impl Message<AddAssesses> for GraphManager {
         let from_id = self.service.node_by_slug(&from)?;
         let to_id = self.service.node_by_slug(&to)?;
         self.service
-            .add_assesses_edge(from_id, to_id, attrs, confidence)?;
+            .add_edge::<crate::graph::AssessesSpec>(from_id, to_id, attrs, confidence)?;
         Ok(())
     }
 }
@@ -256,8 +264,12 @@ impl Message<AddPrecedes> for GraphManager {
     ) -> Self::Reply {
         let from_id = self.service.node_by_slug(&from)?;
         let to_id = self.service.node_by_slug(&to)?;
-        self.service
-            .add_precedes_edge(from_id, to_id, episode, confidence)?;
+        self.service.add_edge::<crate::graph::PrecedesSpec>(
+            from_id,
+            to_id,
+            PrecedesAttrs { episode },
+            confidence,
+        )?;
         Ok(())
     }
 }
@@ -284,8 +296,12 @@ impl Message<AddAnchors> for GraphManager {
     ) -> Self::Reply {
         let from_id = self.service.node_by_slug(&from)?;
         let to_id = self.service.node_by_slug(&to)?;
-        self.service
-            .add_anchors_edge(from_id, to_id, impact, confidence)?;
+        self.service.add_edge::<crate::graph::AnchorsSpec>(
+            from_id,
+            to_id,
+            AnchorsAttrs { impact },
+            confidence,
+        )?;
         Ok(())
     }
 }
@@ -335,27 +351,19 @@ impl Message<Neighbors> for GraphManager {
     ) -> Self::Reply {
         let node = self.service.node_by_slug(&slug)?;
 
-        let kind_filter = edge_kind.map(|k| k.to_ascii_lowercase());
-        if let Some(ref k) = kind_filter
-            && !matches!(k.as_str(), "requires" | "supports" | "assesses" | "precedes" | "anchors")
-        {
-            return Err(GraphError::Schema(format!("unknown edge_kind `{}`", k)));
-        }
+        let kind_filter = edge_kind;
 
-        let dirs: Vec<Direction> = match direction.as_deref() {
-            Some("incoming") => vec![Direction::Incoming],
-            Some("outgoing") => vec![Direction::Outgoing],
-            Some("both") | None => vec![Direction::Incoming, Direction::Outgoing],
-            Some(other) => {
-                return Err(GraphError::Schema(format!("unknown direction `{}`", other)));
-            }
+        let dirs: Vec<Direction> = match direction.unwrap_or(NeighborDirection::Both) {
+            NeighborDirection::Incoming => vec![Direction::Incoming],
+            NeighborDirection::Outgoing => vec![Direction::Outgoing],
+            NeighborDirection::Both => vec![Direction::Incoming, Direction::Outgoing],
         };
 
         let mut out = Vec::new();
         let g = self.service.graph();
         for dir in dirs {
             for edge in g.edges_directed(node, dir) {
-                if let Some(ref k) = kind_filter
+                if let Some(k) = kind_filter
                     && !edge_kind_matches(k, &edge.weight().kind)
                 {
                     continue;
@@ -378,6 +386,18 @@ impl Message<Neighbors> for GraphManager {
         }
 
         Ok(out)
+    }
+}
+
+impl Message<ResolveSlug> for GraphManager {
+    type Reply = Result<NodeId, GraphError>;
+
+    async fn handle(
+        &mut self,
+        ResolveSlug { slug }: ResolveSlug,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.service.node_by_slug(&slug)
     }
 }
 
@@ -411,8 +431,8 @@ pub struct SaveSnapshot {
 
 pub struct Neighbors {
     pub slug:      String,
-    pub edge_kind: Option<String>, // requires, supports, assesses, precedes, anchors
-    pub direction: Option<String>, // incoming, outgoing, both
+    pub edge_kind: Option<EdgeKindFilter>, // requires, supports, assesses, precedes, anchors
+    pub direction: Option<NeighborDirection>, // incoming, outgoing, both
 }
 
 pub struct RenameNode {
@@ -421,6 +441,10 @@ pub struct RenameNode {
 }
 
 pub struct RemoveNode {
+    pub slug: String,
+}
+
+pub struct ResolveSlug {
     pub slug: String,
 }
 
@@ -433,7 +457,7 @@ impl Message<SaveSnapshot> for GraphManager {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let graph = self.service.shared_graph();
-        persist::save_graph(graph.as_ref(), path, &self.course_commit).await
+        persist::save_graph(graph.as_ref(), path, &self.config.course_commit).await
     }
 }
 
@@ -449,8 +473,9 @@ impl Message<LoadSnapshot> for GraphManager {
         LoadSnapshot { path }: LoadSnapshot,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let graph = persist::load_graph(&path).await?;
-        self.service.replace_graph(graph);
+        let snapshot = persist::load_graph(&path).await?;
+        self.service.replace_graph(snapshot.graph)?;
+        self.config.course_commit = snapshot.course_commit;
         Ok(())
     }
 }

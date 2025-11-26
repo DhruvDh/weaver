@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{
     fs::{self, File},
     io::AsyncWriteExt,
+    task,
 };
 
 use crate::graph::CurriculumGraph;
@@ -44,7 +45,14 @@ pub async fn save_graph(
     course_commit: &str,
 ) -> anyhow::Result<()> {
     let snapshot = GraphSnapshot::new(graph.clone(), course_commit.to_string());
-    let data = serde_json::to_vec_pretty(&snapshot).context("serialize graph snapshot")?;
+
+    // Serialize in a blocking task to avoid hogging async executors on large
+    // graphs.
+    let data = task::spawn_blocking(move || {
+        serde_json::to_vec_pretty(&snapshot).context("serialize graph snapshot")
+    })
+    .await
+    .context("snapshot serialization task panicked")??;
     let path = path.as_ref();
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -72,7 +80,7 @@ pub async fn save_graph(
 }
 
 /// Load a snapshot from disk and reconstruct GraphService.
-pub async fn load_graph(path: impl AsRef<Path>) -> anyhow::Result<CurriculumGraph> {
+pub async fn load_graph(path: impl AsRef<Path>) -> anyhow::Result<GraphSnapshot> {
     let data = fs::read(path.as_ref())
         .await
         .with_context(|| format!("read snapshot {}", path.as_ref().display()))?;
@@ -85,5 +93,5 @@ pub async fn load_graph(path: impl AsRef<Path>) -> anyhow::Result<CurriculumGrap
             SNAPSHOT_VERSION
         );
     }
-    Ok(snapshot.graph)
+    Ok(snapshot)
 }

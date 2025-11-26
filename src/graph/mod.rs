@@ -7,6 +7,7 @@ use petgraph::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::schema::types::{
@@ -15,6 +16,14 @@ use crate::schema::types::{
 
 pub mod manager;
 pub mod persist;
+
+fn validate_source_refs(spans: &[SourceRef]) -> Result<(), GraphError> {
+    for span in spans {
+        crate::schema::validate::validate_source_ref(span)
+            .map_err(|e| GraphError::Schema(e.to_string()))?;
+    }
+    Ok(())
+}
 
 /// Runtime configuration for graph persistence/metadata.
 #[derive(Clone, Debug)]
@@ -182,10 +191,12 @@ pub enum GraphError {
         from: Option<NodeKindPreview>,
         to:   Option<NodeKindPreview>,
     },
-    #[error("edge would create a cycle in requires layer")]
-    RequiresCycle,
+    #[error("edge would create a cycle in requires layer: {cycle_slugs:?}")]
+    RequiresCycle { cycle_slugs: Vec<String> },
     #[error("validator error: {0}")]
     Schema(String),
+    #[error("graph invariant violation(s): {violations:?}")]
+    InvariantViolation { violations: Vec<String> },
 }
 
 /// Lightweight snapshot of a node's kind used for error messages.
@@ -241,7 +252,8 @@ impl GraphService {
             graph:        Arc::new(graph),
             slug_to_node: HashMap::new(),
         };
-        svc.rebuild_slug_index();
+        svc.rebuild_slug_index()
+            .expect("graph provided to from_graph must have unique slugs");
         svc
     }
 
@@ -254,7 +266,7 @@ impl GraphService {
         &self.graph
     }
 
-    pub fn graph_mut(&mut self) -> &mut CurriculumGraph {
+    pub(crate) fn graph_mut(&mut self) -> &mut CurriculumGraph {
         Arc::make_mut(&mut self.graph)
     }
 
@@ -281,6 +293,12 @@ impl GraphService {
                 slug
             )));
         }
+        if payload.source_refs.is_empty() {
+            return Err(GraphError::Schema(
+                "knowledge nodes must include at least one source_ref".to_string(),
+            ));
+        }
+        validate_source_refs(&payload.source_refs)?;
         let logical_id = Uuid::new_v4();
         let node = NodePayload {
             logical_id,
@@ -289,7 +307,8 @@ impl GraphService {
             tags,
         };
         let id = self.graph_mut().add_node(node);
-        self.upsert_slug(slug, id);
+        self.upsert_slug(slug.clone(), id);
+        self.validate_global_invariants_or_rollback_node(id, &slug)?;
         Ok(id)
     }
 
@@ -302,6 +321,20 @@ impl GraphService {
     ) -> Result<NodeId, GraphError> {
         let id = self.node_by_slug(slug)?;
         let old_kind = self.graph()[id].kind.clone();
+        let old_tags = self.graph()[id].tags.clone();
+        if !matches!(&old_kind, NodeKind::Knowledge(_)) {
+            return Err(GraphError::Schema(format!(
+                "slug `{}` exists as teaching_step; cannot update knowledge",
+                slug
+            )));
+        }
+
+        if payload.source_refs.is_empty() {
+            return Err(GraphError::Schema(
+                "knowledge nodes must include at least one source_ref".to_string(),
+            ));
+        }
+        validate_source_refs(&payload.source_refs)?;
 
         // apply tentative change
         self.graph_mut()[id].kind = NodeKind::Knowledge(payload);
@@ -314,6 +347,12 @@ impl GraphService {
         }
 
         self.graph_mut()[id].tags = tags;
+        if let Err(err) = self.validate_global_invariants() {
+            // rollback
+            self.graph_mut()[id].kind = old_kind;
+            self.graph_mut()[id].tags = old_tags;
+            return Err(err);
+        }
         Ok(id)
     }
 
@@ -388,17 +427,36 @@ impl GraphService {
         (*self.graph).clone()
     }
 
-    pub fn replace_graph(&mut self, graph: CurriculumGraph) {
-        self.graph = Arc::new(graph);
-        self.rebuild_slug_index();
+    pub fn replace_graph(&mut self, graph: CurriculumGraph) -> Result<(), GraphError> {
+        // Build slug index first; only commit if it succeeds.
+        let candidate = Arc::new(graph);
+        let index = self.build_slug_index_map(candidate.as_ref())?;
+        self.graph = candidate;
+        self.slug_to_node = index;
+        Ok(())
     }
 
-    fn rebuild_slug_index(&mut self) {
-        self.slug_to_node.clear();
-        for n in self.graph.node_indices() {
-            let slug = self.graph[n].slug.clone();
-            self.slug_to_node.insert(slug, n);
+    fn rebuild_slug_index(&mut self) -> Result<(), GraphError> {
+        let map = self.build_slug_index_map(self.graph.as_ref())?;
+        self.slug_to_node = map;
+        Ok(())
+    }
+
+    fn build_slug_index_map(
+        &self,
+        graph: &CurriculumGraph,
+    ) -> Result<HashMap<String, NodeId>, GraphError> {
+        let mut map = HashMap::new();
+        for n in graph.node_indices() {
+            let slug = graph[n].slug.clone();
+            if map.insert(slug.clone(), n).is_some() {
+                return Err(GraphError::Schema(format!(
+                    "duplicate slug `{}` found while rebuilding index",
+                    slug
+                )));
+            }
         }
+        Ok(map)
     }
 
     pub fn add_teaching_step(
@@ -413,6 +471,12 @@ impl GraphService {
                 slug
             )));
         }
+        if payload.source_refs.is_empty() {
+            return Err(GraphError::Schema(
+                "teaching steps must include at least one source_ref".to_string(),
+            ));
+        }
+        validate_source_refs(&payload.source_refs)?;
         let logical_id = Uuid::new_v4();
         let node = NodePayload {
             logical_id,
@@ -421,7 +485,8 @@ impl GraphService {
             tags,
         };
         let id = self.graph_mut().add_node(node);
-        self.upsert_slug(slug, id);
+        self.upsert_slug(slug.clone(), id);
+        self.validate_global_invariants_or_rollback_node(id, &slug)?;
         Ok(id)
     }
 
@@ -433,6 +498,19 @@ impl GraphService {
     ) -> Result<NodeId, GraphError> {
         let id = self.node_by_slug(slug)?;
         let old_kind = self.graph()[id].kind.clone();
+        let old_tags = self.graph()[id].tags.clone();
+        if !matches!(&old_kind, NodeKind::TeachingStep(_)) {
+            return Err(GraphError::Schema(format!(
+                "slug `{}` exists as knowledge; cannot update teaching_step",
+                slug
+            )));
+        }
+        if payload.source_refs.is_empty() {
+            return Err(GraphError::Schema(
+                "teaching steps must include at least one source_ref".to_string(),
+            ));
+        }
+        validate_source_refs(&payload.source_refs)?;
         self.graph_mut()[id].kind = NodeKind::TeachingStep(payload);
 
         if let Err(err) = self.validate_incident_edges(id) {
@@ -440,6 +518,11 @@ impl GraphService {
             return Err(err);
         }
         self.graph_mut()[id].tags = tags;
+        if let Err(err) = self.validate_global_invariants() {
+            self.graph_mut()[id].kind = old_kind;
+            self.graph_mut()[id].tags = old_tags;
+            return Err(err);
+        }
         Ok(id)
     }
 
@@ -451,83 +534,73 @@ impl GraphService {
         attrs: S::Attrs,
         confidence: f32,
     ) -> Result<EdgeId, GraphError> {
+        // Duplicate edge guard runs only for new insertions; validation passes
+        // during node updates should not trigger it.
+        let duplicate = match S::NAME {
+            "requires" => self.has_edge_of_kind(from, to, |k| matches!(k, EdgeKind::Requires(_))),
+            "supports" => self.has_edge_of_kind(from, to, |k| matches!(k, EdgeKind::Supports(_))),
+            "assesses" => self.has_edge_of_kind(from, to, |k| matches!(k, EdgeKind::Assesses(_))),
+            "precedes" => self.has_edge_of_kind(from, to, |k| matches!(k, EdgeKind::Precedes(_))),
+            "anchors" => self.has_edge_of_kind(from, to, |k| matches!(k, EdgeKind::Anchors(_))),
+            _ => false,
+        };
+        if duplicate {
+            return Err(GraphError::Schema(format!(
+                "duplicate {} edge between these nodes",
+                S::NAME
+            )));
+        }
+
         S::validate(self, from, to, &attrs, confidence)?;
         let payload = S::make_payload(attrs, confidence);
-        Ok(self.graph_mut().add_edge(from, to, payload))
+        let edge_id = self.graph_mut().add_edge(from, to, payload);
+
+        if let Err(err) = self.validate_global_invariants() {
+            // rollback
+            self.graph_mut().remove_edge(edge_id);
+            return Err(err);
+        }
+
+        Ok(edge_id)
     }
 
-    // Convenience wrappers retaining the previous API surface.
-    pub fn add_requires_edge(
-        &mut self,
-        from: NodeId,
-        to: NodeId,
-        attrs: RequiresAttrs,
-        confidence: f32,
-    ) -> Result<EdgeId, GraphError> {
-        self.add_edge::<RequiresSpec>(from, to, attrs, confidence)
-    }
-
-    pub fn add_supports_edge(
-        &mut self,
-        from: NodeId,
-        to: NodeId,
-        attrs: SupportsAttrs,
-        confidence: f32,
-    ) -> Result<EdgeId, GraphError> {
-        self.add_edge::<SupportsSpec>(from, to, attrs, confidence)
-    }
-
-    pub fn add_assesses_edge(
-        &mut self,
-        from: NodeId,
-        to: NodeId,
-        attrs: AssessesAttrs,
-        confidence: f32,
-    ) -> Result<EdgeId, GraphError> {
-        self.add_edge::<AssessesSpec>(from, to, attrs, confidence)
-    }
-
-    pub fn add_precedes_edge(
-        &mut self,
-        from: NodeId,
-        to: NodeId,
-        episode: String,
-        confidence: f32,
-    ) -> Result<EdgeId, GraphError> {
-        self.add_edge::<PrecedesSpec>(from, to, PrecedesAttrs { episode }, confidence)
-    }
-
-    pub fn add_anchors_edge(
-        &mut self,
-        from: NodeId,
-        to: NodeId,
-        impact: AnchorImpact,
-        confidence: f32,
-    ) -> Result<EdgeId, GraphError> {
-        self.add_edge::<AnchorsSpec>(from, to, AnchorsAttrs { impact }, confidence)
+    fn has_edge_of_kind(&self, from: NodeId, to: NodeId, pred: impl Fn(&EdgeKind) -> bool) -> bool {
+        use petgraph::Direction;
+        self.graph
+            .edges_directed(from, Direction::Outgoing)
+            .any(|e| e.target() == to && pred(&e.weight().kind))
     }
 
     pub fn node(&self, id: NodeId) -> &NodePayload {
         &self.graph[id]
     }
 
-    fn node_kinds(&self, from: NodeId, to: NodeId) -> Result<(&NodeKind, &NodeKind), GraphError> {
+    fn node_kinds(
+        &self,
+        edge_name: &'static str,
+        from: NodeId,
+        to: NodeId,
+    ) -> Result<(&NodeKind, &NodeKind), GraphError> {
         let from_kind = &self
             .graph
             .node_weight(from)
-            .ok_or(GraphError::InvalidEndpoints {
-                edge: "generic",
-                from: None,
-                to:   None,
+            .ok_or_else(|| {
+                GraphError::Schema(format!(
+                    "{} edge references missing from-node index {:?}",
+                    edge_name,
+                    from.index()
+                ))
             })?
             .kind;
         let to_kind = &self
             .graph
             .node_weight(to)
-            .ok_or(GraphError::InvalidEndpoints {
-                edge: "generic",
-                from: None,
-                to:   None,
+            .ok_or_else(|| {
+                GraphError::Schema(format!(
+                    "{} edge references missing to-node index {:?}",
+                    edge_name,
+                    to.index()
+                ))
             })?
             .kind;
         Ok((from_kind, to_kind))
@@ -556,6 +629,46 @@ impl GraphService {
         false
     }
 
+    /// Return one requires-path from `start` to `goal`, if it exists.
+    pub fn requires_path(&self, start: NodeId, goal: NodeId) -> Option<Vec<NodeId>> {
+        use std::collections::{HashMap, HashSet, VecDeque};
+
+        use petgraph::Direction;
+
+        let mut queue = VecDeque::new();
+        let mut seen = HashSet::new();
+        let mut parent: HashMap<NodeId, NodeId> = HashMap::new();
+
+        queue.push_back(start);
+        seen.insert(start);
+
+        while let Some(node) = queue.pop_front() {
+            if node == goal {
+                // reconstruct
+                let mut path = vec![goal];
+                let mut cur = goal;
+                while let Some(&p) = parent.get(&cur) {
+                    cur = p;
+                    path.push(cur);
+                }
+                path.reverse();
+                return Some(path);
+            }
+            for edge in self
+                .graph
+                .edges_directed(node, Direction::Outgoing)
+                .filter(|e| matches!(e.weight().kind, EdgeKind::Requires(_)))
+            {
+                let next = edge.target();
+                if seen.insert(next) {
+                    parent.insert(next, node);
+                    queue.push_back(next);
+                }
+            }
+        }
+        None
+    }
+
     fn has_precedes_path(&self, start: NodeId, goal: NodeId, episode: &str) -> bool {
         use petgraph::Direction;
         let mut stack = vec![start];
@@ -574,6 +687,84 @@ impl GraphService {
             }
         }
         false
+    }
+
+    /// Run global audits and return violations as errors.
+    fn validate_global_invariants(&self) -> Result<(), GraphError> {
+        use crate::analysis;
+
+        let g = self.graph();
+        let mut warnings = Vec::new();
+        let mut errors = Vec::new();
+
+        if !analysis::requires_is_dag(g) {
+            errors.push("requires layer must remain acyclic".to_string());
+        }
+
+        for lo in analysis::lo_missing_target_assessments(g) {
+            warnings
+                .push(format!("learning_outcome `{}` missing assesses(scope=target)", g[lo].slug));
+        }
+
+        for lo_id in g.node_indices().filter(|&n| matches!(&g[n].kind, NodeKind::Knowledge(k) if k.knowledge_type == KnowledgeType::LearningOutcome)) {
+            let report = analysis::coverage_report(g, lo_id);
+            if !report.missing_criteria.is_empty() {
+                warnings.push(format!(
+                    "learning_outcome `{}` missing coverage for rubric criteria: {}",
+                    g[lo_id].slug,
+                    report.missing_criteria.join(", ")
+                ));
+            }
+        }
+
+        for gap in analysis::example_gaps(g) {
+            warnings.push(format!("{}: {}", g[gap.node].slug, gap.description));
+        }
+
+        for gap in analysis::procedural_practice_gaps(g) {
+            warnings.push(format!(
+                "procedural `{}` lacks reachable assessment with assesses(scope=target)",
+                g[gap.node].slug
+            ));
+        }
+
+        for issue in analysis::fadeability_issues(g) {
+            let assessment_slug = g[issue.assessment].slug.clone();
+            let edges: Vec<String> = issue
+                .support_edges
+                .iter()
+                .filter_map(|e| g.edge_endpoints(*e))
+                .map(|(u, v)| format!("{} -> {}", g[u].slug, g[v].slug))
+                .collect();
+            errors.push(format!(
+                "assessment `{}` reachable only via supports that carry prerequisite load: [{}]",
+                assessment_slug,
+                edges.join("; ")
+            ));
+        }
+
+        for w in warnings {
+            warn!(target: "weaver.graph.invariants", "{w}");
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(GraphError::InvariantViolation { violations: errors })
+        }
+    }
+
+    fn validate_global_invariants_or_rollback_node(
+        &mut self,
+        id: NodeId,
+        slug: &str,
+    ) -> Result<(), GraphError> {
+        if let Err(err) = self.validate_global_invariants() {
+            self.graph_mut().remove_node(id);
+            self.slug_to_node.remove(slug);
+            return Err(err);
+        }
+        Ok(())
     }
 }
 
@@ -597,7 +788,7 @@ impl EdgeSpec for RequiresSpec {
         attrs: &Self::Attrs,
         _confidence: f32,
     ) -> Result<(), GraphError> {
-        let (from_kind, to_kind) = svc.node_kinds(from, to)?;
+        let (from_kind, to_kind) = svc.node_kinds(Self::NAME, from, to)?;
         let (from_kt, to_kt) = match (from_kind, to_kind) {
             (NodeKind::Knowledge(f), NodeKind::Knowledge(t)) => {
                 (f.knowledge_type, t.knowledge_type)
@@ -620,8 +811,12 @@ impl EdgeSpec for RequiresSpec {
         )
         .map_err(|e| GraphError::Schema(e.to_string()))?;
 
-        if svc.has_requires_path(to, from) {
-            return Err(GraphError::RequiresCycle);
+        if let Some(path) = svc.requires_path(to, from) {
+            let cycle_slugs = path
+                .into_iter()
+                .map(|id| svc.graph()[id].slug.clone())
+                .collect();
+            return Err(GraphError::RequiresCycle { cycle_slugs });
         }
         Ok(())
     }
@@ -646,7 +841,7 @@ impl EdgeSpec for SupportsSpec {
         attrs: &Self::Attrs,
         _confidence: f32,
     ) -> Result<(), GraphError> {
-        let (from_kind, to_kind) = svc.node_kinds(from, to)?;
+        let (from_kind, to_kind) = svc.node_kinds(Self::NAME, from, to)?;
         if from == to {
             return Err(GraphError::Schema("supports self-loops are not allowed".to_string()));
         }
@@ -700,7 +895,7 @@ impl EdgeSpec for AssessesSpec {
         attrs: &Self::Attrs,
         _confidence: f32,
     ) -> Result<(), GraphError> {
-        let (from_kind, to_kind) = svc.node_kinds(from, to)?;
+        let (from_kind, to_kind) = svc.node_kinds(Self::NAME, from, to)?;
         let (from_kt, to_kt) = match (from_kind, to_kind) {
             (NodeKind::Knowledge(f), NodeKind::Knowledge(t)) => {
                 (f.knowledge_type, t.knowledge_type)
@@ -748,7 +943,7 @@ impl EdgeSpec for PrecedesSpec {
         attrs: &Self::Attrs,
         _confidence: f32,
     ) -> Result<(), GraphError> {
-        let (from_kind, to_kind) = svc.node_kinds(from, to)?;
+        let (from_kind, to_kind) = svc.node_kinds(Self::NAME, from, to)?;
         match (from_kind, to_kind) {
             (NodeKind::TeachingStep(_), NodeKind::TeachingStep(_)) => {}
             _ => {
@@ -791,6 +986,13 @@ impl EdgeSpec for AnchorsSpec {
     type Attrs = AnchorsAttrs;
     const NAME: &'static str = "anchors";
 
+    /// Discourse anchors semantics:
+    /// - Source must be TeachingStep.
+    /// - impact = introduce/refine: target must be instructional knowledge (not
+    ///   LO or assessment).
+    /// - impact = target: target must be a LearningOutcome.
+    /// - impact = use/motivate: general knowledge allowed; if target is an
+    ///   assessment item, only `use` is permitted.
     fn validate(
         svc: &GraphService,
         from: NodeId,
@@ -798,7 +1000,7 @@ impl EdgeSpec for AnchorsSpec {
         attrs: &Self::Attrs,
         _confidence: f32,
     ) -> Result<(), GraphError> {
-        let (from_kind, to_kind) = svc.node_kinds(from, to)?;
+        let (from_kind, to_kind) = svc.node_kinds(Self::NAME, from, to)?;
         match from_kind {
             NodeKind::TeachingStep(_) => {}
             _ => {

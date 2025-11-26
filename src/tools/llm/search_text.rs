@@ -134,6 +134,11 @@ impl ToolInstance for SearchTextTool {
                 let hints = vec![
                     format!("{} matches totaling roughly {} bytes.", match_count, approx_bytes),
                     "Set fetch_body=true to retrieve all matches.".to_string(),
+                    format!("Pattern: `{}`", self.args.pattern),
+                    format!(
+                        "Scope: {}",
+                        render_relative_path(self.workspace_root.as_ref(), &scope)
+                    ),
                     "Refine the regex or narrow the path to reduce match volume.".to_string(),
                 ];
                 let mut value = build_cost_preview(IDENTIFIER, approx_bytes, safe_tokens, hints);
