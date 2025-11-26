@@ -20,6 +20,8 @@ pub enum SchemaError {
     EmptyField { field: &'static str },
     #[error("source_ref line range is invalid: start {start_line} > end {end_line}")]
     InvalidLineRange { start_line: u32, end_line: u32 },
+    #[error("source_ref revision must be a 7-40 character hexadecimal git hash")]
+    InvalidRevision,
     #[error("observation_features must contain at least one entry for {edge}")]
     MissingObservationFeature { edge: &'static str },
 }
@@ -37,7 +39,12 @@ pub fn validate_source_ref(span: &SourceRef) -> Result<(), SchemaError> {
             end_line:   span.end_line,
         });
     }
-    ensure_non_empty(&span.path, "source_ref.path")
+    ensure_non_empty(&span.path, "source_ref.path")?;
+    ensure_non_empty(&span.revision, "source_ref.revision")?;
+    if !is_git_hash(&span.revision) {
+        return Err(SchemaError::InvalidRevision);
+    }
+    Ok(())
 }
 
 pub fn validate_requires(
@@ -151,4 +158,12 @@ fn ensure_non_empty(value: &str, field: &'static str) -> Result<(), SchemaError>
     } else {
         Ok(())
     }
+}
+
+fn is_git_hash(value: &str) -> bool {
+    let len = value.len();
+    if !(7..=40).contains(&len) {
+        return false;
+    }
+    value.bytes().all(|b| b.is_ascii_hexdigit())
 }

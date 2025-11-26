@@ -24,6 +24,8 @@ use self::{
 use crate::llm_gateway::{GatewayMetrics, LLMGateway};
 
 mod delegate_tasks;
+mod graph_neighbors;
+mod graph_tools;
 mod list_directory;
 mod read_file_full;
 mod read_file_range;
@@ -209,13 +211,15 @@ pub fn apply_preview_cost(
 }
 
 static TOOL_PROTOTYPES: Lazy<Vec<ToolPrototype>> = Lazy::new(|| {
-    let metas = vec![
+    let mut metas = vec![
         list_directory_meta(),
         read_file_full_meta(),
         read_file_range_meta(),
         search_text_meta(),
         delegate_tasks_meta(),
     ];
+
+    metas.extend(graph_tools::graph_tool_prototypes());
 
     let mut seen = HashMap::new();
     for meta in &metas {

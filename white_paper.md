@@ -158,7 +158,7 @@ We add two relations over TeachingSteps plus cross‑layer anchoring:
 * **`title`** — stable, human‑readable identifier.
 * **`knowledge_type`** ∈ {factual, conceptual, procedural, metacognitive, learning_outcome, assessment_item}. (Revised Bloom + CA/ECD anchors.)
 * **`statement`** — a concise, self‑contained sentence or two (for LOs: performance statement).
-* **`source_refs`** — *path + line range + commit hash* for the exact PreTeXt source (no excerpted text), e.g., `source/DesignRecipe/section.xml#L120–L180 @ 1a2b3c4d`. These references are immutable with respect to that commit; when the upstream repo changes you regenerate or migrate the graph for the new commit rather than “sliding” offsets.
+* **`source_refs`** — *path + line range + commit hash* for the exact PreTeXt source (no excerpted text), e.g., `source/DesignRecipe/section.xml#L120–L180 @ 1a2b3c4d`. Stored as structured objects `{ path, start_line, end_line, revision }`, never as free strings. These references are immutable with respect to that commit; when the upstream repo changes you regenerate or migrate the graph for the new commit rather than “sliding” offsets.
 * **`confidence`** — model’s self‑estimate (0–1) to flag uncertain extractions.
 * **LO-only fields.** `rubric_criteria: [String]` stores the observable behaviors or scoring dimensions promised by the LO. These criteria are what `observation_features` must cover.
 * **Assessment-only fields.** `construct_irrelevant_demands: [String]` documents any known skills the item happens to require but is *not* intended to measure (e.g., advanced prose, tricky notation). Recording them makes purity checks interpretable.
@@ -315,7 +315,7 @@ Sections §6 (“Example minimums”, “Variety check”) and §10.2 reference 
 
 ## 9. Practical notes for your stack
 
-* **Helix‑DB.** Store nodes/edges plus `source_refs`/`evidence_link`, and make every entry in `source_refs` the triple `{path, line_range, commit_hash}` taken from a pinned repo revision. Persist that commit hash in graph metadata so analysts know when the graph is stale; updating the course means regenerating/migrating for a new commit, never hand‑shifting line numbers.
+* **Graph engine (Rust + petgraph).** Represent the curriculum as a single directed `petgraph::Graph<NodePayload, EdgeKind, Directed>`; `EdgeKind` discriminates `requires`/`supports`/`assesses`. Use filtered views of that graph per layer when running algorithms: `algo::toposort` or `is_cyclic_directed` for the `requires` DAG; `has_path_connecting`/BFS for reachability and LO predicates; simple reachability counts for keystone approximations. Serialize nodes/edges plus the pinned repo commit hash with `serde` (JSON or similar) so snapshots are reproducible and auditable.
 * **Visualization (Rerun).** Show three layers togglable: **requires** (backbone DAG), **supports** (scaffolds), **assesses** (assessment→LO links).
 * **Validation hooks.** Add checks for (a) DAG property, (b) LO reachability predicate, (c) coverage (observation features vs. rubric criteria), (d) purity (Extraneous sets + construct-irrelevant demands), (e) orphan nodes, (f) item without claim, (g) supports that create self-loops.
 * **Slug convention.** Use `{kind}.{short_name}` for every node/edge slug, where `kind ∈ {F,C,P,M,R,LO,A}` denotes factual, conceptual, procedural, metacognitive, principle/misconception tags, learning outcome, or assessment item (e.g., `C.contract_components`, `R.python_docstring`, `LO.clear_contract`, `A.update_rating_docstring`).
@@ -436,7 +436,7 @@ This keeps the *theory* (why these kinds and edges exist) distinct from the *imp
 
 ## Appendix B: Detailed schema and implementation guide
 
-This appendix inlines the standalone `schema.md` guidance so the white paper now contains both the theoretical framing and the concrete Helix/Rust implementation notes.
+This appendix inlines the standalone `schema.md` guidance so the white paper now contains both the theoretical framing and one concrete Rust implementation path (petgraph-based) without locking you to a particular backend.
 
 ### B.1 Design goals (from the white paper)
 
@@ -533,7 +533,7 @@ Guidance:
 
 1. **SourceSpan meta nodes** (optional)  
    `N::SourceSpan { path, start_line, end_line, revision }` with edges `cites` from any node/edge to the span. Use when the same segment justifies multiple nodes and you need repo revision tracking.
-2. **Vector nodes** (Helix `V::Node`)  
+2. **Vector nodes** (optional embedding layer)  
    * `V::KnowledgeEmbedding` storing `[F64]`.  
    * Edges `has_embedding` from any knowledge/LO node to its vector.  
    * Vectors are created from agent-generated summaries (no raw textbook text stored).  
@@ -541,196 +541,110 @@ Guidance:
 
 ### B.5 Validation and integrity checks
 
-1. **Requires DAG.** Guard each insert with a `ShortestPath` lookup and run periodic topological peels; reject any edge that would introduce a cycle or originate from a non-knowledge node. Assessment items must remain sinks in this layer.
+1. **Requires DAG.** For each proposed `requires` edge, use `has_path_connecting` (on the `requires`-only view) or a temporary insert + `toposort` to detect cycles; reject edges that would introduce a cycle or originate from non-knowledge nodes. Assessment items must remain sinks in this layer.
 2. **First-principle tagging.** Automatically tag nodes with indegree 0 (in `requires`) as first principles; persist the tag so reports can anchor reasoning paths without manual bookkeeping.
 3. **LO reachability predicate.** For every LO, confirm the existence of an assessment satisfying the predicate from §6 (reachable from a first principle via `requires*` and `assesses` the LO with `scope = target`).
 4. **Coverage audit.** For each LO, intersect its `rubric_criteria` with the union of `observation_features` across incoming target edges; raise errors for missing criteria and warnings when coverage depends only on enabling edges. Any rubric change automatically re-runs this audit (rubric drift guard).
 5. **Purity audit.** For every target assessment‐LO pair, compute `Extraneous(A, L)` and compare it against the LO’s intended knowledge plus the assessment’s declared `construct_irrelevant_demands`. Non-empty differences require explanation or task redesign.
 6. **Supports sanity.** Reject self-loops, track clusters that are not fadeable (i.e., removing them changes reachability), and ensure each edge carries an `intended_effect` aligned with CLT.
 7. **Evidence presence.** Require at least one `source_refs` entry and `evidence_refs` (when applicable) on every node/edge; missing references surface in nightly audits.
+8. **SourceRef guards.** Enforce structured spans: `path` non-empty, `start_line >= 1`, `end_line >= start_line`, `revision` present and matches `[0-9a-f]{7,40}`. Reject inserts that violate these or that lack `revision` equal to the graph’s pinned commit.
 
-8. **Example minimums.**
+9. **Example minimums.**
    * Enforce the §6 “Example minimums” item (backed by the §5.5 table) by checking each knowledge type’s minimum count and `case_tag` variety.
 
-9. **Procedural practice.**
+10. **Procedural practice.**
    * Enforce the §6 “Procedural practice” rule: each procedural node must be on a path to ≥ 1 assessment with `assesses(..., scope=target)` to some LO.
 
-10. **Variety check.**
+11. **Variety check.**
     * Enforce the §6 “Variety check” so every procedural node has both `typical` and `edge` (or `error_case`) examples recorded via `supports`.
 
-11. **Assessable Atom Test.**
+12. **Assessable Atom Test.**
     * Enforce the §6 AAT: statements must be ≤ 2 sentences and every node must either serve as a prerequisite (≥ 1 distinct `requires` consumer) or have ≥ 2 anchored TeachingSteps; otherwise flag for merge/fold.
 
-12. **Keystone analysis.**
+13. **Keystone analysis.**
     * Compute betweenness centrality over the `requires` DAG; any node above the Keystone threshold must own ≥ 2 `worked_example` supports or trigger a **high-risk** alert.
 
-13. **Granularity audits.**
+14. **Granularity audits.**
     * Over‑bundling detector: `len(statement) > 2 sentences` AND `in_degree(requires) ≥ 4` → suggest `grain_level=macro` or split.
     * Fragment detector: `len(statement) < 15 tokens` AND no `assesses` AND no `supports` → suggest fold into an example (`grain_level=micro`).
     * **Complexity warning:** if `in_degree(requires) ≥ 4` **and** `intrinsic_load != high`, warn the author to bump the load tag or split the node; heavy prerequisite fans imply higher cognitive load.
 
-14. **Fading readiness.**
+15. **Fading readiness.**
     * For nodes with `intrinsic_load=high`, require ≥ 2 supports; warn if the set is not fadeable (removing supports changes `requires*` reachability).
 
-### B.6 Implementation notes for Helix‑DB
+### B.6 Implementation notes: Rust + petgraph core
 
-* **Schema fragments**
+We implement the multiplex graph in-process with `petgraph` and serialize snapshots with `serde`.
 
-  ```hx
-  N::Knowledge {
-    INDEX slug: String
-    title: String
-    statement: String
-    knowledge_type: String
-    source_refs: [SourceRef]
-    confidence: F32 DEFAULT 0.7
-    rubric_criteria: [String] DEFAULT []          // non-empty for LOs
-    construct_irrelevant_demands: [String] DEFAULT [] // populated for assessment items
-    grain_level: String DEFAULT "mid"
-    intrinsic_load: String DEFAULT "medium"
-    introduction_scope: String DEFAULT "in_course"
+* **Core types (sketch)**
+
+  ```rust
+  use petgraph::{graph::Graph, Directed};
+
+  pub type CurriculumGraph = Graph<NodePayload, EdgeKind, Directed>;
+
+  #[derive(Clone, Debug)]
+  pub struct NodePayload {
+      pub id: uuid::Uuid,
+      pub title: String,
+      pub statement: String,
+      pub knowledge_type: KnowledgeType,
+      pub source_refs: Vec<SourceRef>,
+      pub confidence: f32,
+      pub rubric_criteria: Vec<String>,
+      pub construct_irrelevant_demands: Vec<String>,
+      pub grain_level: Option<GrainLevel>,
+      pub intrinsic_load: Option<IntrinsicLoad>,
+      pub introduction_scope: IntroductionScope,
+      pub tags: Vec<String>,
+  }
+
+  #[derive(Clone, Debug)]
+  pub enum EdgeKind {
+      Requires(RequiresAttrs),
+      Supports(SupportsAttrs),
+      Assesses(AssessesAttrs),
   }
   ```
 
-  where `SourceRef` is `{ path: String, start_line: U32, end_line: U32, revision: String }`.
+  *Represent LOs either as a dedicated node variant or as `knowledge_type="learning_outcome"`; assessments remain sinks for `requires`.*
 
-* **Edges**
+* **Layered algorithms.** Build filtered views per edge kind:
+  * `requires` view → `petgraph::algo::toposort` / `is_cyclic_directed` to enforce DAG; `has_path_connecting` for fast “would this edge close a cycle?” checks before insert.
+  * `assesses` + `requires` → reachability for LO predicate: first-principle → … → assessment → LO.
+  * `supports` view → fadeability checks: removing supports must not change `requires*` reachability.
+  * Keystone approx = `in_reach(n) * out_reach(n)` via repeated BFS/DFS on the `requires` view.
 
-  ```hx
-  E::Requires {
-    From: Knowledge
-    To: KnowledgeOrAssessment
-    Properties: {
-      strength: String,
-      rationale: String,
-      evidence_refs: [SourceRef],
-      confidence: F32 DEFAULT 0.7
-    }
-  }
-  ```
+* **Validation hooks.** Reuse the Rust validators in `schema::validate` for spans, enums, and edge constraints before mutating the graph. Prefer “fail fast” on ingest.
 
-  Represent LOs either as a dedicated `N::LearningOutcome` type or as `Knowledge` rows with `knowledge_type="learning_outcome"`; in either case enforce that `assesses` always originates from assessment items and terminates at LOs.
+* **Persistence.** Serialize `CurriculumGraph` nodes/edges plus the pinned source commit hash (and optional remote URL) to JSON/CBOR. Treat each commit as an immutable snapshot; regenerate on repo changes rather than editing in place.
 
-* **Enum enforcement** relies on Rust-side enums plus Helix guards (`WHERE`, validation actors).  
-* **Enum aliases (ingestion).** During ingestion normalize `reduce_load → reduce_extraneous_load`, `germane_load → increase_germane_load`, and `edge_case → edge` for `case_tag`. Store only canonical enum values in the database.
-* **Embeddings** use `AddV<KnowledgeEmbedding>(Embed(statement))` with `has_embedding` edges; exclude these meta nodes from DAG/coverage checks.
+### B.7 Example graph operations (Rust-oriented recipes)
 
-### B.7 Example query templates
+1. **insert_factual**
+   *Signature*: `fn insert_factual(g: &mut CurriculumGraph, payload: NodePayload) -> NodeIndex`  
+   Validates `knowledge_type=factual`, `source_refs`, then inserts node.
 
-1. **Insert a factual node**
+2. **add_requires_if_acyclic**
+   *Signature*: `fn add_requires_if_acyclic(g: &mut CurriculumGraph, from: NodeIndex, to: NodeIndex, attrs: RequiresAttrs) -> Result<EdgeIndex, CycleError>`  
+   Steps: validate attrs → check `has_path_connecting(requires_view(g), to, from, None)` → if true, return cycle error; else insert `EdgeKind::Requires`.
 
-   ```hx
-   QUERY InsertFactual(
-     slug: String,
-     title: String,
-     statement: String,
-     source_path: String,
-     start_line: U32,
-     end_line: U32,
-     confidence: F32,
-     revision: String
-   ) =>
-     node <- AddN<Knowledge>({
-       slug: slug,
-       title: title,
-       statement: statement,
-       knowledge_type: "factual",
-       source_refs: [
-         { path: source_path, start_line: start_line, end_line: end_line, revision: revision }
-       ],
-       confidence: confidence
-     })
-     RETURN node
-   ```
+3. **lo_alignment**
+   *Signature*: `fn lo_alignment(g: &CurriculumGraph, lo: NodeIndex) -> AlignmentReport`  
+   For each assessment with `assesses(lo, scope=target)`, report whether some first‑principle node reaches that assessment via `requires*`; include missing-coverage rubric criteria.
 
-2. **Add a requires edge with cycle guard**
+4. **borrow_ahead**
+   *Signature*: `fn borrow_ahead(g: &CurriculumGraph, episode: &str) -> Vec<BorrowAheadWarning>`  
+   Find `TeachingStep` nodes in the episode whose `anchors(impact=use)` targets a knowledge node that lacks any prior `introduce` anchor in the same or earlier episode (configurable scope); grade severity per §6.
 
-   ```hx
-   QUERY AddRequiresIfAcyclic(
-     from_id: ID,
-     to_id: ID,
-     strength: String,
-     rationale: String,
-     evidence_path: String,
-     evidence_start: U32,
-     evidence_end: U32,
-     evidence_revision: String
-   ) =>
-     path <- N<Knowledge>(to_id)::ShortestPath<Requires>::To(from_id)::LIMIT(1)
-     only_if <- path::WHERE(_::{length}::EQ(0))
-     AddE<Requires>({
-       strength: strength,
-       rationale: rationale,
-       evidence_refs: [
-         {
-           path: evidence_path,
-           start_line: evidence_start,
-           end_line: evidence_end,
-           revision: evidence_revision
-         }
-       ]
-     })::From(from_id)::To(to_id)
-     RETURN "ok"
-   ```
+5. **add_precedes_if_acyclic (discourse layer)**
+   *Signature*: `fn add_precedes_if_acyclic(g: &mut CurriculumGraph, from: NodeIndex, to: NodeIndex, episode: &str)`  
+   Restrict to `TeachingStep` nodes of that episode; reject if `has_path_connecting` already links `to → from` within that episode’s `precedes` edges.
 
-3. **LO coverage report**
-
-   ```hx
-   QUERY LOAlignment(lo_id: ID) =>
-     assessments <- N<LearningOutcome>(lo_id)::In<Assesses>
-   upstream <- assessments::In<Requires>::LIMIT(1)
-    RETURN {
-       lo: lo_id,
-       assessed_by: assessments::{ id, title },
-       has_prereqs: upstream::{ id, title }
-     }
-   ```
-
-4. **Insert a TeachingStep**
-
-   ```hx
-   QUERY InsertTeachingStep(
-     title: String, statement: String, purpose: String, episode: String,
-     method_tags: [String], source_path: String, start_line: U32, end_line: U32, revision: String
-   ) =>
-     step <- AddN<TeachingStep>({
-       title: title, statement: statement, purpose: purpose, episode: episode,
-       method_tags: method_tags,
-       source_refs: [{ path: source_path, start_line: start_line, end_line: end_line, revision: revision }]
-     })
-     RETURN step
-   ```
-
-5. **Add precedes if acyclic (per episode)**
-
-   ```hx
-   QUERY AddPrecedesIfAcyclic(from_id: ID, to_id: ID, episode: String) =>
-     path <- N<TeachingStep>(to_id)::In<Precedes>::To(from_id)::WHERE(_::{episode}::EQ(episode))::LIMIT(1)
-     only_if <- path::WHERE(_::{length}::EQ(0))
-     AddE<Precedes>()::From(from_id)::To(to_id)
-     RETURN "ok"
-   ```
-
-6. **Add an anchors edge**
-
-   ```hx
-   QUERY AddAnchors(step_id: ID, target_id: ID, impact: String) =>
-     AddE<Anchors>({ impact: impact })::From(step_id)::To(target_id)
-     RETURN "ok"
-   ```
-
-7. **Borrow‑ahead detector (report)**
-
-   ```hx
-   QUERY BorrowAhead(episode: String) =>
-     steps <- N<TeachingStep>()::WHERE(_::{episode}::EQ(episode))
-     uses <- steps::Out<Anchors>::WHERE(_::{impact}::EQ("use"))::To(N<Knowledge>())
-     intro <- N<TeachingStep>()::Out<Anchors>::WHERE(_::{impact}::EQ("introduce"))::To(uses)
-     missing <- uses::WHERE(_::intro::{count}::EQ(0))::WHERE(_::{introduction_scope}::EQ("in_course"))
-     RETURN missing::{ step: steps::{id,title}, knowledge: uses::{id,title} }
-   ```
-
-8. **Nodes missing examples by type**
+6. **missing_examples_report**
+   *Signature*: `fn missing_examples(g: &CurriculumGraph) -> Vec<NodeIndex>`  
+   Return knowledge nodes whose incoming `supports` lack required `support_kind`/`case_tag` variety per §6 table.
 
    ```hx
    QUERY MissingExamplesByType() =>
@@ -829,12 +743,12 @@ Guidance:
 
 ### B.9 Next steps
 
-1. **Finalize Helix schema** using the shapes above (either separate node types per knowledge kind or a single `Knowledge` type with `knowledge_type` attribute).
-2. **Codify enums** in Rust (`KnowledgeType`, `SupportKind`, `Strength`, `AssessmentScope`) and create typed helpers for each query.
-3. **Author validation queries** (reachability report, coverage audit, purity/construct-irrelevant scan, cycle detector) and schedule them as part of CI.
-4. **Backfill initial data** for the Design Recipe units to test the end-to-end flow: insert nodes, add edges, run topological sorts, inspect LO coverage.
+1. **Finalize the petgraph data model** using the shapes above (single `CurriculumGraph` with `EdgeKind` discriminants; optional separate LO node type vs. `knowledge_type="learning_outcome"`).
+2. **Codify enums** in Rust (`KnowledgeType`, `SupportKind`, `Strength`, `AssessmentScope`) and expose typed builders/validators for each edge kind.
+3. **Author validation routines** (reachability report, coverage audit, purity/construct-irrelevant scan, cycle detector) and run them in CI on every regenerated snapshot.
+4. **Backfill initial data** for the Design Recipe units to test end-to-end: insert nodes, add edges, run `toposort`/reachability, inspect LO coverage; serialize the snapshot with its commit hash.
 
-Once these steps are complete, the implementation will exactly reflect the white paper’s theoretical commitments while remaining practical for Helix‑DB and Rust tooling.
+Once these steps are complete, the implementation will reflect the white paper’s theoretical commitments while remaining practical for a Rust + petgraph stack.
 
 ## Appendix C: Discourse layer (MDC) schema
 

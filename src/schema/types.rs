@@ -1,9 +1,10 @@
 use std::{fmt, str::FromStr};
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Primary knowledge categories from the white paper ontology.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum KnowledgeType {
     Factual,
@@ -63,7 +64,7 @@ impl FromStr for KnowledgeType {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Strength {
     Necessary,
@@ -71,7 +72,7 @@ pub enum Strength {
     Helpful,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SupportKind {
     WorkedExample,
@@ -82,7 +83,7 @@ pub enum SupportKind {
     RubricNote,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum IntendedEffect {
     ReduceExtraneousLoad,
@@ -91,7 +92,7 @@ pub enum IntendedEffect {
     Contrast,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AssessmentScope {
     Target,
@@ -100,14 +101,12 @@ pub enum AssessmentScope {
 
 /// Reference to a source span inside the PreTeXt repository (path + line range
 /// + revision).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SourceRef {
     pub path:       String,
     pub start_line: u32,
     pub end_line:   u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(default)]
-    pub revision:   Option<String>,
+    pub revision:   String,
 }
 
 impl SourceRef {
@@ -115,19 +114,19 @@ impl SourceRef {
         path: impl Into<String>,
         start_line: u32,
         end_line: u32,
-        revision: Option<String>,
+        revision: impl Into<String>,
     ) -> Self {
         Self {
             path: path.into(),
             start_line,
             end_line,
-            revision,
+            revision: revision.into(),
         }
     }
 }
 
 /// Evidence Centered Design payload stored on `assesses` edges.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct EvidenceLink {
     pub claim:                String,
     #[serde(default)]

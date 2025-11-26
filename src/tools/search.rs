@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use grep_regex::RegexMatcher;
 use grep_searcher::{BinaryDetection, SearcherBuilder, sinks::Lossy};
 use walkdir::WalkDir;
@@ -31,7 +31,13 @@ pub async fn search_recursive(root: impl AsRef<Path>, pattern: &str) -> Result<V
 
         let mut results = Vec::new();
         for entry in WalkDir::new(&root) {
-            let entry = entry.with_context(|| format!("failed to traverse {}", root.display()))?;
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_err) => {
+                    // Skip unreadable entries instead of aborting the search.
+                    continue;
+                }
+            };
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -47,8 +53,9 @@ pub async fn search_recursive(root: impl AsRef<Path>, pattern: &str) -> Result<V
             match searcher.search_path(&matcher, &path, &mut sink) {
                 Ok(()) => {}
                 Err(err) if err.kind() == ErrorKind::InvalidData => continue,
-                Err(err) => {
-                    return Err(anyhow!("failed to search {}: {}", path.display(), err));
+                Err(_err) => {
+                    // Skip files that failed to search; continue with others.
+                    continue;
                 }
             }
         }

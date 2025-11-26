@@ -239,8 +239,8 @@ impl Message<FileReaderQuery> for FileReader {
                 conversation_id,
             };
 
-            let response = gateway.ask(request).await?;
-            Ok(response)
+            let reply = gateway.ask(request).await?;
+            Ok(reply)
         })
     }
 }

@@ -126,6 +126,15 @@ pub async fn read_file_range(
         );
     }
 
+    if end_line > total_lines {
+        bail!(
+            "requested end_line {} exceeds file line count {} for {}",
+            end_line,
+            total_lines,
+            path_buf.display()
+        );
+    }
+
     let count = end_line - start_line + 1;
     let lines: Vec<&str> = content.lines().skip(start_line - 1).take(count).collect();
 
