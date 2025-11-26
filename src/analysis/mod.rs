@@ -3,7 +3,6 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use petgraph::{
     Direction,
     algo::{is_cyclic_directed, toposort},
-    graph::DiGraph,
     visit::EdgeRef,
 };
 use schemars::JsonSchema;
@@ -18,22 +17,18 @@ use crate::{
 pub struct RequiresCycle;
 
 pub fn requires_toposort(g: &CurriculumGraph) -> Result<Vec<NodeId>, RequiresCycle> {
-    let (subgraph, map) = requires_only(g);
-    let order = toposort(&subgraph, None).map_err(|_| RequiresCycle)?;
-    let reversed: HashMap<usize, NodeId> = map
-        .into_iter()
-        .map(|(orig, idx)| (idx.index(), orig))
-        .collect();
-    Ok(order
-        .into_iter()
-        .map(|idx| reversed[&idx.index()])
-        .collect())
+    let view = petgraph::visit::EdgeFiltered::from_fn(g, |e| {
+        matches!(e.weight().kind, EdgeKind::Requires(_))
+    });
+    toposort(&view, None).map_err(|_| RequiresCycle)
 }
 
 /// True when the `requires` layer is acyclic.
 pub fn requires_is_dag(g: &CurriculumGraph) -> bool {
-    let (subgraph, _) = requires_only(g);
-    !is_cyclic_directed(&subgraph)
+    let view = petgraph::visit::EdgeFiltered::from_fn(g, |e| {
+        matches!(e.weight().kind, EdgeKind::Requires(_))
+    });
+    !is_cyclic_directed(&view)
 }
 
 /// Nodes with zero in-degree in the `requires` layer and instructional
@@ -162,21 +157,28 @@ pub struct KeystoneScore {
 }
 
 pub fn keystone_scores(g: &CurriculumGraph) -> Vec<KeystoneScore> {
-    let mut scores = Vec::new();
-    for n in g.node_indices().filter(|&n| {
-        matches!(
-            &g[n].kind,
-            NodeKind::Knowledge(k) if k.knowledge_type.is_instructional_knowledge()
-        )
-    }) {
-        let (in_reach, out_reach) = requires_reach_counts(g, n);
-        scores.push(KeystoneScore {
-            node: n,
-            score: in_reach * out_reach,
-            in_reach,
-            out_reach,
-        });
-    }
+    let (in_map, out_map) = requires_reach_counts_all(g);
+
+    let mut scores: Vec<_> = g
+        .node_indices()
+        .filter(|&n| {
+            matches!(
+                &g[n].kind,
+                NodeKind::Knowledge(k) if k.knowledge_type.is_instructional_knowledge()
+            )
+        })
+        .map(|n| {
+            let in_reach = *in_map.get(&n).unwrap_or(&0);
+            let out_reach = *out_map.get(&n).unwrap_or(&0);
+            KeystoneScore {
+                node: n,
+                score: in_reach * out_reach,
+                in_reach,
+                out_reach,
+            }
+        })
+        .collect();
+
     scores.sort_by(|a, b| b.score.cmp(&a.score));
     scores
 }
@@ -565,26 +567,6 @@ pub fn discourse_orphans(g: &CurriculumGraph, episode: Option<&str>) -> Vec<Node
 
 // ---------- helpers ----------
 
-fn requires_only(
-    g: &CurriculumGraph,
-) -> (DiGraph<(), ()>, HashMap<NodeId, petgraph::graph::NodeIndex>) {
-    let mut sub = DiGraph::<(), ()>::with_capacity(g.node_count(), g.edge_count());
-    let mut map = HashMap::new();
-    for n in g.node_indices() {
-        let idx = sub.add_node(());
-        map.insert(n, idx);
-    }
-    for e in g.edge_indices() {
-        if matches!(g[e].kind, EdgeKind::Requires(_)) {
-            let (u, v) = g.edge_endpoints(e).expect("valid endpoints");
-            let u2 = map[&u];
-            let v2 = map[&v];
-            sub.add_edge(u2, v2, ());
-        }
-    }
-    (sub, map)
-}
-
 fn requires_ancestors(g: &CurriculumGraph, start: NodeId) -> HashSet<NodeId> {
     let mut seen = HashSet::new();
     let mut queue = VecDeque::new();
@@ -602,38 +584,70 @@ fn requires_ancestors(g: &CurriculumGraph, start: NodeId) -> HashSet<NodeId> {
     seen
 }
 
-fn requires_reach_counts(g: &CurriculumGraph, start: NodeId) -> (usize, usize) {
-    let mut in_seen = HashSet::new();
-    let mut out_seen = HashSet::new();
-    {
-        let mut queue = VecDeque::new();
-        queue.push_back(start);
-        while let Some(node) = queue.pop_front() {
-            for edge in g.edges_directed(node, Direction::Incoming) {
-                if matches!(edge.weight().kind, EdgeKind::Requires(_)) {
-                    let pred = edge.source();
-                    if in_seen.insert(pred) {
-                        queue.push_back(pred);
-                    }
+/// Compute in- and out-reach counts for every node in the requires layer using
+/// a single topological pass (no per-node BFS). Assumes requires is a DAG; if a
+/// cycle exists, falls back to empty maps.
+fn requires_reach_counts_all(
+    g: &CurriculumGraph,
+) -> (HashMap<NodeId, usize>, HashMap<NodeId, usize>) {
+    // Try toposort over requires edges; fall back if cyclic.
+    let topo = requires_toposort(g).ok();
+    let Some(order) = topo else {
+        return (HashMap::new(), HashMap::new());
+    };
+
+    // Build predecessor and successor adjacency over requires edges.
+    let mut succ: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    let mut pred: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    for edge in g.edge_indices() {
+        if let EdgeKind::Requires(_) = g[edge].kind
+            && let Some((u, v)) = g.edge_endpoints(edge)
+        {
+            succ.entry(u).or_default().push(v);
+            pred.entry(v).or_default().push(u);
+        }
+    }
+
+    // out_reach: process reverse topological order.
+    let mut out_sets: HashMap<NodeId, HashSet<NodeId>> = HashMap::new();
+    for &n in order.iter().rev() {
+        let mut set = HashSet::new();
+        if let Some(children) = succ.get(&n) {
+            for &c in children {
+                set.insert(c);
+                if let Some(child_set) = out_sets.get(&c) {
+                    set.extend(child_set.iter().copied());
                 }
             }
         }
+        out_sets.insert(n, set);
     }
-    {
-        let mut queue = VecDeque::new();
-        queue.push_back(start);
-        while let Some(node) = queue.pop_front() {
-            for edge in g.edges_directed(node, Direction::Outgoing) {
-                if matches!(edge.weight().kind, EdgeKind::Requires(_)) {
-                    let succ = edge.target();
-                    if out_seen.insert(succ) {
-                        queue.push_back(succ);
-                    }
+
+    // in_reach: process forward topological order.
+    let mut in_sets: HashMap<NodeId, HashSet<NodeId>> = HashMap::new();
+    for &n in &order {
+        let mut set = HashSet::new();
+        if let Some(parents) = pred.get(&n) {
+            for &p in parents {
+                set.insert(p);
+                if let Some(parent_set) = in_sets.get(&p) {
+                    set.extend(parent_set.iter().copied());
                 }
             }
         }
+        in_sets.insert(n, set);
     }
-    (in_seen.len(), out_seen.len())
+
+    let in_counts = in_sets
+        .into_iter()
+        .map(|(k, v)| (k, v.len()))
+        .collect::<HashMap<_, _>>();
+    let out_counts = out_sets
+        .into_iter()
+        .map(|(k, v)| (k, v.len()))
+        .collect::<HashMap<_, _>>();
+
+    (in_counts, out_counts)
 }
 
 fn has_requires_path(g: &CurriculumGraph, from: NodeId, to: NodeId) -> bool {

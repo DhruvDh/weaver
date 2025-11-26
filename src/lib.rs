@@ -5,3 +5,4 @@ pub mod graph;
 pub mod llm_gateway;
 pub mod schema;
 pub mod tools;
+pub use graph::{manager, manager::Neighbor};

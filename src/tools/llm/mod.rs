@@ -21,10 +21,12 @@ use self::{
     read_file_full::read_file_full_meta, read_file_range::read_file_range_meta,
     search_text::search_text_meta,
 };
-use crate::llm_gateway::{GatewayMetrics, LLMGateway};
+use crate::{
+    graph::manager::GraphManager,
+    llm_gateway::{GatewayMetrics, LLMGateway},
+};
 
 mod delegate_tasks;
-mod graph_neighbors;
 mod graph_tools;
 mod list_directory;
 mod read_file_full;
@@ -246,6 +248,7 @@ pub struct CallState {
     pub gateway:            ActorRef<LLMGateway>,
     pub model:              Arc<String>,
     pub metrics:            Arc<GatewayMetrics>,
+    pub graph:              ActorRef<GraphManager>,
     pub actor_name:         Arc<String>,
     pub conversation_id:    Arc<String>,
 }

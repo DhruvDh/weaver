@@ -83,6 +83,7 @@ fn parse_delegate_tasks(raw: Value, state: &CallState) -> ToolInputResult<Box<dy
         gateway: state.gateway.clone(),
         model: Arc::clone(&state.model),
         metrics: Arc::clone(&state.metrics),
+        graph: state.graph.clone(),
     }))
 }
 
@@ -94,6 +95,7 @@ struct DelegateTasksTool {
     gateway:            ActorRef<LLMGateway>,
     model:              Arc<String>,
     metrics:            Arc<GatewayMetrics>,
+    graph:              ActorRef<crate::graph::manager::GraphManager>,
 }
 
 #[async_trait]
@@ -107,16 +109,17 @@ impl ToolInstance for DelegateTasksTool {
             MAX_PARALLEL_DELEGATIONS
         );
 
-        let result = run_delegate_batch_with_state(
-            self.gateway.clone(),
-            Arc::clone(&self.model),
-            Arc::clone(&self.workspace_root),
-            Arc::clone(&self.metrics),
-            self.depth,
-            self.max_subdelegations,
-            self.args.tasks.clone(),
-        )
-        .await?;
+        let ctx = crate::file_reader::DelegateBatchCtx {
+            gateway:            self.gateway.clone(),
+            model:              Arc::clone(&self.model),
+            workspace_root:     Arc::clone(&self.workspace_root),
+            metrics:            Arc::clone(&self.metrics),
+            graph:              self.graph.clone(),
+            depth:              self.depth,
+            max_subdelegations: self.max_subdelegations,
+        };
+
+        let result = run_delegate_batch_with_state(ctx, self.args.tasks.clone()).await?;
 
         Ok(ToolOutput::new(result))
     }

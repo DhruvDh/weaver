@@ -49,6 +49,7 @@ pub struct FileReader {
     model:              Arc<String>,
     root:               Arc<PathBuf>,
     metrics:            Arc<GatewayMetrics>,
+    graph:              ActorRef<crate::graph::manager::GraphManager>,
     depth:              usize,
     max_subdelegations: usize,
     actor_name:         Arc<String>,
@@ -61,8 +62,9 @@ impl FileReader {
         root: impl AsRef<Path>,
         gateway: ActorRef<LLMGateway>,
         metrics: Arc<GatewayMetrics>,
+        graph: ActorRef<crate::graph::manager::GraphManager>,
     ) -> Result<Self> {
-        Self::from_env_with_limit(root, gateway, metrics, DEFAULT_MAX_SUBDELEGATIONS)
+        Self::from_env_with_limit(root, gateway, metrics, graph, DEFAULT_MAX_SUBDELEGATIONS)
     }
 
     /// Build a new [`FileReader`] with a custom delegation limit.
@@ -70,6 +72,7 @@ impl FileReader {
         root: impl AsRef<Path>,
         gateway: ActorRef<LLMGateway>,
         metrics: Arc<GatewayMetrics>,
+        graph: ActorRef<crate::graph::manager::GraphManager>,
         max_subdelegations: usize,
     ) -> Result<Self> {
         let model = Arc::new(
@@ -82,7 +85,7 @@ impl FileReader {
                 format!("failed to canonicalize root {}", root.as_ref().display())
             })?);
 
-        Ok(Self::new(gateway, model, root, metrics, 0, max_subdelegations))
+        Ok(Self::new(gateway, model, root, metrics, graph, 0, max_subdelegations))
     }
 
     fn new(
@@ -90,6 +93,7 @@ impl FileReader {
         model: Arc<String>,
         root: Arc<PathBuf>,
         metrics: Arc<GatewayMetrics>,
+        graph: ActorRef<crate::graph::manager::GraphManager>,
         depth: usize,
         max_subdelegations: usize,
     ) -> Self {
@@ -105,6 +109,7 @@ impl FileReader {
             model,
             root,
             metrics,
+            graph,
             depth,
             max_subdelegations,
             actor_name: Arc::new(actor_name),
@@ -125,19 +130,26 @@ impl FileReader {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+#[derive(Clone)]
+pub(crate) struct DelegateBatchCtx {
+    pub gateway:            ActorRef<LLMGateway>,
+    pub model:              Arc<String>,
+    pub workspace_root:     Arc<PathBuf>,
+    pub metrics:            Arc<GatewayMetrics>,
+    pub graph:              ActorRef<crate::graph::manager::GraphManager>,
+    pub depth:              usize,
+    pub max_subdelegations: usize,
+}
+
 pub(crate) async fn run_delegate_batch_with_state(
-    gateway: ActorRef<LLMGateway>,
-    model: Arc<String>,
-    workspace_root: Arc<PathBuf>,
-    metrics: Arc<GatewayMetrics>,
-    depth: usize,
-    max_subdelegations: usize,
+    ctx: DelegateBatchCtx,
     tasks: Vec<String>,
 ) -> Result<Value> {
     if tasks.is_empty() {
         return Ok(json!({
             "type": "delegation_batch_result",
-            "depth": depth + 1,
+            "depth": ctx.depth + 1,
             "requested": 0,
             "max_concurrency": 0,
             "results": [],
@@ -149,16 +161,20 @@ pub(crate) async fn run_delegate_batch_with_state(
 
     let results = stream::iter(tasks.into_iter())
         .map(|task| {
-            let gateway = gateway.clone();
-            let model = Arc::clone(&model);
-            let root = Arc::clone(&workspace_root);
-            let metrics = Arc::clone(&metrics);
+            let gateway = ctx.gateway.clone();
+            let model = Arc::clone(&ctx.model);
+            let root = Arc::clone(&ctx.workspace_root);
+            let metrics = Arc::clone(&ctx.metrics);
+            let graph = ctx.graph.clone();
+            let depth = ctx.depth;
+            let max_subdelegations = ctx.max_subdelegations;
             async move {
                 let child = FileReader::new(
                     gateway.clone(),
                     model,
                     root,
                     metrics,
+                    graph,
                     depth + 1,
                     max_subdelegations,
                 );
@@ -188,7 +204,7 @@ pub(crate) async fn run_delegate_batch_with_state(
 
     Ok(json!({
         "type": "delegation_batch_result",
-        "depth": depth + 1,
+        "depth": ctx.depth + 1,
         "requested": total,
         "max_concurrency": limit,
         "results": results,
@@ -268,6 +284,7 @@ impl Message<ExecuteTool> for FileReader {
             gateway:            self.gateway.clone(),
             model:              Arc::clone(&self.model),
             metrics:            Arc::clone(&self.metrics),
+            graph:              self.graph.clone(),
             actor_name:         Arc::clone(&self.actor_name),
             conversation_id:    Arc::clone(&self.conversation_id),
         };

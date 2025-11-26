@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{env, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Result, anyhow};
 use bpaf::{OptionParser, Parser, construct, positional};
@@ -8,6 +8,10 @@ use tracing_subscriber::EnvFilter;
 use weaver::{
     constants::PRETEXT_SUBDIR,
     file_reader::{FileReader, FileReaderQuery},
+    graph::{
+        GraphConfig, GraphService,
+        manager::{GraphManager, SaveSnapshot},
+    },
     llm_gateway::LLMGateway,
 };
 
@@ -36,11 +40,47 @@ async fn main() -> Result<()> {
 
     debug!("FileReader demo starting");
 
+    let course_commit = env::var("GRAPH_COURSE_COMMIT").unwrap_or_default();
+    let autosave_path =
+        env::var("GRAPH_SNAPSHOT_PATH").unwrap_or_else(|_| "graph_snapshot.json".to_string());
+    let autosave_secs = env::var("GRAPH_AUTOSAVE_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(300);
+    let graph_config = GraphConfig {
+        course_commit: course_commit.clone(),
+        autosave_path: autosave_path.clone().into(),
+        autosave_secs,
+    };
+
     let gateway_instance = LLMGateway::from_env()?;
     let metrics = gateway_instance.metrics();
     let gateway = LLMGateway::spawn(gateway_instance);
+    let graph_actor = GraphManager::spawn(GraphManager::new(GraphService::new(), course_commit));
 
-    let actor = match FileReader::from_env(workspace, gateway.clone(), Arc::clone(&metrics)) {
+    // Autosave the graph periodically to avoid data loss.
+    let graph_actor_for_save = graph_actor.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(graph_config.autosave_secs));
+        let path = graph_config.autosave_path.clone();
+        loop {
+            interval.tick().await;
+            match graph_actor_for_save
+                .ask(SaveSnapshot { path: path.clone() })
+                .await
+            {
+                Ok(()) => debug!("graph autosave completed"),
+                Err(send_err) => error!(error = ?send_err, "graph autosave failed"),
+            }
+        }
+    });
+
+    let actor = match FileReader::from_env(
+        workspace,
+        gateway.clone(),
+        Arc::clone(&metrics),
+        graph_actor.clone(),
+    ) {
         Ok(actor) => actor,
         Err(err) => {
             error!(

@@ -5,7 +5,10 @@ use std::{
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use tokio::fs;
+use tokio::{
+    fs::{self, File},
+    io::AsyncWriteExt,
+};
 
 use crate::graph::CurriculumGraph;
 
@@ -20,7 +23,7 @@ pub struct GraphSnapshot {
 }
 
 impl GraphSnapshot {
-    pub fn new(graph: CurriculumGraph) -> Self {
+    pub fn new(graph: CurriculumGraph, course_commit: String) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -28,19 +31,44 @@ impl GraphSnapshot {
         Self {
             version: SNAPSHOT_VERSION,
             saved_at_sec: now,
-            course_commit: std::env::var("GRAPH_COURSE_COMMIT").unwrap_or_default(),
+            course_commit,
             graph,
         }
     }
 }
 
 /// Serialize the graph to disk (JSON).
-pub async fn save_graph(graph: &CurriculumGraph, path: impl AsRef<Path>) -> anyhow::Result<()> {
-    let snapshot = GraphSnapshot::new(graph.clone());
+pub async fn save_graph(
+    graph: &CurriculumGraph,
+    path: impl AsRef<Path>,
+    course_commit: &str,
+) -> anyhow::Result<()> {
+    let snapshot = GraphSnapshot::new(graph.clone(), course_commit.to_string());
     let data = serde_json::to_vec_pretty(&snapshot).context("serialize graph snapshot")?;
-    fs::write(path.as_ref(), data)
+    let path = path.as_ref();
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("create snapshot directory {}", parent.display()))?;
+    }
+
+    let tmp_path = path.with_extension("tmp");
+    {
+        let mut file = File::create(&tmp_path)
+            .await
+            .with_context(|| format!("create temp snapshot {}", tmp_path.display()))?;
+        file.write_all(&data)
+            .await
+            .with_context(|| format!("write temp snapshot {}", tmp_path.display()))?;
+        file.sync_all()
+            .await
+            .with_context(|| format!("fsync temp snapshot {}", tmp_path.display()))?;
+    }
+    fs::rename(&tmp_path, path)
         .await
-        .with_context(|| format!("write snapshot to {}", path.as_ref().display()))
+        .with_context(|| format!("rename temp snapshot to {}", path.display()))
 }
 
 /// Load a snapshot from disk and reconstruct GraphService.

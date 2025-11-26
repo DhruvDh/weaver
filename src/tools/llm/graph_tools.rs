@@ -1,21 +1,25 @@
-use std::{env, sync::Arc, time::Duration};
+use std::{env, path::PathBuf};
 
+use anyhow::anyhow;
 use async_trait::async_trait;
 use bon::Builder;
-use once_cell::sync::Lazy;
-use parking_lot::RwLock;
+use kameo::{error::SendError, prelude::ActorRef};
 use petgraph::visit::EdgeRef;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::time;
-use tracing::warn;
 
 use crate::{
-    analysis,
+    analysis::{self},
     graph::{
-        AnchorImpact, AssessesAttrs, CaseTag, GraphError, GraphService, IntroductionScope,
-        KnowledgeNode, NodeKind, RequiresAttrs, SupportsAttrs, TeachingPurpose, TeachingStepNode,
+        AnchorImpact, AssessesAttrs, CaseTag, CurriculumGraph, GraphError, IntroductionScope,
+        KnowledgeNode, NodeId, NodeKind, RequiresAttrs, SupportsAttrs, TeachingPurpose,
+        TeachingStepNode,
+        manager::{
+            AddAnchors, AddAssesses, AddPrecedes, AddRequires, AddSupports, GetGraph, GetNode,
+            InsertKnowledge, InsertTeachingStep, LoadSnapshot, SaveSnapshot, UpdateKnowledge,
+            UpdateTeachingStep,
+        },
     },
     schema::types::{
         AssessmentScope, EvidenceLink, IntendedEffect, KnowledgeType, SourceRef, Strength,
@@ -23,16 +27,9 @@ use crate::{
     },
     tools::llm::{
         CallState, ToolExecutionError, ToolInputError, ToolInputResult, ToolInstance, ToolOutput,
-        ToolPrototype, graph_neighbors::neighbors_meta, schema_for_args,
+        ToolPrototype, schema_for_args,
     },
 };
-
-/// Shared in-memory graph for tool calls in this process.
-pub(crate) static GRAPH: Lazy<Arc<RwLock<GraphService>>> = Lazy::new(|| {
-    let svc = Arc::new(RwLock::new(GraphService::new()));
-    start_autosave(Arc::clone(&svc));
-    svc
-});
 
 // ---------- Helpers ----------
 
@@ -52,28 +49,107 @@ pub(crate) fn map_graph_err(err: GraphError, tool: &'static str) -> ToolExecutio
     }
 }
 
-fn start_autosave(service: Arc<RwLock<GraphService>>) {
-    // Requires a Tokio runtime; if unavailable, skip autosave.
-    if tokio::runtime::Handle::try_current().is_err() {
-        warn!("graph autosave not started: no Tokio runtime");
-        return;
+fn find_node_by_slug(graph: &CurriculumGraph, slug: &str) -> Option<NodeId> {
+    graph.node_indices().find(|&n| graph[n].slug == slug)
+}
+
+fn map_send_err<M>(err: SendError<M, GraphError>, tool: &'static str) -> ToolExecutionError {
+    match err {
+        SendError::HandlerError(e) => map_graph_err(e, tool),
+        other => ToolExecutionError::Internal(anyhow!("{:?}", other)),
     }
-    let path =
-        env::var("GRAPH_SNAPSHOT_PATH").unwrap_or_else(|_| "graph_snapshot.json".to_string());
-    let interval_secs = env::var("GRAPH_AUTOSAVE_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(300u64);
-    tokio::spawn(async move {
-        let mut ticker = time::interval(Duration::from_secs(interval_secs));
-        loop {
-            ticker.tick().await;
-            let graph_clone = { service.read().snapshot_graph() };
-            if let Err(err) = crate::graph::persist::save_graph(&graph_clone, &path).await {
-                warn!(error = ?err, "graph autosave failed");
-            }
+}
+
+fn map_send_err_inf<M>(err: SendError<M, std::convert::Infallible>) -> ToolExecutionError {
+    ToolExecutionError::Internal(anyhow!("{:?}", err))
+}
+
+fn map_send_err_anyhow<M>(err: SendError<M, anyhow::Error>) -> ToolExecutionError {
+    match err {
+        SendError::HandlerError(e) => ToolExecutionError::Internal(e),
+        other => ToolExecutionError::Internal(anyhow!("{:?}", other)),
+    }
+}
+
+/// Generic, minimal boilerplate tool wrapper for simple graph commands that are
+/// just an actor message + a JSON success payload.
+type MsgReply<Msg> = <crate::graph::manager::GraphManager as kameo::message::Message<Msg>>::Reply;
+
+struct GraphCommandTool<Args, Msg>
+where
+    Msg: Send + 'static,
+    crate::graph::manager::GraphManager: kameo::message::Message<Msg>,
+{
+    args:    Args,
+    graph:   ActorRef<crate::graph::manager::GraphManager>,
+    build:   fn(&Args) -> Msg,
+    map_ok:  fn(&Args, <MsgReply<Msg> as kameo::Reply>::Ok) -> Value,
+    map_err: fn(SendError<Msg, <MsgReply<Msg> as kameo::Reply>::Error>) -> ToolExecutionError,
+}
+
+impl<Args, Msg> GraphCommandTool<Args, Msg>
+where
+    Msg: Send + 'static,
+    crate::graph::manager::GraphManager: kameo::message::Message<Msg>,
+{
+    fn new(
+        args: Args,
+        graph: ActorRef<crate::graph::manager::GraphManager>,
+        build: fn(&Args) -> Msg,
+        map_ok: fn(&Args, <MsgReply<Msg> as kameo::Reply>::Ok) -> Value,
+        map_err: fn(SendError<Msg, <MsgReply<Msg> as kameo::Reply>::Error>) -> ToolExecutionError,
+    ) -> Self {
+        Self {
+            args,
+            graph,
+            build,
+            map_ok,
+            map_err,
         }
-    });
+    }
+}
+
+#[async_trait]
+impl<Args, Msg> ToolInstance for GraphCommandTool<Args, Msg>
+where
+    Args: Send + Sync + 'static,
+    Msg: Send + 'static,
+    crate::graph::manager::GraphManager: kameo::message::Message<Msg>,
+{
+    async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
+        let msg = (self.build)(&self.args);
+        let reply: <MsgReply<Msg> as kameo::Reply>::Ok =
+            self.graph.ask(msg).await.map_err(|e| (self.map_err)(e))?;
+
+        Ok(ToolOutput::new((self.map_ok)(&self.args, reply)))
+    }
+}
+
+fn parse_graph_command<Args, Msg>(
+    tool: &'static str,
+    raw: Value,
+    state: &CallState,
+    build: fn(&Args) -> Msg,
+    map_ok: fn(&Args, <MsgReply<Msg> as kameo::Reply>::Ok) -> Value,
+    map_err: fn(SendError<Msg, <MsgReply<Msg> as kameo::Reply>::Error>) -> ToolExecutionError,
+) -> ToolInputResult<Box<dyn ToolInstance>>
+where
+    Args: for<'de> Deserialize<'de> + JsonSchema + Clone + Send + Sync + 'static,
+    Msg: Send + 'static,
+    crate::graph::manager::GraphManager: kameo::message::Message<Msg>,
+{
+    let args: Args = serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
+        tool,
+        message: err.to_string(),
+    })?;
+
+    Ok(Box::new(GraphCommandTool::new(
+        args,
+        state.graph.clone(),
+        build,
+        map_ok,
+        map_err,
+    )))
 }
 
 // ---------- Insert knowledge node ----------
@@ -114,54 +190,85 @@ pub(super) fn insert_knowledge_meta() -> ToolPrototype {
     }
 }
 
-fn parse_insert_knowledge(
-    raw: Value,
-    _state: &CallState,
-) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let args: InsertKnowledgeArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    INSERT_KNOWLEDGE,
-            message: err.to_string(),
-        })?;
-    Ok(Box::new(InsertKnowledgeTool { args }))
-}
-
-struct InsertKnowledgeTool {
-    args: InsertKnowledgeArgs,
-}
-
-#[async_trait]
-impl ToolInstance for InsertKnowledgeTool {
-    async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let mut graph = GRAPH.write();
-        let payload = KnowledgeNode {
-            title: self.args.title.clone(),
-            statement: self.args.statement.clone(),
-            knowledge_type: self.args.knowledge_type,
-            source_refs: self.args.source_refs.clone(),
-            confidence: self.args.confidence,
-            rubric_criteria: self.args.rubric_criteria.clone(),
-            construct_irrelevant_demands: self.args.construct_irrelevant_demands.clone(),
-            grain_level: self.args.grain_level,
-            intrinsic_load: self.args.intrinsic_load,
-            introduction_scope: self
-                .args
-                .introduction_scope
-                .unwrap_or(IntroductionScope::InCourse),
-        };
-        let id = graph
-            .add_knowledge_node(self.args.slug.clone(), payload, self.args.tags.clone())
-            .map_err(|e| map_graph_err(e, INSERT_KNOWLEDGE))?;
-        Ok(ToolOutput::new(json!({
-            "status": "ok",
-            "node_id": id.index(),
-        })))
+pub(super) fn update_knowledge_meta() -> ToolPrototype {
+    ToolPrototype {
+        id:          UPDATE_KNOWLEDGE,
+        description: "Update a knowledge/LO/assessment node (revalidates incident edges).",
+        schema:      schema_for_args::<InsertKnowledgeArgs>(),
+        parse:       parse_update_knowledge,
     }
+}
+
+fn build_insert_knowledge(args: &InsertKnowledgeArgs) -> InsertKnowledge {
+    let payload = KnowledgeNode {
+        title: args.title.clone(),
+        statement: args.statement.clone(),
+        knowledge_type: args.knowledge_type,
+        source_refs: args.source_refs.clone(),
+        confidence: args.confidence,
+        rubric_criteria: args.rubric_criteria.clone(),
+        construct_irrelevant_demands: args.construct_irrelevant_demands.clone(),
+        grain_level: args.grain_level,
+        intrinsic_load: args.intrinsic_load,
+        introduction_scope: args
+            .introduction_scope
+            .unwrap_or(IntroductionScope::InCourse),
+    };
+    InsertKnowledge {
+        slug: args.slug.clone(),
+        payload,
+        tags: args.tags.clone(),
+    }
+}
+
+fn ok_node_id(_: &InsertKnowledgeArgs, id: NodeId) -> Value {
+    json!({"status": "ok", "node_id": id.index()})
+}
+
+fn parse_insert_knowledge(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
+    parse_graph_command::<InsertKnowledgeArgs, InsertKnowledge>(
+        INSERT_KNOWLEDGE,
+        raw,
+        state,
+        build_insert_knowledge,
+        ok_node_id,
+        |e| map_send_err(e, INSERT_KNOWLEDGE),
+    )
+}
+
+fn parse_update_knowledge(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
+    parse_graph_command::<InsertKnowledgeArgs, UpdateKnowledge>(
+        UPDATE_KNOWLEDGE,
+        raw,
+        state,
+        |args| UpdateKnowledge {
+            slug:    args.slug.clone(),
+            payload: KnowledgeNode {
+                title: args.title.clone(),
+                statement: args.statement.clone(),
+                knowledge_type: args.knowledge_type,
+                source_refs: args.source_refs.clone(),
+                confidence: args.confidence,
+                rubric_criteria: args.rubric_criteria.clone(),
+                construct_irrelevant_demands: args.construct_irrelevant_demands.clone(),
+                grain_level: args.grain_level,
+                intrinsic_load: args.intrinsic_load,
+                introduction_scope: args
+                    .introduction_scope
+                    .unwrap_or(IntroductionScope::InCourse),
+            },
+            tags:    args.tags.clone(),
+        },
+        ok_node_id,
+        |e| map_send_err(e, UPDATE_KNOWLEDGE),
+    )
 }
 
 // ---------- Insert teaching step ----------
 
 const INSERT_TEACHING: &str = "graph_insert_teaching_step";
+const UPDATE_KNOWLEDGE: &str = "graph_update_knowledge";
+const UPDATE_TEACHING: &str = "graph_update_teaching_step";
 
 #[derive(Debug, Clone, Builder, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -188,36 +295,62 @@ pub(super) fn insert_teaching_meta() -> ToolPrototype {
     }
 }
 
-fn parse_insert_teaching(raw: Value, _state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let args: InsertTeachingArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    INSERT_TEACHING,
-            message: err.to_string(),
-        })?;
-    Ok(Box::new(InsertTeachingTool { args }))
-}
-
-struct InsertTeachingTool {
-    args: InsertTeachingArgs,
-}
-
-#[async_trait]
-impl ToolInstance for InsertTeachingTool {
-    async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let mut graph = GRAPH.write();
-        let payload = TeachingStepNode {
-            title:       self.args.title.clone(),
-            statement:   self.args.statement.clone(),
-            purpose:     self.args.purpose,
-            method_tags: self.args.method_tags.clone(),
-            episode:     self.args.episode.clone(),
-            source_refs: self.args.source_refs.clone(),
-        };
-        let id = graph
-            .add_teaching_step(self.args.slug.clone(), payload, self.args.tags.clone())
-            .map_err(|e| map_graph_err(e, INSERT_TEACHING))?;
-        Ok(ToolOutput::new(json!({"status": "ok", "node_id": id.index()})))
+pub(super) fn update_teaching_meta() -> ToolPrototype {
+    ToolPrototype {
+        id:          UPDATE_TEACHING,
+        description: "Update a TeachingStep node (revalidates incident edges).",
+        schema:      schema_for_args::<InsertTeachingArgs>(),
+        parse:       parse_update_teaching,
     }
+}
+
+fn build_insert_teaching(args: &InsertTeachingArgs) -> InsertTeachingStep {
+    let payload = TeachingStepNode {
+        title:       args.title.clone(),
+        statement:   args.statement.clone(),
+        purpose:     args.purpose,
+        method_tags: args.method_tags.clone(),
+        episode:     args.episode.clone(),
+        source_refs: args.source_refs.clone(),
+    };
+    InsertTeachingStep {
+        slug: args.slug.clone(),
+        payload,
+        tags: args.tags.clone(),
+    }
+}
+
+fn parse_insert_teaching(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
+    parse_graph_command::<InsertTeachingArgs, InsertTeachingStep>(
+        INSERT_TEACHING,
+        raw,
+        state,
+        build_insert_teaching,
+        |_, id| json!({"status": "ok", "node_id": id.index()}),
+        |e| map_send_err(e, INSERT_TEACHING),
+    )
+}
+
+fn parse_update_teaching(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
+    parse_graph_command::<InsertTeachingArgs, UpdateTeachingStep>(
+        UPDATE_TEACHING,
+        raw,
+        state,
+        |args| UpdateTeachingStep {
+            slug:    args.slug.clone(),
+            payload: TeachingStepNode {
+                title:       args.title.clone(),
+                statement:   args.statement.clone(),
+                purpose:     args.purpose,
+                method_tags: args.method_tags.clone(),
+                episode:     args.episode.clone(),
+                source_refs: args.source_refs.clone(),
+            },
+            tags:    args.tags.clone(),
+        },
+        |_, id| json!({ "status": "ok", "node_id": id.index() }),
+        |e| map_send_err(e, UPDATE_TEACHING),
+    )
 }
 
 // ---------- add requires ----------
@@ -250,43 +383,28 @@ pub(super) fn add_requires_meta() -> ToolPrototype {
     }
 }
 
-fn parse_add_requires(raw: Value, _state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let args: AddRequiresArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    ADD_REQUIRES,
-            message: err.to_string(),
-        })?;
-    Ok(Box::new(AddRequiresTool { args }))
-}
-
-struct AddRequiresTool {
-    args: AddRequiresArgs,
-}
-
-#[async_trait]
-impl ToolInstance for AddRequiresTool {
-    async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let mut graph = GRAPH.write();
-        let from = graph
-            .node_by_slug(&self.args.from_slug)
-            .map_err(|e| map_graph_err(e, ADD_REQUIRES))?;
-        let to = graph
-            .node_by_slug(&self.args.to_slug)
-            .map_err(|e| map_graph_err(e, ADD_REQUIRES))?;
-        graph
-            .add_requires_edge(
-                from,
-                to,
-                RequiresAttrs {
-                    strength:      self.args.strength,
-                    rationale:     self.args.rationale.clone(),
-                    evidence_refs: self.args.evidence_refs.clone(),
-                },
-                self.args.confidence,
-            )
-            .map_err(|e| map_graph_err(e, ADD_REQUIRES))?;
-        Ok(ToolOutput::new(json!({"status": "ok"})))
+fn build_add_requires(args: &AddRequiresArgs) -> AddRequires {
+    AddRequires {
+        from:       args.from_slug.clone(),
+        to:         args.to_slug.clone(),
+        attrs:      RequiresAttrs {
+            strength:      args.strength,
+            rationale:     args.rationale.clone(),
+            evidence_refs: args.evidence_refs.clone(),
+        },
+        confidence: args.confidence,
     }
+}
+
+fn parse_add_requires(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
+    parse_graph_command::<AddRequiresArgs, AddRequires>(
+        ADD_REQUIRES,
+        raw,
+        state,
+        build_add_requires,
+        |_, _| json!({"status": "ok"}),
+        |e| map_send_err(e, ADD_REQUIRES),
+    )
 }
 
 // ---------- add supports ----------
@@ -319,45 +437,30 @@ pub(super) fn add_supports_meta() -> ToolPrototype {
     }
 }
 
-fn parse_add_supports(raw: Value, _state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let args: AddSupportsArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    ADD_SUPPORTS,
-            message: err.to_string(),
-        })?;
-    Ok(Box::new(AddSupportsTool { args }))
-}
-
-struct AddSupportsTool {
-    args: AddSupportsArgs,
-}
-
-#[async_trait]
-impl ToolInstance for AddSupportsTool {
-    async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let mut graph = GRAPH.write();
-        let from = graph
-            .node_by_slug(&self.args.from_slug)
-            .map_err(|e| map_graph_err(e, ADD_SUPPORTS))?;
-        let to = graph
-            .node_by_slug(&self.args.to_slug)
-            .map_err(|e| map_graph_err(e, ADD_SUPPORTS))?;
-        graph
-            .add_supports_edge(
-                from,
-                to,
-                SupportsAttrs {
-                    support_kind:    self.args.support_kind,
-                    intended_effect: self.args.intended_effect,
-                    case_tag:        self.args.case_tag,
-                    coverage_tags:   self.args.coverage_tags.clone(),
-                    evidence_refs:   self.args.evidence_refs.clone(),
-                },
-                self.args.confidence,
-            )
-            .map_err(|e| map_graph_err(e, ADD_SUPPORTS))?;
-        Ok(ToolOutput::new(json!({"status": "ok"})))
+fn build_add_supports(args: &AddSupportsArgs) -> AddSupports {
+    AddSupports {
+        from:       args.from_slug.clone(),
+        to:         args.to_slug.clone(),
+        attrs:      SupportsAttrs {
+            support_kind:    args.support_kind,
+            intended_effect: args.intended_effect,
+            case_tag:        args.case_tag,
+            coverage_tags:   args.coverage_tags.clone(),
+            evidence_refs:   args.evidence_refs.clone(),
+        },
+        confidence: args.confidence,
     }
+}
+
+fn parse_add_supports(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
+    parse_graph_command::<AddSupportsArgs, AddSupports>(
+        ADD_SUPPORTS,
+        raw,
+        state,
+        build_add_supports,
+        |_, _| json!({"status": "ok"}),
+        |e| map_send_err(e, ADD_SUPPORTS),
+    )
 }
 
 // ---------- add assesses ----------
@@ -386,45 +489,30 @@ pub(super) fn add_assesses_meta() -> ToolPrototype {
     }
 }
 
-fn parse_add_assesses(raw: Value, _state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let args: AddAssessesArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    ADD_ASSESSES,
-            message: err.to_string(),
-        })?;
-    Ok(Box::new(AddAssessesTool { args }))
-}
-
-struct AddAssessesTool {
-    args: AddAssessesArgs,
-}
-
-#[async_trait]
-impl ToolInstance for AddAssessesTool {
-    async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let mut graph = GRAPH.write();
-        let from = graph
-            .node_by_slug(&self.args.from_slug)
-            .map_err(|e| map_graph_err(e, ADD_ASSESSES))?;
-        let to = graph
-            .node_by_slug(&self.args.to_slug)
-            .map_err(|e| map_graph_err(e, ADD_ASSESSES))?;
-        graph
-            .add_assesses_edge(
-                from,
-                to,
-                AssessesAttrs {
-                    evidence_link: EvidenceLink {
-                        claim:                self.args.claim.clone(),
-                        observation_features: self.args.observation_features.clone(),
-                        scope:                self.args.scope,
-                    },
-                },
-                self.args.confidence,
-            )
-            .map_err(|e| map_graph_err(e, ADD_ASSESSES))?;
-        Ok(ToolOutput::new(json!({"status": "ok"})))
+fn build_add_assesses(args: &AddAssessesArgs) -> AddAssesses {
+    AddAssesses {
+        from:       args.from_slug.clone(),
+        to:         args.to_slug.clone(),
+        attrs:      AssessesAttrs {
+            evidence_link: EvidenceLink {
+                claim:                args.claim.clone(),
+                observation_features: args.observation_features.clone(),
+                scope:                args.scope,
+            },
+        },
+        confidence: args.confidence,
     }
+}
+
+fn parse_add_assesses(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
+    parse_graph_command::<AddAssessesArgs, AddAssesses>(
+        ADD_ASSESSES,
+        raw,
+        state,
+        build_add_assesses,
+        |_, _| json!({"status": "ok"}),
+        |e| map_send_err(e, ADD_ASSESSES),
+    )
 }
 
 // ---------- add precedes ----------
@@ -450,34 +538,24 @@ pub(super) fn add_precedes_meta() -> ToolPrototype {
     }
 }
 
-fn parse_add_precedes(raw: Value, _state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let args: AddPrecedesArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    ADD_PRECEDES,
-            message: err.to_string(),
-        })?;
-    Ok(Box::new(AddPrecedesTool { args }))
-}
-
-struct AddPrecedesTool {
-    args: AddPrecedesArgs,
-}
-
-#[async_trait]
-impl ToolInstance for AddPrecedesTool {
-    async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let mut graph = GRAPH.write();
-        let from = graph
-            .node_by_slug(&self.args.from_slug)
-            .map_err(|e| map_graph_err(e, ADD_PRECEDES))?;
-        let to = graph
-            .node_by_slug(&self.args.to_slug)
-            .map_err(|e| map_graph_err(e, ADD_PRECEDES))?;
-        graph
-            .add_precedes_edge(from, to, self.args.episode.clone(), self.args.confidence)
-            .map_err(|e| map_graph_err(e, ADD_PRECEDES))?;
-        Ok(ToolOutput::new(json!({"status": "ok"})))
+fn build_add_precedes(args: &AddPrecedesArgs) -> AddPrecedes {
+    AddPrecedes {
+        from:       args.from_slug.clone(),
+        to:         args.to_slug.clone(),
+        episode:    args.episode.clone(),
+        confidence: args.confidence,
     }
+}
+
+fn parse_add_precedes(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
+    parse_graph_command::<AddPrecedesArgs, AddPrecedes>(
+        ADD_PRECEDES,
+        raw,
+        state,
+        build_add_precedes,
+        |_, _| json!({"status": "ok"}),
+        |e| map_send_err(e, ADD_PRECEDES),
+    )
 }
 
 // ---------- add anchors ----------
@@ -503,37 +581,142 @@ pub(super) fn add_anchors_meta() -> ToolPrototype {
     }
 }
 
-fn parse_add_anchors(raw: Value, _state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let args: AddAnchorsArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    ADD_ANCHORS,
-            message: err.to_string(),
-        })?;
-    Ok(Box::new(AddAnchorsTool { args }))
-}
-
-struct AddAnchorsTool {
-    args: AddAnchorsArgs,
-}
-
-#[async_trait]
-impl ToolInstance for AddAnchorsTool {
-    async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let mut graph = GRAPH.write();
-        let from = graph
-            .node_by_slug(&self.args.from_slug)
-            .map_err(|e| map_graph_err(e, ADD_ANCHORS))?;
-        let to = graph
-            .node_by_slug(&self.args.to_slug)
-            .map_err(|e| map_graph_err(e, ADD_ANCHORS))?;
-        graph
-            .add_anchors_edge(from, to, self.args.impact, self.args.confidence)
-            .map_err(|e| map_graph_err(e, ADD_ANCHORS))?;
-        Ok(ToolOutput::new(json!({"status": "ok"})))
+fn build_add_anchors(args: &AddAnchorsArgs) -> AddAnchors {
+    AddAnchors {
+        from:       args.from_slug.clone(),
+        to:         args.to_slug.clone(),
+        impact:     args.impact,
+        confidence: args.confidence,
     }
 }
 
+fn parse_add_anchors(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
+    parse_graph_command::<AddAnchorsArgs, AddAnchors>(
+        ADD_ANCHORS,
+        raw,
+        state,
+        build_add_anchors,
+        |_, _| json!({"status": "ok"}),
+        |e| map_send_err(e, ADD_ANCHORS),
+    )
+}
+
 // ---------- Inspection ----------
+
+const GRAPH_NEIGHBORS: &str = "graph_neighbors";
+const RENAME_NODE: &str = "graph_rename_node";
+const REMOVE_NODE: &str = "graph_remove_node";
+
+#[derive(Debug, Clone, Builder, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NeighborsArgs {
+    pub slug:      String,
+    #[serde(default)]
+    pub edge_kind: Option<String>, // requires, supports, assesses, precedes, anchors
+    #[serde(default)]
+    pub direction: Option<String>, // outgoing, incoming, both
+}
+
+#[derive(Debug, Clone, Builder, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RenameNodeArgs {
+    pub old_slug: String,
+    pub new_slug: String,
+}
+
+#[derive(Debug, Clone, Builder, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RemoveNodeArgs {
+    pub slug: String,
+}
+
+pub(super) fn neighbors_meta() -> ToolPrototype {
+    ToolPrototype {
+        id:          GRAPH_NEIGHBORS,
+        description: "List neighbors of a node filtered by edge kind and direction.",
+        schema:      schema_for_args::<NeighborsArgs>(),
+        parse:       parse_neighbors,
+    }
+}
+
+fn parse_neighbors(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
+    let args: NeighborsArgs =
+        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
+            tool:    GRAPH_NEIGHBORS,
+            message: err.to_string(),
+        })?;
+    Ok(Box::new(NeighborsTool {
+        args,
+        graph: state.graph.clone(),
+    }))
+}
+
+struct NeighborsTool {
+    args:  NeighborsArgs,
+    graph: ActorRef<crate::graph::manager::GraphManager>,
+}
+
+#[async_trait]
+impl ToolInstance for NeighborsTool {
+    async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
+        let neighbors = self
+            .graph
+            .ask(crate::graph::manager::Neighbors {
+                slug:      self.args.slug.clone(),
+                edge_kind: self.args.edge_kind.clone(),
+                direction: self.args.direction.clone(),
+            })
+            .await
+            .map_err(|e| map_send_err(e, GRAPH_NEIGHBORS))?;
+
+        Ok(ToolOutput::new(json!({"status": "ok", "neighbors": neighbors})))
+    }
+}
+
+pub(super) fn rename_node_meta() -> ToolPrototype {
+    ToolPrototype {
+        id:          RENAME_NODE,
+        description: "Rename a node slug and update dependent assesses claims.",
+        schema:      schema_for_args::<RenameNodeArgs>(),
+        parse:       parse_rename_node,
+    }
+}
+
+fn parse_rename_node(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
+    parse_graph_command::<RenameNodeArgs, crate::graph::manager::RenameNode>(
+        RENAME_NODE,
+        raw,
+        state,
+        |args| crate::graph::manager::RenameNode {
+            old_slug: args.old_slug.clone(),
+            new_slug: args.new_slug.clone(),
+        },
+        |_, _| json!({"status": "ok"}),
+        |e| map_send_err(e, RENAME_NODE),
+    )
+}
+
+pub(super) fn remove_node_meta() -> ToolPrototype {
+    ToolPrototype {
+        id:          REMOVE_NODE,
+        description: "Delete a node and its incident edges.",
+        schema:      schema_for_args::<RemoveNodeArgs>(),
+        parse:       parse_remove_node,
+    }
+}
+
+fn parse_remove_node(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
+    parse_graph_command::<RemoveNodeArgs, crate::graph::manager::RemoveNode>(
+        REMOVE_NODE,
+        raw,
+        state,
+        |args| crate::graph::manager::RemoveNode {
+            slug: args.slug.clone(),
+        },
+        |_, _| json!({"status": "ok"}),
+        |e| map_send_err(e, REMOVE_NODE),
+    )
+}
 
 const GET_NODE: &str = "graph_get_node";
 
@@ -552,27 +735,33 @@ pub(super) fn get_node_meta() -> ToolPrototype {
     }
 }
 
-fn parse_get_node(raw: Value, _state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
+fn parse_get_node(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
     let args: GetNodeArgs =
         serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
             tool:    GET_NODE,
             message: err.to_string(),
         })?;
-    Ok(Box::new(GetNodeTool { args }))
+    Ok(Box::new(GetNodeTool {
+        args,
+        graph: state.graph.clone(),
+    }))
 }
 
 struct GetNodeTool {
-    args: GetNodeArgs,
+    args:  GetNodeArgs,
+    graph: ActorRef<crate::graph::manager::GraphManager>,
 }
 
 #[async_trait]
 impl ToolInstance for GetNodeTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let graph = GRAPH.read();
-        let id = graph
-            .node_by_slug(&self.args.slug)
-            .map_err(|e| map_graph_err(e, GET_NODE))?;
-        let payload = &graph.graph()[id];
+        let payload = self
+            .graph
+            .ask(GetNode {
+                slug: self.args.slug.clone(),
+            })
+            .await
+            .map_err(|e| map_send_err(e, GET_NODE))?;
         let value = match &payload.kind {
             NodeKind::Knowledge(k) => json!({
                 "slug": payload.slug,
@@ -624,23 +813,26 @@ pub(super) fn dag_check_meta() -> ToolPrototype {
 #[serde(deny_unknown_fields)]
 struct NoArgs {}
 
-fn parse_dag_check(raw: Value, _state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
+fn parse_dag_check(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
     let _: NoArgs = serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
         tool:    DAG_CHECK,
         message: err.to_string(),
     })?;
-    Ok(Box::new(DAGCheckTool))
+    Ok(Box::new(DAGCheckTool {
+        graph: state.graph.clone(),
+    }))
 }
 
-#[derive(Default)]
-struct DAGCheckTool;
+struct DAGCheckTool {
+    graph: ActorRef<crate::graph::manager::GraphManager>,
+}
 
 #[async_trait]
 impl ToolInstance for DAGCheckTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let graph = GRAPH.read();
-        let dag = analysis::requires_is_dag(graph.graph());
-        let topo = analysis::requires_toposort(graph.graph()).ok();
+        let graph = self.graph.ask(GetGraph).await.map_err(map_send_err_inf)?;
+        let dag = analysis::requires_is_dag(&graph);
+        let topo = analysis::requires_toposort(&graph).ok();
         Ok(ToolOutput::new(json!({
             "status": "ok",
             "is_dag": dag,
@@ -660,29 +852,26 @@ pub(super) fn first_principles_meta() -> ToolPrototype {
     }
 }
 
-#[derive(Default)]
-struct FirstPrinciplesTool;
+struct FirstPrinciplesTool {
+    graph: ActorRef<crate::graph::manager::GraphManager>,
+}
 
-fn parse_first_principles(
-    raw: Value,
-    _state: &CallState,
-) -> ToolInputResult<Box<dyn ToolInstance>> {
+fn parse_first_principles(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
     let _: NoArgs = serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
         tool:    FIRST_PRINCIPLES,
         message: err.to_string(),
     })?;
-    Ok(Box::new(FirstPrinciplesTool))
+    Ok(Box::new(FirstPrinciplesTool {
+        graph: state.graph.clone(),
+    }))
 }
 
 #[async_trait]
 impl ToolInstance for FirstPrinciplesTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let graph = GRAPH.read();
-        let fps = analysis::first_principles(graph.graph());
-        let slugs: Vec<_> = fps
-            .iter()
-            .map(|id| graph.graph()[*id].slug.clone())
-            .collect();
+        let graph = self.graph.ask(GetGraph).await.map_err(map_send_err_inf)?;
+        let fps = analysis::first_principles(&graph);
+        let slugs: Vec<_> = fps.iter().map(|id| graph[*id].slug.clone()).collect();
         Ok(ToolOutput::new(json!({"status": "ok", "first_principles": slugs})))
     }
 }
@@ -715,34 +904,42 @@ pub(super) fn lo_alignment_meta() -> ToolPrototype {
     }
 }
 
-fn parse_lo_reach(raw: Value, _state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
+fn parse_lo_reach(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
     let args: LoReachArgs =
         serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
             tool:    LO_REACH,
             message: err.to_string(),
         })?;
-    Ok(Box::new(LoReachTool { args }))
+    Ok(Box::new(LoReachTool {
+        args,
+        graph: state.graph.clone(),
+    }))
 }
 
 struct LoReachTool {
-    args: LoReachArgs,
+    args:  LoReachArgs,
+    graph: ActorRef<crate::graph::manager::GraphManager>,
 }
 
 #[async_trait]
 impl ToolInstance for LoReachTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let graph = GRAPH.read();
-        let lo = graph
-            .node_by_slug(&self.args.lo_slug)
-            .map_err(|e| map_graph_err(e, LO_REACH))?;
-        let fps = analysis::first_principles(graph.graph());
-        let report = analysis::lo_reachability(graph.graph(), lo, &fps);
+        let graph = self.graph.ask(GetGraph).await.map_err(map_send_err_inf)?;
+        let lo = find_node_by_slug(&graph, &self.args.lo_slug).ok_or_else(|| {
+            ToolExecutionError::Input(ToolInputError::InvalidPath {
+                tool:    LO_REACH,
+                path:    self.args.lo_slug.clone(),
+                message: "slug not found".into(),
+            })
+        })?;
+        let fps = analysis::first_principles(&graph);
+        let report = analysis::lo_reachability(&graph, lo, &fps);
         let assessments = report
             .assessments
             .into_iter()
             .map(|a| {
                 json!({
-                    "assessment_slug": graph.graph()[a.assessment].slug,
+                    "assessment_slug": graph[a.assessment].slug,
                     "reachable_from_first_principle": a.reachable_from_first_principle,
                 })
             })
@@ -762,27 +959,35 @@ pub(super) fn coverage_meta() -> ToolPrototype {
     }
 }
 
-fn parse_lo_coverage(raw: Value, _state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
+fn parse_lo_coverage(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
     let args: LoReachArgs =
         serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
             tool:    COVERAGE,
             message: err.to_string(),
         })?;
-    Ok(Box::new(LoCoverageTool { args }))
+    Ok(Box::new(LoCoverageTool {
+        args,
+        graph: state.graph.clone(),
+    }))
 }
 
 struct LoCoverageTool {
-    args: LoReachArgs,
+    args:  LoReachArgs,
+    graph: ActorRef<crate::graph::manager::GraphManager>,
 }
 
 #[async_trait]
 impl ToolInstance for LoCoverageTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let graph = GRAPH.read();
-        let lo = graph
-            .node_by_slug(&self.args.lo_slug)
-            .map_err(|e| map_graph_err(e, COVERAGE))?;
-        let report = analysis::coverage_report(graph.graph(), lo);
+        let graph = self.graph.ask(GetGraph).await.map_err(map_send_err_inf)?;
+        let lo = find_node_by_slug(&graph, &self.args.lo_slug).ok_or_else(|| {
+            ToolExecutionError::Input(ToolInputError::InvalidPath {
+                tool:    COVERAGE,
+                path:    self.args.lo_slug.clone(),
+                message: "slug not found".into(),
+            })
+        })?;
+        let report = analysis::coverage_report(&graph, lo);
         Ok(ToolOutput::new(json!({
             "status": "ok",
             "covered": report.covered_criteria,
@@ -792,53 +997,60 @@ impl ToolInstance for LoCoverageTool {
     }
 }
 
-fn parse_lo_alignment(raw: Value, _state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
+fn parse_lo_alignment(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
     let args: LoReachArgs =
         serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
             tool:    LO_ALIGNMENT,
             message: err.to_string(),
         })?;
-    Ok(Box::new(LoAlignmentTool { args }))
+    Ok(Box::new(LoAlignmentTool {
+        args,
+        graph: state.graph.clone(),
+    }))
 }
 
 struct LoAlignmentTool {
-    args: LoReachArgs,
+    args:  LoReachArgs,
+    graph: ActorRef<crate::graph::manager::GraphManager>,
 }
 
 #[async_trait]
 impl ToolInstance for LoAlignmentTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let graph = GRAPH.read();
-        let lo = graph
-            .node_by_slug(&self.args.lo_slug)
-            .map_err(|e| map_graph_err(e, LO_ALIGNMENT))?;
+        let graph = self.graph.ask(GetGraph).await.map_err(map_send_err_inf)?;
+        let lo = find_node_by_slug(&graph, &self.args.lo_slug).ok_or_else(|| {
+            ToolExecutionError::Input(ToolInputError::InvalidPath {
+                tool:    LO_ALIGNMENT,
+                path:    self.args.lo_slug.clone(),
+                message: "slug not found".into(),
+            })
+        })?;
 
         // Reachability
-        let fps = analysis::first_principles(graph.graph());
-        let reach = analysis::lo_reachability(graph.graph(), lo, &fps);
+        let fps = analysis::first_principles(&graph);
+        let reach = analysis::lo_reachability(&graph, lo, &fps);
         let assessments = reach
             .assessments
             .into_iter()
             .map(|a| {
                 json!({
-                    "assessment_slug": graph.graph()[a.assessment].slug,
+                    "assessment_slug": graph[a.assessment].slug,
                     "reachable_from_first_principle": a.reachable_from_first_principle,
                 })
             })
             .collect::<Vec<_>>();
 
         // Coverage
-        let coverage = analysis::coverage_report(graph.graph(), lo);
+        let coverage = analysis::coverage_report(&graph, lo);
 
         // Anchors with impact=target
         let target_anchors: Vec<_> = graph
-            .graph()
             .edges_directed(lo, petgraph::Direction::Incoming)
             .filter_map(|e| match &e.weight().kind {
                 crate::graph::EdgeKind::Anchors(attrs)
                     if matches!(attrs.impact, crate::graph::AnchorImpact::Target) =>
                 {
-                    Some(graph.graph()[e.source()].slug.clone())
+                    Some(graph[e.source()].slug.clone())
                 }
                 _ => None,
             })
@@ -868,27 +1080,30 @@ pub(super) fn example_gaps_meta() -> ToolPrototype {
     }
 }
 
-#[derive(Default)]
-struct ExampleGapsTool;
+struct ExampleGapsTool {
+    graph: ActorRef<crate::graph::manager::GraphManager>,
+}
 
-fn parse_example_gaps(raw: Value, _state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
+fn parse_example_gaps(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
     let _: NoArgs = serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
         tool:    EXAMPLE_GAPS,
         message: err.to_string(),
     })?;
-    Ok(Box::new(ExampleGapsTool))
+    Ok(Box::new(ExampleGapsTool {
+        graph: state.graph.clone(),
+    }))
 }
 
 #[async_trait]
 impl ToolInstance for ExampleGapsTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let graph = GRAPH.read();
-        let gaps = analysis::example_gaps(graph.graph());
+        let graph = self.graph.ask(GetGraph).await.map_err(map_send_err_inf)?;
+        let gaps = analysis::example_gaps(&graph);
         let rendered: Vec<_> = gaps
             .into_iter()
             .map(|gap| {
                 json!({
-                    "slug": graph.graph()[gap.node].slug,
+                    "slug": graph[gap.node].slug,
                     "description": gap.description,
                 })
             })
@@ -908,27 +1123,30 @@ pub(super) fn keystone_meta() -> ToolPrototype {
     }
 }
 
-#[derive(Default)]
-struct KeystoneTool;
+struct KeystoneTool {
+    graph: ActorRef<crate::graph::manager::GraphManager>,
+}
 
-fn parse_keystone(raw: Value, _state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
+fn parse_keystone(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
     let _: NoArgs = serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
         tool:    KEYSTONE,
         message: err.to_string(),
     })?;
-    Ok(Box::new(KeystoneTool))
+    Ok(Box::new(KeystoneTool {
+        graph: state.graph.clone(),
+    }))
 }
 
 #[async_trait]
 impl ToolInstance for KeystoneTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let graph = GRAPH.read();
-        let scores = analysis::keystone_scores(graph.graph());
+        let graph = self.graph.ask(GetGraph).await.map_err(map_send_err_inf)?;
+        let scores = analysis::keystone_scores(&graph);
         let rendered: Vec<_> = scores
             .into_iter()
             .map(|score| {
                 json!({
-                    "slug": graph.graph()[score.node].slug,
+                    "slug": graph[score.node].slug,
                     "score": score.score,
                     "in_reach": score.in_reach,
                     "out_reach": score.out_reach,
@@ -958,24 +1176,28 @@ pub(super) fn fadeability_meta() -> ToolPrototype {
     }
 }
 
-fn parse_fadeability(raw: Value, _state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
+fn parse_fadeability(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
     let _: NoArgs = serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
         tool:    FADEABILITY,
         message: err.to_string(),
     })?;
-    Ok(Box::new(FadeabilityTool))
+    Ok(Box::new(FadeabilityTool {
+        graph: state.graph.clone(),
+    }))
 }
 
-struct FadeabilityTool;
+struct FadeabilityTool {
+    graph: ActorRef<crate::graph::manager::GraphManager>,
+}
 
 #[async_trait]
 impl ToolInstance for FadeabilityTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let graph = GRAPH.read();
-        let issues = analysis::fadeability_issues(graph.graph());
+        let graph = self.graph.ask(GetGraph).await.map_err(map_send_err_inf)?;
+        let issues = analysis::fadeability_issues(&graph);
         let rendered: Vec<_> = issues
             .into_iter()
-            .map(|i| json!({ "assessment_slug": graph.graph()[i.assessment].slug }))
+            .map(|i| json!({ "assessment_slug": graph[i.assessment].slug }))
             .collect();
         Ok(ToolOutput::new(json!({"status": "ok", "issues": rendered})))
     }
@@ -996,24 +1218,28 @@ pub(super) fn practice_gaps_meta() -> ToolPrototype {
     }
 }
 
-fn parse_practice_gaps(raw: Value, _state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
+fn parse_practice_gaps(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
     let _: NoArgs = serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
         tool:    PRACTICE_GAPS,
         message: err.to_string(),
     })?;
-    Ok(Box::new(PracticeGapsTool))
+    Ok(Box::new(PracticeGapsTool {
+        graph: state.graph.clone(),
+    }))
 }
 
-struct PracticeGapsTool;
+struct PracticeGapsTool {
+    graph: ActorRef<crate::graph::manager::GraphManager>,
+}
 
 #[async_trait]
 impl ToolInstance for PracticeGapsTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let graph = GRAPH.read();
-        let gaps = analysis::procedural_practice_gaps(graph.graph());
+        let graph = self.graph.ask(GetGraph).await.map_err(map_send_err_inf)?;
+        let gaps = analysis::procedural_practice_gaps(&graph);
         let rendered: Vec<_> = gaps
             .into_iter()
-            .map(|g| json!({ "slug": graph.graph()[g.node].slug }))
+            .map(|g| json!({ "slug": graph[g.node].slug }))
             .collect();
         Ok(ToolOutput::new(json!({"status": "ok", "gaps": rendered})))
     }
@@ -1039,48 +1265,61 @@ pub(super) fn extraneous_meta() -> ToolPrototype {
     }
 }
 
-fn parse_extraneous(raw: Value, _state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
+fn parse_extraneous(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
     let args: ExtraneousArgs =
         serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
             tool:    EXTRANEOUS,
             message: err.to_string(),
         })?;
-    Ok(Box::new(ExtraneousTool { args }))
+    Ok(Box::new(ExtraneousTool {
+        args,
+        graph: state.graph.clone(),
+    }))
 }
 
 struct ExtraneousTool {
-    args: ExtraneousArgs,
+    args:  ExtraneousArgs,
+    graph: ActorRef<crate::graph::manager::GraphManager>,
 }
 
 #[async_trait]
 impl ToolInstance for ExtraneousTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let graph = GRAPH.read();
-        let assessment = graph
-            .node_by_slug(&self.args.assessment_slug)
-            .map_err(|e| map_graph_err(e, EXTRANEOUS))?;
-        let lo = graph
-            .node_by_slug(&self.args.lo_slug)
-            .map_err(|e| map_graph_err(e, EXTRANEOUS))?;
+        let graph = self.graph.ask(GetGraph).await.map_err(map_send_err_inf)?;
+        let assessment =
+            find_node_by_slug(&graph, &self.args.assessment_slug).ok_or_else(|| {
+                ToolExecutionError::Input(ToolInputError::InvalidPath {
+                    tool:    EXTRANEOUS,
+                    path:    self.args.assessment_slug.clone(),
+                    message: "slug not found".into(),
+                })
+            })?;
+        let lo = find_node_by_slug(&graph, &self.args.lo_slug).ok_or_else(|| {
+            ToolExecutionError::Input(ToolInputError::InvalidPath {
+                tool:    EXTRANEOUS,
+                path:    self.args.lo_slug.clone(),
+                message: "slug not found".into(),
+            })
+        })?;
 
         // Build intended set from provided slugs (optional).
         let mut intended = std::collections::HashSet::new();
         for slug in &self.args.intended_slugs {
-            if let Ok(id) = graph.node_by_slug(slug) {
+            if let Some(id) = find_node_by_slug(&graph, slug) {
                 intended.insert(id);
             }
         }
 
-        let report = analysis::extraneous_report(graph.graph(), assessment, lo, &intended);
+        let report = analysis::extraneous_report(&graph, assessment, lo, &intended);
 
         let extraneous_slugs: Vec<_> = report
             .extraneous_nodes
             .iter()
-            .map(|n| graph.graph()[*n].slug.clone())
+            .map(|n| graph[*n].slug.clone())
             .collect();
 
         // Declared construct_irrelevant_demands (as strings) on the assessment node.
-        let declared_cid = match &graph.graph()[assessment].kind {
+        let declared_cid = match &graph[assessment].kind {
             crate::graph::NodeKind::Knowledge(k) => k.construct_irrelevant_demands.clone(),
             _ => Vec::new(),
         };
@@ -1103,28 +1342,32 @@ pub(super) fn alignment_gaps_meta() -> ToolPrototype {
     }
 }
 
-fn parse_alignment_gaps(raw: Value, _state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
+fn parse_alignment_gaps(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
     let _: NoArgs = serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
         tool:    ALIGNMENT_GAPS,
         message: err.to_string(),
     })?;
-    Ok(Box::new(AlignmentGapsTool))
+    Ok(Box::new(AlignmentGapsTool {
+        graph: state.graph.clone(),
+    }))
 }
 
-struct AlignmentGapsTool;
+struct AlignmentGapsTool {
+    graph: ActorRef<crate::graph::manager::GraphManager>,
+}
 
 #[async_trait]
 impl ToolInstance for AlignmentGapsTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let graph = GRAPH.read();
-        let los = analysis::lo_missing_target_assessments(graph.graph());
-        let orphan = analysis::orphan_assessments(graph.graph());
-        let unreachable = analysis::unreachable_assessments(graph.graph());
+        let graph = self.graph.ask(GetGraph).await.map_err(map_send_err_inf)?;
+        let los = analysis::lo_missing_target_assessments(&graph);
+        let orphan = analysis::orphan_assessments(&graph);
+        let unreachable = analysis::unreachable_assessments(&graph);
         Ok(ToolOutput::new(json!({
             "status": "ok",
-            "los_missing_target_assessment": los.into_iter().map(|n| graph.graph()[n].slug.clone()).collect::<Vec<_>>(),
-            "assessments_without_lo": orphan.into_iter().map(|n| graph.graph()[n].slug.clone()).collect::<Vec<_>>(),
-            "assessments_unreachable": unreachable.into_iter().map(|n| graph.graph()[n].slug.clone()).collect::<Vec<_>>(),
+            "los_missing_target_assessment": los.into_iter().map(|n| graph[n].slug.clone()).collect::<Vec<_>>(),
+            "assessments_without_lo": orphan.into_iter().map(|n| graph[n].slug.clone()).collect::<Vec<_>>(),
+            "assessments_unreachable": unreachable.into_iter().map(|n| graph[n].slug.clone()).collect::<Vec<_>>(),
         })))
     }
 }
@@ -1148,29 +1391,30 @@ pub(super) fn discourse_orphans_meta() -> ToolPrototype {
 
 fn parse_discourse_orphans(
     raw: Value,
-    _state: &CallState,
+    state: &CallState,
 ) -> ToolInputResult<Box<dyn ToolInstance>> {
     let args: DiscourseOrphansArgs =
         serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
             tool:    DISCOURSE_ORPHANS,
             message: err.to_string(),
         })?;
-    Ok(Box::new(DiscourseOrphansTool { args }))
+    Ok(Box::new(DiscourseOrphansTool {
+        args,
+        graph: state.graph.clone(),
+    }))
 }
 
 struct DiscourseOrphansTool {
-    args: DiscourseOrphansArgs,
+    args:  DiscourseOrphansArgs,
+    graph: ActorRef<crate::graph::manager::GraphManager>,
 }
 
 #[async_trait]
 impl ToolInstance for DiscourseOrphansTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let graph = GRAPH.read();
-        let list = analysis::discourse_orphans(graph.graph(), self.args.episode.as_deref());
-        let slugs: Vec<_> = list
-            .into_iter()
-            .map(|n| graph.graph()[n].slug.clone())
-            .collect();
+        let graph = self.graph.ask(GetGraph).await.map_err(map_send_err_inf)?;
+        let list = analysis::discourse_orphans(&graph, self.args.episode.as_deref());
+        let slugs: Vec<_> = list.into_iter().map(|n| graph[n].slug.clone()).collect();
         Ok(ToolOutput::new(json!({"status": "ok", "orphans": slugs})))
     }
 }
@@ -1184,30 +1428,34 @@ pub(super) fn borrow_ahead_meta() -> ToolPrototype {
     }
 }
 
-fn parse_borrow_ahead(raw: Value, _state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
+fn parse_borrow_ahead(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
     let args: BorrowAheadArgs =
         serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
             tool:    BORROW_AHEAD,
             message: err.to_string(),
         })?;
-    Ok(Box::new(BorrowAheadTool { args }))
+    Ok(Box::new(BorrowAheadTool {
+        args,
+        graph: state.graph.clone(),
+    }))
 }
 
 struct BorrowAheadTool {
-    args: BorrowAheadArgs,
+    args:  BorrowAheadArgs,
+    graph: ActorRef<crate::graph::manager::GraphManager>,
 }
 
 #[async_trait]
 impl ToolInstance for BorrowAheadTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let graph = GRAPH.read();
-        let results = analysis::borrow_ahead(graph.graph(), &self.args.episode);
+        let graph = self.graph.ask(GetGraph).await.map_err(map_send_err_inf)?;
+        let results = analysis::borrow_ahead(&graph, &self.args.episode);
         let rendered: Vec<_> = results
             .into_iter()
             .map(|b| {
                 json!({
-                    "step_slug": graph.graph()[b.step].slug,
-                    "target_slug": graph.graph()[b.target].slug,
+                    "step_slug": graph[b.step].slug,
+                    "target_slug": graph[b.target].slug,
                     "severity": b.severity,
                 })
             })
@@ -1221,12 +1469,17 @@ impl ToolInstance for BorrowAheadTool {
 pub fn graph_tool_prototypes() -> Vec<ToolPrototype> {
     vec![
         insert_knowledge_meta(),
+        update_knowledge_meta(),
         insert_teaching_meta(),
+        update_teaching_meta(),
         add_requires_meta(),
         add_supports_meta(),
         add_assesses_meta(),
         add_precedes_meta(),
         add_anchors_meta(),
+        rename_node_meta(),
+        remove_node_meta(),
+        neighbors_meta(),
         get_node_meta(),
         dag_check_meta(),
         first_principles_meta(),
@@ -1241,7 +1494,6 @@ pub fn graph_tool_prototypes() -> Vec<ToolPrototype> {
         practice_gaps_meta(),
         alignment_gaps_meta(),
         discourse_orphans_meta(),
-        neighbors_meta(),
         lo_alignment_meta(),
         extraneous_meta(),
     ]
@@ -1268,34 +1520,35 @@ pub(super) fn save_snapshot_meta() -> ToolPrototype {
     }
 }
 
-fn parse_save_snapshot(raw: Value, _state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let args: SaveSnapshotArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    SAVE_SNAPSHOT,
-            message: err.to_string(),
-        })?;
-    Ok(Box::new(SaveSnapshotTool { args }))
-}
-
-struct SaveSnapshotTool {
-    args: SaveSnapshotArgs,
-}
-
-#[async_trait]
-impl ToolInstance for SaveSnapshotTool {
-    async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let path = self
-            .args
-            .path
-            .clone()
-            .or_else(|| env::var("GRAPH_SNAPSHOT_PATH").ok())
-            .unwrap_or_else(|| "graph_snapshot.json".to_string());
-        let graph_clone = { GRAPH.read().snapshot_graph() };
-        crate::graph::persist::save_graph(&graph_clone, &path)
-            .await
-            .map_err(ToolExecutionError::from)?;
-        Ok(ToolOutput::new(json!({"status": "ok", "path": path})))
+fn build_save_snapshot(args: &SaveSnapshotArgs) -> SaveSnapshot {
+    let path_str = args
+        .path
+        .clone()
+        .or_else(|| env::var("GRAPH_SNAPSHOT_PATH").ok())
+        .unwrap_or_else(|| "graph_snapshot.json".to_string());
+    SaveSnapshot {
+        path: PathBuf::from(path_str),
     }
+}
+
+fn ok_save_snapshot(args: &SaveSnapshotArgs, _: ()) -> Value {
+    let path = args
+        .path
+        .clone()
+        .or_else(|| env::var("GRAPH_SNAPSHOT_PATH").ok())
+        .unwrap_or_else(|| "graph_snapshot.json".to_string());
+    json!({"status": "ok", "path": path})
+}
+
+fn parse_save_snapshot(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
+    parse_graph_command::<SaveSnapshotArgs, SaveSnapshot>(
+        SAVE_SNAPSHOT,
+        raw,
+        state,
+        build_save_snapshot,
+        ok_save_snapshot,
+        map_send_err_anyhow,
+    )
 }
 
 const LOAD_SNAPSHOT: &str = "graph_load_snapshot";
@@ -1315,29 +1568,19 @@ pub(super) fn load_snapshot_meta() -> ToolPrototype {
     }
 }
 
-fn parse_load_snapshot(raw: Value, _state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let args: LoadSnapshotArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    LOAD_SNAPSHOT,
-            message: err.to_string(),
-        })?;
-    Ok(Box::new(LoadSnapshotTool { args }))
-}
-
-struct LoadSnapshotTool {
-    args: LoadSnapshotArgs,
-}
-
-#[async_trait]
-impl ToolInstance for LoadSnapshotTool {
-    async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let new_graph = crate::graph::persist::load_graph(&self.args.path)
-            .await
-            .map_err(ToolExecutionError::from)?;
-        {
-            let mut guard = GRAPH.write();
-            guard.replace_graph(new_graph);
-        }
-        Ok(ToolOutput::new(json!({"status": "ok", "path": self.args.path})))
+fn build_load_snapshot(args: &LoadSnapshotArgs) -> LoadSnapshot {
+    LoadSnapshot {
+        path: PathBuf::from(args.path.clone()),
     }
+}
+
+fn parse_load_snapshot(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
+    parse_graph_command::<LoadSnapshotArgs, LoadSnapshot>(
+        LOAD_SNAPSHOT,
+        raw,
+        state,
+        build_load_snapshot,
+        |args, _| json!({"status": "ok", "path": args.path}),
+        map_send_err_anyhow,
+    )
 }
