@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use kameo::prelude::ActorRef;
 use once_cell::sync::Lazy;
 use schemars::{JsonSchema, schema_for};
-use serde_json::{self, Value, json};
+use serde_json::{self, Map, Value, json};
 use thiserror::Error;
 use tracing::warn;
 
@@ -251,6 +251,7 @@ pub struct CallState {
     pub graph:              ActorRef<GraphManager>,
     pub actor_name:         Arc<String>,
     pub conversation_id:    Arc<String>,
+    pub rerun:              Option<ActorRef<crate::rerun_sink::RerunSink>>,
 }
 
 pub const fn default_false() -> bool {
@@ -477,7 +478,19 @@ fn schema_value_for<T: JsonSchema>() -> Value {
 }
 
 pub fn schema_for_args<T: JsonSchema>() -> Value {
-    schema_value_for::<T>()
+    let mut val = schema_value_for::<T>();
+    if let Value::Object(map) = &mut val {
+        map.entry("type")
+            .or_insert_with(|| Value::String("object".to_string()));
+        map.entry("properties")
+            .or_insert_with(|| Value::Object(Map::new()));
+        map.entry("required")
+            .or_insert_with(|| Value::Array(Vec::new()));
+    } else {
+        // Only patch truly empty/invalid cases; let real schema errors surface.
+        val = json!({"type": "object", "properties": {}, "required": []});
+    }
+    val
 }
 
 pub fn unsupported_tool(identifier: &str) -> ToolInputError {

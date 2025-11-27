@@ -448,6 +448,10 @@ pub struct ResolveSlug {
     pub slug: String,
 }
 
+pub struct RedundantRequires {
+    pub prune: bool,
+}
+
 impl Message<SaveSnapshot> for GraphManager {
     type Reply = Result<()>;
 
@@ -458,6 +462,29 @@ impl Message<SaveSnapshot> for GraphManager {
     ) -> Self::Reply {
         let graph = self.service.shared_graph();
         persist::save_graph(graph.as_ref(), path, &self.config.course_commit).await
+    }
+}
+
+impl Message<RedundantRequires> for GraphManager {
+    type Reply = Result<Vec<(String, String)>, GraphError>;
+
+    async fn handle(
+        &mut self,
+        RedundantRequires { prune }: RedundantRequires,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let edges: Vec<(String, String)> = self
+            .service
+            .redundant_requires()
+            .into_iter()
+            .map(|(u, v)| {
+                (self.service.graph()[u].slug.clone(), self.service.graph()[v].slug.clone())
+            })
+            .collect();
+        if prune {
+            let _ = self.service.prune_redundant_requires();
+        }
+        Ok(edges)
     }
 }
 

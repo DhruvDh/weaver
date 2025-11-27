@@ -17,13 +17,14 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use petgraph::{
     Direction,
-    algo::{is_cyclic_directed, toposort},
-    visit::EdgeRef,
+    algo::{has_path_connecting, is_cyclic_directed, toposort},
+    visit::{EdgeRef, Reversed},
 };
+use rayon::prelude::*;
 use schemars::JsonSchema;
 
 use crate::{
-    graph::{AnchorImpact, CaseTag, CurriculumGraph, EdgeKind, NodeId, NodeKind},
+    graph::{self, AnchorImpact, CaseTag, CurriculumGraph, EdgeKind, NodeId, NodeKind, traversal},
     schema::types::{AssessmentScope, KnowledgeType, SupportKind},
 };
 
@@ -207,18 +208,31 @@ pub struct FadeabilityIssue {
 
 pub fn fadeability_issues(g: &CurriculumGraph) -> Vec<FadeabilityIssue> {
     let fps = first_principles(g);
-    let reachable_requires = reachable_assessments_requires_only(g, &fps);
-    let reachable_with_supports = reachable_assessments_with_supports(g, &fps);
+    let rs_view = traversal::requires_or_supports_view(g);
 
-    let mut issues = Vec::new();
-    for &assessment in reachable_with_supports.difference(&reachable_requires) {
-        let support_edges = supports_on_paths_to_assessment(g, &fps, assessment);
-        issues.push(FadeabilityIssue {
-            assessment,
-            support_edges,
-        });
-    }
-    issues
+    let reachable_requires: HashSet<_> = g
+        .node_indices()
+        .filter(|&n| matches!(&g[n].kind, NodeKind::Knowledge(k) if k.knowledge_type.is_assessment_item()))
+        .filter(|&a| fps.iter().any(|&fp| traversal::requires_path_exists(g, fp, a)))
+        .collect();
+
+    let reachable_with_supports: HashSet<_> = g
+        .node_indices()
+        .filter(|&n| matches!(&g[n].kind, NodeKind::Knowledge(k) if k.knowledge_type.is_assessment_item()))
+        .filter(|&a| fps.iter().any(|&fp| has_path_connecting(&rs_view, fp, a, None)))
+        .collect();
+
+    reachable_with_supports
+        .difference(&reachable_requires)
+        .cloned()
+        .map(|assessment| {
+            let support_edges = supports_on_paths_to_assessment(g, &fps, assessment);
+            FadeabilityIssue {
+                assessment,
+                support_edges,
+            }
+        })
+        .collect()
 }
 
 /// Example minimum + variety checks.
@@ -228,102 +242,106 @@ pub struct ExampleGap {
 }
 
 pub fn example_gaps(g: &CurriculumGraph) -> Vec<ExampleGap> {
-    let mut map: HashMap<NodeId, Vec<String>> = HashMap::new();
-    for n in g.node_indices() {
-        let node = &g[n];
-        let knowledge = match &node.kind {
-            NodeKind::Knowledge(k) => k,
-            _ => continue,
-        };
-        let supports: Vec<_> = g
-            .edges_directed(n, Direction::Incoming)
-            .filter_map(|e| match &e.weight().kind {
-                EdgeKind::Supports(attrs) => Some(attrs),
-                _ => None,
-            })
-            .collect();
+    let nodes: Vec<NodeId> = g
+        .node_indices()
+        .filter(|&n| matches!(&g[n].kind, NodeKind::Knowledge(_)))
+        .collect();
 
-        match knowledge.knowledge_type {
-            KnowledgeType::Procedural => {
-                let we_total = supports
-                    .iter()
-                    .filter(|s| s.support_kind == SupportKind::WorkedExample)
-                    .count();
-                let typical = supports.iter().any(|s| {
-                    s.support_kind == SupportKind::WorkedExample
-                        && matches!(s.case_tag, Some(CaseTag::Typical))
-                });
-                let edge_case = supports.iter().any(|s| {
-                    s.support_kind == SupportKind::WorkedExample
-                        && matches!(s.case_tag, Some(CaseTag::Edge | CaseTag::ErrorCase))
-                });
-                if we_total < 2 || !typical || !edge_case {
-                    map.entry(n).or_default().push(
-                        "procedural nodes need >=2 worked examples (typical + edge/error)"
+    let mut gaps: Vec<ExampleGap> = nodes
+        .par_iter()
+        .filter_map(|&n| {
+            let knowledge = match &g[n].kind {
+                NodeKind::Knowledge(k) => k,
+                _ => return None,
+            };
+            let supports: Vec<_> = g
+                .edges_directed(n, Direction::Incoming)
+                .filter_map(|e| match &e.weight().kind {
+                    EdgeKind::Supports(attrs) => Some(attrs.clone()),
+                    _ => None,
+                })
+                .collect();
+
+            let mut descs = Vec::new();
+            match knowledge.knowledge_type {
+                KnowledgeType::Procedural => {
+                    let we_total = supports
+                        .iter()
+                        .filter(|s| s.support_kind == SupportKind::WorkedExample)
+                        .count();
+                    let typical = supports.iter().any(|s| {
+                        s.support_kind == SupportKind::WorkedExample
+                            && matches!(s.case_tag, Some(CaseTag::Typical))
+                    });
+                    let edge_case = supports.iter().any(|s| {
+                        s.support_kind == SupportKind::WorkedExample
+                            && matches!(s.case_tag, Some(CaseTag::Edge | CaseTag::ErrorCase))
+                    });
+                    if we_total < 2 || !typical || !edge_case {
+                        descs.push(
+                            "procedural nodes need >=2 worked examples (typical + edge/error)"
+                                .to_string(),
+                        );
+                    }
+                }
+                KnowledgeType::Conceptual => {
+                    let has_analogy = supports
+                        .iter()
+                        .any(|s| s.support_kind == SupportKind::Analogy);
+                    let has_counter = supports
+                        .iter()
+                        .any(|s| s.support_kind == SupportKind::Counterexample);
+                    if !(has_analogy || has_counter) {
+                        descs.push(
+                            "conceptual nodes need at least one analogy or counterexample"
+                                .to_string(),
+                        );
+                    }
+                }
+                KnowledgeType::Factual => {
+                    let has_example = supports.iter().any(|s| {
+                        s.support_kind == SupportKind::WorkedExample
+                            || s.support_kind == SupportKind::Counterexample
+                    });
+                    if !has_example {
+                        descs.push("factual nodes need an example or counterexample".into());
+                    }
+                }
+                KnowledgeType::Metacognitive => {
+                    let has_hint = supports
+                        .iter()
+                        .any(|s| s.support_kind == SupportKind::StrategyHint);
+                    if !has_hint {
+                        descs.push("metacognitive nodes need a strategy hint support".into());
+                    }
+                }
+                _ => {}
+            }
+
+            if matches!(knowledge.intrinsic_load, Some(graph::IntrinsicLoad::High)) {
+                let has_support = !supports.is_empty();
+                let has_coverage_tag = supports.iter().any(|s| !s.coverage_tags.is_empty());
+                if !has_support || !has_coverage_tag {
+                    descs.push(
+                        "high intrinsic_load nodes should include rich supports with coverage_tags"
                             .to_string(),
                     );
                 }
             }
-            KnowledgeType::Conceptual => {
-                let has_analogy = supports
-                    .iter()
-                    .any(|s| s.support_kind == SupportKind::Analogy);
-                let has_counter = supports
-                    .iter()
-                    .any(|s| s.support_kind == SupportKind::Counterexample);
-                if !(has_analogy || has_counter) {
-                    map.entry(n).or_default().push(
-                        "conceptual nodes need at least one analogy or counterexample".to_string(),
-                    );
-                }
-            }
-            KnowledgeType::Factual => {
-                let has_example = supports.iter().any(|s| {
-                    s.support_kind == SupportKind::WorkedExample
-                        || s.support_kind == SupportKind::Counterexample
-                });
-                if !has_example {
-                    map.entry(n)
-                        .or_default()
-                        .push("factual nodes need an example or counterexample".into());
-                }
-            }
-            KnowledgeType::Metacognitive => {
-                let has_hint = supports
-                    .iter()
-                    .any(|s| s.support_kind == SupportKind::StrategyHint);
-                if !has_hint {
-                    map.entry(n)
-                        .or_default()
-                        .push("metacognitive nodes need a strategy hint support".into());
-                }
-            }
-            _ => {}
-        }
 
-        // Additional CLT guard: high intrinsic load should have at least one support
-        // with coverage_tags.
-        if matches!(knowledge.intrinsic_load, Some(crate::graph::IntrinsicLoad::High)) {
-            let has_support = !supports.is_empty();
-            let has_coverage_tag = supports.iter().any(|s| !s.coverage_tags.is_empty());
-            if !has_support || !has_coverage_tag {
-                map.entry(n).or_default().push(
-                    "high intrinsic_load nodes should include rich supports with coverage_tags"
-                        .to_string(),
-                );
+            if descs.is_empty() {
+                None
+            } else {
+                Some(ExampleGap {
+                    node:        n,
+                    description: descs.join("; "),
+                })
             }
-        }
-    }
-    let mut entries: Vec<_> = map.into_iter().collect();
-    entries.sort_by_key(|(node, _)| node.index());
-
-    entries
-        .into_iter()
-        .map(|(node, descs)| ExampleGap {
-            node,
-            description: descs.join("; "),
         })
-        .collect()
+        .collect();
+
+    gaps.sort_by_key(|g| g.node.index());
+    gaps
 }
 
 /// Borrow-ahead detection within an episode.
@@ -459,54 +477,39 @@ pub struct PracticeGap {
 }
 
 pub fn procedural_practice_gaps(g: &CurriculumGraph) -> Vec<PracticeGap> {
-    use petgraph::Direction;
-    let mut gaps = Vec::new();
     let procedural_nodes: Vec<NodeId> = g
         .node_indices()
         .filter(|&n| matches!(&g[n].kind, NodeKind::Knowledge(k) if k.knowledge_type == KnowledgeType::Procedural))
         .collect();
 
-    for proc in procedural_nodes {
-        let mut reachable_assessments = Vec::new();
-        // requires* forward
-        let mut stack = vec![proc];
-        let mut seen = std::collections::HashSet::new();
-        while let Some(node) = stack.pop() {
-            if !seen.insert(node) {
-                continue;
-            }
-            if matches!(
-                &g[node].kind,
-                NodeKind::Knowledge(k) if k.knowledge_type.is_assessment_item()
-            ) {
-                reachable_assessments.push(node);
-            }
-            for edge in g
-                .edges_directed(node, Direction::Outgoing)
-                .filter(|e| matches!(e.weight().kind, EdgeKind::Requires(_)))
-            {
-                stack.push(edge.target());
-            }
-        }
+    let assessments: Vec<NodeId> = g
+        .node_indices()
+        .filter(|&n| matches!(&g[n].kind, NodeKind::Knowledge(k) if k.knowledge_type.is_assessment_item()))
+        .collect();
 
-        let mut ok = false;
-        for a in reachable_assessments {
-            for edge in g.edges_directed(a, Direction::Outgoing) {
-                if let EdgeKind::Assesses(attrs) = &edge.weight().kind
-                    && attrs.evidence_link.scope == AssessmentScope::Target
-                {
-                    ok = true;
-                    break;
-                }
-            }
+    let view = traversal::requires_view(g);
+
+    let mut gaps: Vec<PracticeGap> = procedural_nodes
+        .par_iter()
+        .filter_map(|&proc| {
+            let ok = assessments.iter().any(|&a| {
+                has_path_connecting(&view, proc, a, None)
+                    && g.edges_directed(a, Direction::Outgoing).any(|e| {
+                        matches!(
+                            &e.weight().kind,
+                            EdgeKind::Assesses(attrs) if attrs.evidence_link.scope == AssessmentScope::Target
+                        )
+                    })
+            });
             if ok {
-                break;
+                None
+            } else {
+                Some(PracticeGap { node: proc })
             }
-        }
-        if !ok {
-            gaps.push(PracticeGap { node: proc });
-        }
-    }
+        })
+        .collect();
+
+    gaps.sort_by_key(|g| g.node.index());
     gaps
 }
 
@@ -693,62 +696,6 @@ fn has_requires_path(g: &CurriculumGraph, from: NodeId, to: NodeId) -> bool {
     false
 }
 
-fn reachable_assessments_requires_only(
-    g: &CurriculumGraph,
-    first_principles: &[NodeId],
-) -> std::collections::HashSet<NodeId> {
-    use petgraph::Direction;
-    let mut reachable = std::collections::HashSet::new();
-    let mut stack = first_principles.to_vec();
-    let mut seen = std::collections::HashSet::new();
-    while let Some(node) = stack.pop() {
-        if !seen.insert(node) {
-            continue;
-        }
-        if matches!(
-            &g[node].kind,
-            NodeKind::Knowledge(k) if k.knowledge_type.is_assessment_item()
-        ) {
-            reachable.insert(node);
-        }
-        for edge in g
-            .edges_directed(node, Direction::Outgoing)
-            .filter(|e| matches!(e.weight().kind, EdgeKind::Requires(_)))
-        {
-            stack.push(edge.target());
-        }
-    }
-    reachable
-}
-
-fn reachable_assessments_with_supports(
-    g: &CurriculumGraph,
-    first_principles: &[NodeId],
-) -> std::collections::HashSet<NodeId> {
-    use petgraph::Direction;
-    let mut reachable = std::collections::HashSet::new();
-    let mut stack = first_principles.to_vec();
-    let mut seen = std::collections::HashSet::new();
-    while let Some(node) = stack.pop() {
-        if !seen.insert(node) {
-            continue;
-        }
-        if matches!(
-            &g[node].kind,
-            NodeKind::Knowledge(k) if k.knowledge_type.is_assessment_item()
-        ) {
-            reachable.insert(node);
-        }
-        for edge in g.edges_directed(node, Direction::Outgoing) {
-            match edge.weight().kind {
-                EdgeKind::Requires(_) | EdgeKind::Supports(_) => stack.push(edge.target()),
-                _ => {}
-            }
-        }
-    }
-    reachable
-}
-
 /// Return support edges that participate in at least one path from any first
 /// principle to `assessment` when supports are allowed.
 fn supports_on_paths_to_assessment(
@@ -756,43 +703,18 @@ fn supports_on_paths_to_assessment(
     first_principles: &[NodeId],
     assessment: NodeId,
 ) -> Vec<petgraph::stable_graph::EdgeIndex<u32>> {
-    use petgraph::Direction;
-    // Nodes forward-reachable from fps via requires/supports.
-    let mut forward = std::collections::HashSet::new();
-    let mut stack = first_principles.to_vec();
-    while let Some(node) = stack.pop() {
-        if !forward.insert(node) {
-            continue;
-        }
-        for edge in g.edges_directed(node, Direction::Outgoing) {
-            if matches!(edge.weight().kind, EdgeKind::Requires(_) | EdgeKind::Supports(_)) {
-                stack.push(edge.target());
-            }
-        }
-    }
+    let view = traversal::requires_or_supports_view(g);
+    let rev = Reversed(&view);
 
-    // Nodes that can reach assessment (reverse graph over requires/supports).
-    let mut backward = std::collections::HashSet::new();
-    let mut queue = std::collections::VecDeque::new();
-    queue.push_back(assessment);
-    while let Some(node) = queue.pop_front() {
-        if !backward.insert(node) {
-            continue;
-        }
-        for edge in g.edges_directed(node, Direction::Incoming) {
-            if matches!(edge.weight().kind, EdgeKind::Requires(_) | EdgeKind::Supports(_)) {
-                queue.push_back(edge.source());
-            }
-        }
-    }
-
-    // Any support edge whose source is forward-reachable and target is
-    // backward-reachable lies on some fp -> assessment path.
     g.edge_indices()
         .filter(|&e| matches!(g[e].kind, EdgeKind::Supports(_)))
         .filter(|&e| {
             if let Some((u, v)) = g.edge_endpoints(e) {
-                forward.contains(&u) && backward.contains(&v)
+                let from_fp = first_principles
+                    .iter()
+                    .any(|&fp| has_path_connecting(&view, fp, u, None));
+                let to_assessment = has_path_connecting(&rev, assessment, v, None);
+                from_fp && to_assessment
             } else {
                 false
             }

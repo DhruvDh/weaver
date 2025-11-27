@@ -50,10 +50,21 @@ pub struct FileReader {
     root:               Arc<PathBuf>,
     metrics:            Arc<GatewayMetrics>,
     graph:              ActorRef<crate::graph::manager::GraphManager>,
+    rerun:              Option<ActorRef<crate::rerun_sink::RerunSink>>,
     depth:              usize,
     max_subdelegations: usize,
     actor_name:         Arc<String>,
     conversation_id:    Arc<String>,
+}
+
+#[derive(Clone)]
+struct ReaderDeps {
+    gateway: ActorRef<LLMGateway>,
+    model:   Arc<String>,
+    root:    Arc<PathBuf>,
+    metrics: Arc<GatewayMetrics>,
+    graph:   ActorRef<crate::graph::manager::GraphManager>,
+    rerun:   Option<ActorRef<crate::rerun_sink::RerunSink>>,
 }
 
 impl FileReader {
@@ -63,8 +74,9 @@ impl FileReader {
         gateway: ActorRef<LLMGateway>,
         metrics: Arc<GatewayMetrics>,
         graph: ActorRef<crate::graph::manager::GraphManager>,
+        rerun: Option<ActorRef<crate::rerun_sink::RerunSink>>,
     ) -> Result<Self> {
-        Self::from_env_with_limit(root, gateway, metrics, graph, DEFAULT_MAX_SUBDELEGATIONS)
+        Self::from_env_with_limit(root, gateway, metrics, graph, rerun, DEFAULT_MAX_SUBDELEGATIONS)
     }
 
     /// Build a new [`FileReader`] with a custom delegation limit.
@@ -73,6 +85,7 @@ impl FileReader {
         gateway: ActorRef<LLMGateway>,
         metrics: Arc<GatewayMetrics>,
         graph: ActorRef<crate::graph::manager::GraphManager>,
+        rerun: Option<ActorRef<crate::rerun_sink::RerunSink>>,
         max_subdelegations: usize,
     ) -> Result<Self> {
         let model = Arc::new(
@@ -85,18 +98,18 @@ impl FileReader {
                 format!("failed to canonicalize root {}", root.as_ref().display())
             })?);
 
-        Ok(Self::new(gateway, model, root, metrics, graph, 0, max_subdelegations))
+        let deps = ReaderDeps {
+            gateway,
+            model,
+            root,
+            metrics,
+            graph,
+            rerun,
+        };
+        Ok(Self::new(deps, 0, max_subdelegations))
     }
 
-    fn new(
-        gateway: ActorRef<LLMGateway>,
-        model: Arc<String>,
-        root: Arc<PathBuf>,
-        metrics: Arc<GatewayMetrics>,
-        graph: ActorRef<crate::graph::manager::GraphManager>,
-        depth: usize,
-        max_subdelegations: usize,
-    ) -> Self {
+    fn new(deps: ReaderDeps, depth: usize, max_subdelegations: usize) -> Self {
         let actor_name = if depth == 0 {
             "FileReader/Root".to_string()
         } else {
@@ -105,11 +118,12 @@ impl FileReader {
         let id = NEXT_FILE_READER_ID.fetch_add(1, Ordering::Relaxed);
         let conversation_id = format!("{}#{}", actor_name, id);
         Self {
-            gateway,
-            model,
-            root,
-            metrics,
-            graph,
+            gateway: deps.gateway,
+            model: deps.model,
+            root: deps.root,
+            metrics: deps.metrics,
+            graph: deps.graph,
+            rerun: deps.rerun,
             depth,
             max_subdelegations,
             actor_name: Arc::new(actor_name),
@@ -130,7 +144,6 @@ impl FileReader {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 #[derive(Clone)]
 pub(crate) struct DelegateBatchCtx {
     pub gateway:            ActorRef<LLMGateway>,
@@ -138,6 +151,7 @@ pub(crate) struct DelegateBatchCtx {
     pub workspace_root:     Arc<PathBuf>,
     pub metrics:            Arc<GatewayMetrics>,
     pub graph:              ActorRef<crate::graph::manager::GraphManager>,
+    pub rerun:              Option<ActorRef<crate::rerun_sink::RerunSink>>,
     pub depth:              usize,
     pub max_subdelegations: usize,
 }
@@ -161,23 +175,18 @@ pub(crate) async fn run_delegate_batch_with_state(
 
     let results = stream::iter(tasks.into_iter())
         .map(|task| {
-            let gateway = ctx.gateway.clone();
-            let model = Arc::clone(&ctx.model);
-            let root = Arc::clone(&ctx.workspace_root);
-            let metrics = Arc::clone(&ctx.metrics);
-            let graph = ctx.graph.clone();
+            let deps = ReaderDeps {
+                gateway: ctx.gateway.clone(),
+                model:   Arc::clone(&ctx.model),
+                root:    Arc::clone(&ctx.workspace_root),
+                metrics: Arc::clone(&ctx.metrics),
+                graph:   ctx.graph.clone(),
+                rerun:   ctx.rerun.clone(),
+            };
             let depth = ctx.depth;
             let max_subdelegations = ctx.max_subdelegations;
             async move {
-                let child = FileReader::new(
-                    gateway.clone(),
-                    model,
-                    root,
-                    metrics,
-                    graph,
-                    depth + 1,
-                    max_subdelegations,
-                );
+                let child = FileReader::new(deps, depth + 1, max_subdelegations);
                 let actor = FileReader::spawn(child);
                 let prompt = task.clone();
                 match actor.ask(FileReaderQuery { prompt }).await {
@@ -231,6 +240,7 @@ impl Message<FileReaderQuery> for FileReader {
         let tool_ids = Self::tool_identifiers();
         let actor_name = (*self.actor_name).clone();
         let conversation_id = (*self.conversation_id).clone();
+        let rerun = self.rerun.clone();
 
         ctx.spawn(async move {
             let system_msg: ChatCompletionRequestMessage =
@@ -253,6 +263,7 @@ impl Message<FileReaderQuery> for FileReader {
                 tool_host,
                 actor_name,
                 conversation_id,
+                rerun,
             };
 
             let reply = gateway.ask(request).await?;
@@ -287,6 +298,7 @@ impl Message<ExecuteTool> for FileReader {
             graph:              self.graph.clone(),
             actor_name:         Arc::clone(&self.actor_name),
             conversation_id:    Arc::clone(&self.conversation_id),
+            rerun:              self.rerun.clone(),
         };
 
         let tool = (meta.parse)(arguments, &state).map_err(ToolExecutionError::from)?;

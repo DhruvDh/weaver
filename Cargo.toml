@@ -13,10 +13,11 @@ bpaf = { version = "0.9.20", features = [
 ] }
 grep-regex = "0.1.14"
 grep-searcher = { version = "0.1.16", features = ["avx-accel", "simd-accel"] }
-kameo = "0.18.0"
+kameo = "0.19.2"
+kameo_actors = "0.4.0"
 pathdiff = "0.2.3"
-rerun = "0.26.2"
-schemars = { version = "1.0.4" }
+rerun = "0.27.2"
+schemars = { version = "1.1.0" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 thiserror = "2.0.17"
@@ -30,7 +31,7 @@ tracing-subscriber = { version = "0.3.20", features = [
   "once_cell",
   "parking_lot",
 ] }
-rand = "0.8"
+rand = "0.9"
 uuid = { version = "1.18.1", package = "uuid", features = ["serde", "v4"] }
 walkdir = "2.5.0"
 async-trait = "0.1.89"
@@ -38,8 +39,9 @@ futures = "0.3.31"
 bon = "3.8.1"
 once_cell = "1.21.3"
 parking_lot = "0.12"
-reqwest = { version = "0.12.4", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls"] }
 petgraph = { version = "0.8.3", features = ["all", "serde-1"] }
+rayon = "1.10"
 
 [dev-dependencies]
 proptest = "1.5"

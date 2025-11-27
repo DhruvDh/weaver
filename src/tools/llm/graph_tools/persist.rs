@@ -111,13 +111,13 @@ fn map_load_snapshot_err(
 ) -> ToolExecutionError {
     match err {
         kameo::error::SendError::HandlerError(e) => {
-            if let Some(io) = e.downcast_ref::<std::io::Error>() {
-                if io.kind() == std::io::ErrorKind::NotFound {
-                    return ToolExecutionError::Input(ToolInputError::InvalidPayload {
-                        tool:    LOAD_SNAPSHOT,
-                        message: e.to_string(),
-                    });
-                }
+            if let Some(io) = e.downcast_ref::<std::io::Error>()
+                && io.kind() == std::io::ErrorKind::NotFound
+            {
+                return ToolExecutionError::Input(ToolInputError::InvalidPayload {
+                    tool:    LOAD_SNAPSHOT,
+                    message: e.to_string(),
+                });
             }
             let msg = e.to_string();
             if msg.contains("snapshot version") {

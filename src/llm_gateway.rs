@@ -23,7 +23,7 @@ use async_openai::{
 use kameo::{error::SendError, prelude::*, reply::DelegatedReply};
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
-use rand::{Rng, thread_rng};
+use rand::{Rng, rng};
 use reqwest::Client as HttpClient;
 use serde_json::{self, json};
 use tokio::{
@@ -38,6 +38,7 @@ use crate::{
         RETRY_MAX_BACKOFF_MS, RETRY_MAX_EXP,
     },
     file_reader::{ExecuteTool, FileReader},
+    rerun_sink::{LogScalar, RerunSink},
     tools::llm::{self, ToolOutput},
 };
 
@@ -277,6 +278,37 @@ static DEFAULT_CONTEXT_LIMIT: Lazy<u32> = Lazy::new(|| {
         .unwrap_or(131_072)
 });
 
+async fn log_scalar(rerun: &Option<ActorRef<RerunSink>>, path: impl Into<String>, value: f64) {
+    if let Some(sink) = rerun {
+        let msg = LogScalar {
+            path: path.into(),
+            value,
+            time_ns: None,
+        };
+        let sink = sink.clone();
+        tokio::spawn(async move {
+            let _ = sink.tell(msg).await;
+        });
+    }
+}
+
+async fn log_completion_metrics(
+    rerun: &Option<ActorRef<RerunSink>>,
+    base: &str,
+    elapsed_ms: f64,
+    usage: &CompletionUsage,
+) {
+    let paths = [
+        (format!("{base}/latency/completion_ms"), elapsed_ms),
+        (format!("{base}/tokens/prompt"), usage.prompt_tokens as f64),
+        (format!("{base}/tokens/completion"), usage.completion_tokens as f64),
+        (format!("{base}/tokens/total"), usage.total_tokens as f64),
+    ];
+    for (p, v) in paths {
+        log_scalar(rerun, p, v).await;
+    }
+}
+
 #[derive(Actor)]
 pub struct LLMGateway {
     client:    Client<OpenAIConfig>,
@@ -341,7 +373,8 @@ impl LLMGateway {
         if cap == 0 {
             return 0;
         }
-        thread_rng().gen_range(0..=cap)
+        let mut rng = rng();
+        rng.random_range(0..=cap)
     }
 
     fn should_retry(err: &OpenAIError) -> bool {
@@ -506,7 +539,9 @@ impl LLMGateway {
         client: Client<OpenAIConfig>,
         config: &GatewayConfig,
         metrics: &Arc<GatewayMetrics>,
+        rerun: Option<ActorRef<RerunSink>>,
         iteration: usize,
+        model_label: &str,
         mut build_payload: F,
     ) -> Result<CreateChatCompletionResponse>
     where
@@ -515,6 +550,8 @@ impl LLMGateway {
         let mut attempt = 0usize;
         loop {
             attempt += 1;
+            let base = format!("metrics/llm/{}", model_label);
+            log_scalar(&rerun, format!("{base}/attempt"), attempt as f64).await;
             let payload = build_payload()?;
             let started = Instant::now();
             let client = client.clone();
@@ -522,6 +559,8 @@ impl LLMGateway {
                 timeout(config.timeout, async move { client.chat().create(payload).await }).await;
             match call {
                 Ok(Ok(resp)) => {
+                    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+                    log_scalar(&rerun, format!("{base}/latency/request_ms"), elapsed_ms).await;
                     if let Some(usage) = resp.usage.as_ref() {
                         metrics.record_completion(
                             usage.prompt_tokens,
@@ -529,6 +568,7 @@ impl LLMGateway {
                             usage.total_tokens,
                             started.elapsed(),
                         );
+                        log_completion_metrics(&rerun, &base, elapsed_ms, usage).await;
                         debug!(
                             prompt_tokens = usage.prompt_tokens,
                             completion_tokens = usage.completion_tokens,
@@ -549,11 +589,13 @@ impl LLMGateway {
                         error = %err,
                         "llm_gateway request error"
                     );
+                    log_scalar(&rerun, format!("{base}/errors/api"), 1.0).await;
                     let retryable = Self::should_retry(&err);
                     if attempt >= config.max_retries || !retryable {
                         return Err(anyhow!(err));
                     }
                     let backoff = Self::compute_backoff_ms(attempt, config);
+                    log_scalar(&rerun, format!("{base}/backoff_ms"), backoff as f64).await;
                     sleep(Duration::from_millis(backoff)).await;
                 }
                 Err(_) => {
@@ -563,6 +605,7 @@ impl LLMGateway {
                         timeout_secs = config.timeout.as_secs(),
                         "llm_gateway timeout"
                     );
+                    log_scalar(&rerun, format!("{base}/errors/timeout"), 1.0).await;
                     if attempt >= config.max_retries {
                         return Err(anyhow!(
                             "chat completion timed out after {} attempts",
@@ -571,6 +614,7 @@ impl LLMGateway {
                     }
                     // Timeout has no server hint.
                     let backoff = Self::compute_backoff_ms(attempt, config);
+                    log_scalar(&rerun, format!("{base}/backoff_ms"), backoff as f64).await;
                     sleep(Duration::from_millis(backoff)).await;
                 }
             }
@@ -626,8 +670,14 @@ impl LLMGateway {
             .context("failed to render tool specifications for request")?;
         for iteration in 0..request.max_iterations {
             debug!(iteration, "Starting LLM tool iteration");
-            let response =
-                Self::call_with_retry(client.clone(), &config, &metrics, iteration, || {
+            let response = Self::call_with_retry(
+                client.clone(),
+                &config,
+                &metrics,
+                request.rerun.clone(),
+                iteration,
+                request.model.as_str(),
+                || {
                     Self::build_request(
                         request.model.as_str(),
                         &messages,
@@ -635,8 +685,9 @@ impl LLMGateway {
                         request.top_p,
                         tools.clone(),
                     )
-                })
-                .await?;
+                },
+            )
+            .await?;
 
             if let Some(usage) = response.usage.as_ref() {
                 iter_state.record_usage(&metrics, &conversation_id, request.model.as_str(), usage);
@@ -696,6 +747,7 @@ pub struct ChatCompletionRequest {
     pub tool_host:       ActorRef<FileReader>,
     pub actor_name:      String,
     pub conversation_id: String,
+    pub rerun:           Option<ActorRef<RerunSink>>,
 }
 
 impl Message<ChatCompletionRequest> for LLMGateway {

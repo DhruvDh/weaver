@@ -733,10 +733,10 @@ impl ToolInstance for LoAssessmentsViewTool {
             .assessments
             .into_iter()
             .filter_map(|a| {
-                if let Some(filter) = self.args.reachable_only {
-                    if filter != a.reachable_from_first_principle {
-                        return None;
-                    }
+                if let Some(filter) = self.args.reachable_only
+                    && filter != a.reachable_from_first_principle
+                {
+                    return None;
                 }
                 Some(json!({
                     "assessment_slug": graph[a.assessment].slug.clone(),

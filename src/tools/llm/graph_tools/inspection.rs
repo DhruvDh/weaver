@@ -97,7 +97,7 @@ impl ToolInstance for NeighborsTool {
             .graph
             .ask(Neighbors {
                 slug: self.args.slug.clone(),
-                edge_kind: self.args.edge_kind.clone(),
+                edge_kind: self.args.edge_kind,
                 direction,
             })
             .await

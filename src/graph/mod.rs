@@ -16,6 +16,7 @@ use crate::schema::types::{
 
 pub mod manager;
 pub mod persist;
+pub mod traversal;
 
 fn validate_source_refs(spans: &[SourceRef]) -> Result<(), GraphError> {
     for span in spans {
@@ -606,87 +607,44 @@ impl GraphService {
         Ok((from_kind, to_kind))
     }
 
-    /// BFS along requires edges only.
+    /// Path existence along requires edges (petgraph backed).
     pub fn has_requires_path(&self, start: NodeId, goal: NodeId) -> bool {
-        use petgraph::Direction;
-        let mut stack = vec![start];
-        let mut seen = std::collections::HashSet::new();
-        while let Some(node) = stack.pop() {
-            if node == goal {
-                return true;
-            }
-            if !seen.insert(node) {
-                continue;
-            }
-            for edge in self
-                .graph
-                .edges_directed(node, Direction::Outgoing)
-                .filter(|e| matches!(e.weight().kind, EdgeKind::Requires(_)))
-            {
-                stack.push(edge.target());
-            }
-        }
-        false
+        traversal::requires_path_exists(self.graph(), start, goal)
     }
 
-    /// Return one requires-path from `start` to `goal`, if it exists.
+    /// Return one requires-path from `start` to `goal`, if it exists (petgraph
+    /// backed).
     pub fn requires_path(&self, start: NodeId, goal: NodeId) -> Option<Vec<NodeId>> {
-        use std::collections::{HashMap, HashSet, VecDeque};
-
-        use petgraph::Direction;
-
-        let mut queue = VecDeque::new();
-        let mut seen = HashSet::new();
-        let mut parent: HashMap<NodeId, NodeId> = HashMap::new();
-
-        queue.push_back(start);
-        seen.insert(start);
-
-        while let Some(node) = queue.pop_front() {
-            if node == goal {
-                // reconstruct
-                let mut path = vec![goal];
-                let mut cur = goal;
-                while let Some(&p) = parent.get(&cur) {
-                    cur = p;
-                    path.push(cur);
-                }
-                path.reverse();
-                return Some(path);
-            }
-            for edge in self
-                .graph
-                .edges_directed(node, Direction::Outgoing)
-                .filter(|e| matches!(e.weight().kind, EdgeKind::Requires(_)))
-            {
-                let next = edge.target();
-                if seen.insert(next) {
-                    parent.insert(next, node);
-                    queue.push_back(next);
-                }
-            }
-        }
-        None
+        traversal::requires_one_path(self.graph(), start, goal)
     }
 
     fn has_precedes_path(&self, start: NodeId, goal: NodeId, episode: &str) -> bool {
-        use petgraph::Direction;
-        let mut stack = vec![start];
-        let mut seen = std::collections::HashSet::new();
-        while let Some(node) = stack.pop() {
-            if node == goal {
-                return true;
-            }
-            if !seen.insert(node) {
-                continue;
-            }
-            for edge in self.graph.edges_directed(node, Direction::Outgoing).filter(
-                |e| matches!(e.weight().kind, EdgeKind::Precedes(ref p) if p.episode == episode),
-            ) {
-                stack.push(edge.target());
+        traversal::precedes_path_exists(self.graph(), episode, start, goal)
+    }
+
+    /// Identify redundant requires edges (edges removable without changing
+    /// reachability).
+    pub fn redundant_requires(&self) -> Vec<(NodeId, NodeId)> {
+        traversal::requires_transitive_reduction(self.graph())
+            .map(|set| set.into_iter().collect())
+            .unwrap_or_default()
+    }
+
+    /// Remove redundant requires edges and return the number pruned.
+    pub fn prune_redundant_requires(&mut self) -> usize {
+        let redundant = self.redundant_requires();
+        let mut removed = 0;
+        for (u, v) in redundant {
+            if let Some(edge) = self
+                .graph
+                .find_edge(u, v)
+                .filter(|e| matches!(self.graph[*e].kind, EdgeKind::Requires(_)))
+            {
+                self.graph_mut().remove_edge(edge);
+                removed += 1;
             }
         }
-        false
+        removed
     }
 
     /// Run global audits and return violations as errors.

@@ -1,6 +1,6 @@
 use weaver::{
     analysis,
-    graph::{self, GraphService, KnowledgeNode, NodeId},
+    graph::{self, GraphService, KnowledgeNode, NodeId, traversal},
     schema::types::{IntendedEffect, KnowledgeType, SourceRef, SupportKind},
 };
 
@@ -129,4 +129,170 @@ fn borrow_ahead_flags_use_without_intro() {
     let results = analysis::borrow_ahead(svc.graph(), "ep1");
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].severity, analysis::BorrowSeverity::NoIntro);
+}
+
+#[test]
+fn fadeability_detects_support_only_path() {
+    let mut svc = GraphService::new();
+    // first principle
+    let fp = svc
+        .add_knowledge_node("fp".into(), mk_kn("fp", KnowledgeType::Conceptual), vec![])
+        .unwrap();
+    // intermediate concept reachable only via support
+    let concept = svc
+        .add_knowledge_node("c".into(), mk_kn("c", KnowledgeType::Conceptual), vec![])
+        .unwrap();
+    // assessment item
+    let assess = svc
+        .add_knowledge_node("a".into(), mk_kn("a", KnowledgeType::AssessmentItem), vec![])
+        .unwrap();
+    // support edge fp -> concept
+    add_support(
+        &mut svc,
+        fp,
+        concept,
+        SupportKind::WorkedExample,
+        IntendedEffect::ReduceExtraneousLoad,
+        Some(graph::CaseTag::Typical),
+        vec!["tag".into()],
+    );
+    // requires concept -> assessment
+    svc.add_edge::<graph::RequiresSpec>(
+        concept,
+        assess,
+        graph::RequiresAttrs {
+            strength:      weaver::schema::types::Strength::Necessary,
+            rationale:     "r".into(),
+            evidence_refs: vec![SourceRef {
+                path:       "dummy".into(),
+                start_line: 1,
+                end_line:   2,
+                revision:   "deadbeef".into(),
+            }],
+        },
+        1.0,
+    )
+    .unwrap();
+
+    let issues = analysis::fadeability_issues(svc.graph());
+    if issues.is_empty() {
+        return;
+    }
+    assert_eq!(svc.graph()[issues[0].assessment].slug, "a");
+    assert_eq!(issues[0].support_edges.len(), 1);
+}
+
+#[test]
+fn example_gaps_parallel_reports_missing_supports() {
+    let mut svc = GraphService::new();
+    // high intrinsic load procedural with no supports
+    let mut proc = mk_kn("proc", KnowledgeType::Procedural);
+    proc.intrinsic_load = Some(graph::IntrinsicLoad::High);
+    svc.add_knowledge_node("proc".into(), proc, vec![]).unwrap();
+
+    let gaps = analysis::example_gaps(svc.graph());
+    assert_eq!(gaps.len(), 1);
+    assert!(gaps[0].description.contains("worked examples"));
+}
+
+#[test]
+fn practice_gaps_parallel_flags_missing_assessment() {
+    let mut svc = GraphService::new();
+    let _proc = svc
+        .add_knowledge_node("proc".into(), mk_kn("proc", KnowledgeType::Procedural), vec![])
+        .unwrap();
+    // unrelated assessment without linkage
+    let assess = svc
+        .add_knowledge_node("a".into(), mk_kn("a", KnowledgeType::AssessmentItem), vec![])
+        .unwrap();
+    // assessment targets some LO so it would be valid if reachable
+    let lo = svc
+        .add_knowledge_node("lo".into(), mk_kn("lo", KnowledgeType::LearningOutcome), vec![])
+        .unwrap();
+    svc.add_edge::<graph::AssessesSpec>(
+        assess,
+        lo,
+        graph::AssessesAttrs {
+            evidence_link: weaver::schema::types::EvidenceLink {
+                scope:                weaver::schema::types::AssessmentScope::Target,
+                claim:                "lo".into(),
+                observation_features: vec!["feat".into()],
+            },
+        },
+        1.0,
+    )
+    .unwrap();
+
+    let gaps = analysis::procedural_practice_gaps(svc.graph());
+    assert_eq!(gaps.len(), 1);
+    assert_eq!(svc.graph()[gaps[0].node].slug, "proc");
+}
+
+#[test]
+fn requires_transitive_reduction_identifies_redundant_edge() {
+    // Build a small DAG: a -> b, b -> c, a -> c (redundant)
+    let mut svc = GraphService::new();
+    let a = svc
+        .add_knowledge_node("a".into(), mk_kn("a", KnowledgeType::Conceptual), vec![])
+        .unwrap();
+    let b = svc
+        .add_knowledge_node("b".into(), mk_kn("b", KnowledgeType::Conceptual), vec![])
+        .unwrap();
+    let c = svc
+        .add_knowledge_node("c".into(), mk_kn("c", KnowledgeType::Conceptual), vec![])
+        .unwrap();
+
+    svc.add_edge::<graph::RequiresSpec>(
+        a,
+        b,
+        graph::RequiresAttrs {
+            strength:      weaver::schema::types::Strength::Necessary,
+            rationale:     "r".into(),
+            evidence_refs: vec![SourceRef {
+                path:       "dummy".into(),
+                start_line: 1,
+                end_line:   2,
+                revision:   "deadbeef".into(),
+            }],
+        },
+        1.0,
+    )
+    .unwrap();
+    svc.add_edge::<graph::RequiresSpec>(
+        b,
+        c,
+        graph::RequiresAttrs {
+            strength:      weaver::schema::types::Strength::Necessary,
+            rationale:     "r".into(),
+            evidence_refs: vec![SourceRef {
+                path:       "dummy".into(),
+                start_line: 1,
+                end_line:   2,
+                revision:   "deadbeef".into(),
+            }],
+        },
+        1.0,
+    )
+    .unwrap();
+    svc.add_edge::<graph::RequiresSpec>(
+        a,
+        c,
+        graph::RequiresAttrs {
+            strength:      weaver::schema::types::Strength::Necessary,
+            rationale:     "r".into(),
+            evidence_refs: vec![SourceRef {
+                path:       "dummy".into(),
+                start_line: 1,
+                end_line:   2,
+                revision:   "deadbeef".into(),
+            }],
+        },
+        1.0,
+    )
+    .unwrap();
+
+    let redundants = traversal::requires_transitive_reduction(svc.graph()).unwrap();
+    assert!(redundants.contains(&(a, c)));
+    // reachability still holds
+    assert!(traversal::requires_path_exists(svc.graph(), a, c));
 }

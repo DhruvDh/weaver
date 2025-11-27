@@ -84,6 +84,7 @@ fn parse_delegate_tasks(raw: Value, state: &CallState) -> ToolInputResult<Box<dy
         model: Arc::clone(&state.model),
         metrics: Arc::clone(&state.metrics),
         graph: state.graph.clone(),
+        rerun: state.rerun.clone(),
     }))
 }
 
@@ -96,6 +97,7 @@ struct DelegateTasksTool {
     model:              Arc<String>,
     metrics:            Arc<GatewayMetrics>,
     graph:              ActorRef<crate::graph::manager::GraphManager>,
+    rerun:              Option<ActorRef<crate::rerun_sink::RerunSink>>,
 }
 
 #[async_trait]
@@ -115,6 +117,7 @@ impl ToolInstance for DelegateTasksTool {
             workspace_root:     Arc::clone(&self.workspace_root),
             metrics:            Arc::clone(&self.metrics),
             graph:              self.graph.clone(),
+            rerun:              self.rerun.clone(),
             depth:              self.depth,
             max_subdelegations: self.max_subdelegations,
         };
