@@ -1,6 +1,7 @@
 // graph_tools module split
 pub mod algorithms;
 pub mod analysis;
+pub mod analysis_cache;
 pub mod commands;
 pub mod common;
 pub mod inspection;

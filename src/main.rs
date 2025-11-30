@@ -2,6 +2,7 @@ use std::{
     convert::Infallible,
     fs,
     path::{Path, PathBuf},
+    process::Command,
     sync::Arc,
     time::Duration,
 };
@@ -21,8 +22,7 @@ use weaver::{
     graph::{
         CurriculumGraph, GraphConfig,
         manager::{
-            ApplyRuntimeConfig, GraphManager, GraphManagerState, PersistSnapshot,
-            RedundantRequires, SaveSnapshot,
+            ApplyRuntimeConfig, GraphManager, GraphManagerState, PersistSnapshot, RedundantRequires,
         },
         persist,
     },
@@ -62,7 +62,6 @@ enum RerunMode {
 struct AutosaveWorker {
     graph:   ActorRef<GraphManager>,
     gateway: Option<ActorRef<LLMGateway>>,
-    path:    PathBuf,
     rerun:   Option<ActorRef<RerunSink>>,
 }
 
@@ -99,22 +98,11 @@ impl Message<AutosaveTick> for AutosaveWorker {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let start = std::time::Instant::now();
-        let persist: Result<(), anyhow::Error> = match self.graph.ask(PersistSnapshot).await {
-            Ok(()) => Ok(()),
-            Err(SendError::HandlerError(e)) => Err(e),
-            Err(e) => Err(anyhow!(e)),
-        };
-        let snapshot: Result<(), anyhow::Error> = match self
-            .graph
-            .ask(SaveSnapshot {
-                path: self.path.clone(),
-            })
-            .await
-        {
-            Ok(()) => Ok(()),
-            Err(SendError::HandlerError(e)) => Err(e),
-            Err(e) => Err(anyhow!(e)),
-        };
+        let persist: Result<(), anyhow::Error> =
+            self.graph.ask(PersistSnapshot).await.map_err(|e| match e {
+                SendError::HandlerError(err) => err,
+                other => anyhow!(other),
+            });
         let gateway_persist: Result<(), anyhow::Error> = if let Some(gateway) = &self.gateway {
             match gateway.ask(PersistGatewaySnapshot).await {
                 Ok(()) => Ok(()),
@@ -124,17 +112,13 @@ impl Message<AutosaveTick> for AutosaveWorker {
         } else {
             Ok(())
         };
-        let ok = persist.is_ok() && snapshot.is_ok() && gateway_persist.is_ok();
+        let ok = persist.is_ok() && gateway_persist.is_ok();
 
         if ok {
-            debug!("graph autosave completed (persistence + legacy snapshot)");
+            debug!("graph autosave completed (persistent state only)");
         } else {
             error!(
                 persist_error = persist
-                    .as_ref()
-                    .err()
-                    .map(|e: &anyhow::Error| e.to_string()),
-                snapshot_error = snapshot
                     .as_ref()
                     .err()
                     .map(|e: &anyhow::Error| e.to_string()),
@@ -216,6 +200,20 @@ fn app_config() -> &'static AppConfig {
     APP_CONFIG.get()
 }
 
+fn git_head_hash() -> Option<String> {
+    Command::new("git")
+        .args(["rev-parse", "--short=12", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|out| {
+            if out.status.success() {
+                Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+            } else {
+                None
+            }
+        })
+}
+
 fn ensure_parent_dir(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -257,7 +255,10 @@ fn cli() -> OptionParser<Cli> {
         .fallback(String::new());
     let graph_strict_quality = long("graph-strict-quality")
         .short('q')
-        .help("Enable strict graph quality checks (promote warnings to errors)")
+        .help(
+            "Enable strict graph quality checks (reachability, coverage/purity, practice, \
+             discourse) by promoting warnings to errors; recommended for CI",
+        )
         .switch();
     let graph_prune_requires_s = long("graph-prune-requires-secs")
         .help("Optional interval (seconds) to prune redundant requires edges; omit to disable")
@@ -287,10 +288,16 @@ async fn main() -> Result<()> {
         workspace,
         graph_snapshot_path,
         graph_autosave_secs,
-        graph_course_commit,
+        mut graph_course_commit,
         graph_strict_quality,
         graph_prune_requires_s,
     } = cli().run();
+
+    if graph_course_commit.is_empty()
+        && let Some(head) = git_head_hash()
+    {
+        graph_course_commit = head;
+    }
 
     let app_cfg = AppConfig {
         rerun_mode,
@@ -315,7 +322,7 @@ async fn main() -> Result<()> {
 
     debug!("FileReader demo starting");
 
-    let graph_config = GraphConfig {
+    let mut graph_config = GraphConfig {
         course_commit:  app_cfg.graph_course_commit.clone(),
         autosave_path:  app_cfg.graph_snapshot_path.clone(),
         autosave_secs:  app_cfg.graph_autosave_secs,
@@ -374,9 +381,15 @@ async fn main() -> Result<()> {
                 match persist::load_graph(&snapshot_path).await {
                     Ok(snapshot) => {
                         debug!(path = %snapshot_path.display(), "loaded legacy graph snapshot");
+                        let course_commit = if graph_config.course_commit.is_empty() {
+                            snapshot.course_commit.clone()
+                        } else {
+                            graph_config.course_commit.clone()
+                        };
+                        graph_config.course_commit = course_commit.clone();
                         GraphManagerState::new(
                             snapshot.graph,
-                            graph_config.course_commit.clone(),
+                            course_commit,
                             graph_config.strict_quality,
                             snapshot.graph_version,
                         )
@@ -454,7 +467,6 @@ async fn main() -> Result<()> {
     let autosave_worker = AutosaveWorker {
         graph:   graph_actor.clone(),
         gateway: Some(gateway.clone()),
-        path:    graph_config.autosave_path.clone(),
         rerun:   rerun_actor.clone(),
     };
     let autosave_ref = AutosaveWorker::spawn(autosave_worker);

@@ -90,10 +90,8 @@ impl EdgeSpec for SupportsSpec {
         if from == to {
             return Err(GraphError::Schema("supports self-loops are not allowed".to_string()));
         }
-        let (from_kt, to_kt) = match (from_kind, to_kind) {
-            (NodeKind::Knowledge(f), NodeKind::Knowledge(t)) => {
-                (f.knowledge_type, t.knowledge_type)
-            }
+        let (from_kn, to_kn) = match (from_kind, to_kind) {
+            (NodeKind::Knowledge(f), NodeKind::Knowledge(t)) => (f, t),
             (NodeKind::Knowledge(f), NodeKind::TeachingStep(_)) => {
                 return Err(GraphError::InvalidEndpoints {
                     edge: Self::NAME,
@@ -109,6 +107,8 @@ impl EdgeSpec for SupportsSpec {
                 });
             }
         };
+        let from_kt = from_kn.knowledge_type;
+        let to_kt = to_kn.knowledge_type;
 
         crate::schema::validate::validate_supports(
             from_kt,
@@ -118,6 +118,18 @@ impl EdgeSpec for SupportsSpec {
             &attrs.evidence_refs,
         )
         .map_err(|e| GraphError::Schema(e.to_string()))?;
+
+        if attrs.case_tag.is_none() {
+            return Err(GraphError::Schema("supports.case_tag is required".to_string()));
+        }
+
+        if matches!(to_kn.intrinsic_load, Some(crate::graph::IntrinsicLoad::High))
+            && attrs.coverage_tags.is_empty()
+        {
+            return Err(GraphError::Schema(
+                "supports into high intrinsic_load targets must include coverage_tags".to_string(),
+            ));
+        }
 
         // Fadeability guard: adding this support must not create new
         // first-principle -> assessment reachability. Simulate the insertion on

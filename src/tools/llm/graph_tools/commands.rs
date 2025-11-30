@@ -257,6 +257,9 @@ pub struct InsertTeachingArgs {
     #[serde(default)]
     #[schemars(description = "Free-form tags to group/filter teaching steps.")]
     pub tags:        Vec<String>,
+    #[serde(default)]
+    #[schemars(description = "Rationale when a step intentionally has no anchors.")]
+    pub rationale:   Option<String>,
 }
 
 pub(super) fn insert_teaching_meta() -> ToolPrototype {
@@ -281,6 +284,7 @@ fn build_insert_teaching(args: &InsertTeachingArgs) -> crate::graph::manager::In
             method_tags: args.method_tags.clone(),
             episode:     args.episode.clone(),
             source_refs: args.source_refs.clone(),
+            rationale:   args.rationale.clone(),
         },
         tags:    args.tags.clone(),
     }

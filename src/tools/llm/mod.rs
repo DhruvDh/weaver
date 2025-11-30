@@ -17,9 +17,9 @@ use thiserror::Error;
 use tracing::warn;
 
 use self::{
-    delegate_tasks::delegate_tasks_meta, list_directory::list_directory_meta,
-    read_file_full::read_file_full_meta, read_file_range::read_file_range_meta,
-    search_text::search_text_meta,
+    delegate_tasks::delegate_tasks_meta, graph_tools::analysis_cache::AnalysisCache,
+    list_directory::list_directory_meta, read_file_full::read_file_full_meta,
+    read_file_range::read_file_range_meta, search_text::search_text_meta,
 };
 use crate::{
     graph::manager::GraphManager,
@@ -32,6 +32,8 @@ mod list_directory;
 mod read_file_full;
 mod read_file_range;
 mod search_text;
+
+pub use graph_tools::analysis_cache;
 
 const MASKED_PATH: &str = "<path-unavailable>";
 
@@ -252,6 +254,7 @@ pub struct CallState {
     pub actor_name:         Arc<String>,
     pub conversation_id:    Arc<String>,
     pub rerun:              Option<ActorRef<crate::rerun_sink::RerunSink>>,
+    pub analysis_cache:     Arc<AnalysisCache>,
 }
 
 pub const fn default_false() -> bool {

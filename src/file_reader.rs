@@ -1,10 +1,7 @@
 use std::{
     env,
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
 };
 
 use anyhow::{Context as _, Result, anyhow};
@@ -15,6 +12,7 @@ use async_openai::types::{
 use futures::{StreamExt, stream};
 use kameo::{prelude::*, reply::DelegatedReply};
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 use crate::{
     constants::{
@@ -22,7 +20,7 @@ use crate::{
         MAX_TOOL_ITERATIONS,
     },
     llm_gateway::{ChatCompletionRequest, GatewayMetrics, LLMGateway},
-    tools::llm::{self, CallState, ToolExecutionError, ToolOutput},
+    tools::llm::{self, CallState, ToolExecutionError, ToolOutput, analysis_cache::AnalysisCache},
 };
 
 const SYSTEM_PROMPT_TEMPLATE: &str = r#"You are Weaver's file-reading assistant assigned to explore the UNCC CS2 PreTeXt project.
@@ -40,9 +38,11 @@ pub struct ExecuteTool {
     pub arguments:  Value,
 }
 
-/// Actor that exposes local filesystem utilities to LLM collaborators.
-static NEXT_FILE_READER_ID: AtomicU64 = AtomicU64::new(1);
+fn make_conversation_id(actor_name: &str) -> String {
+    format!("{actor_name}#{}", Uuid::new_v4())
+}
 
+/// Actor that exposes local filesystem utilities to LLM collaborators.
 #[derive(Actor)]
 pub struct FileReader {
     gateway:            ActorRef<LLMGateway>,
@@ -50,6 +50,7 @@ pub struct FileReader {
     root:               Arc<PathBuf>,
     metrics:            Arc<GatewayMetrics>,
     graph:              ActorRef<crate::graph::manager::GraphManager>,
+    analysis_cache:     Arc<AnalysisCache>,
     rerun:              Option<ActorRef<crate::rerun_sink::RerunSink>>,
     depth:              usize,
     max_subdelegations: usize,
@@ -59,12 +60,13 @@ pub struct FileReader {
 
 #[derive(Clone)]
 struct ReaderDeps {
-    gateway: ActorRef<LLMGateway>,
-    model:   Arc<String>,
-    root:    Arc<PathBuf>,
-    metrics: Arc<GatewayMetrics>,
-    graph:   ActorRef<crate::graph::manager::GraphManager>,
-    rerun:   Option<ActorRef<crate::rerun_sink::RerunSink>>,
+    gateway:        ActorRef<LLMGateway>,
+    model:          Arc<String>,
+    root:           Arc<PathBuf>,
+    metrics:        Arc<GatewayMetrics>,
+    graph:          ActorRef<crate::graph::manager::GraphManager>,
+    analysis_cache: Arc<AnalysisCache>,
+    rerun:          Option<ActorRef<crate::rerun_sink::RerunSink>>,
 }
 
 impl FileReader {
@@ -98,12 +100,15 @@ impl FileReader {
                 format!("failed to canonicalize root {}", root.as_ref().display())
             })?);
 
+        let analysis_cache = Arc::new(AnalysisCache::new());
+
         let deps = ReaderDeps {
             gateway,
             model,
             root,
             metrics,
             graph,
+            analysis_cache,
             rerun,
         };
         Ok(Self::new(deps, 0, max_subdelegations))
@@ -115,14 +120,14 @@ impl FileReader {
         } else {
             format!("FileReader/Delegate{}", depth)
         };
-        let id = NEXT_FILE_READER_ID.fetch_add(1, Ordering::Relaxed);
-        let conversation_id = format!("{}#{}", actor_name, id);
+        let conversation_id = make_conversation_id(&actor_name);
         Self {
             gateway: deps.gateway,
             model: deps.model,
             root: deps.root,
             metrics: deps.metrics,
             graph: deps.graph,
+            analysis_cache: deps.analysis_cache,
             rerun: deps.rerun,
             depth,
             max_subdelegations,
@@ -151,6 +156,7 @@ pub(crate) struct DelegateBatchCtx {
     pub workspace_root:     Arc<PathBuf>,
     pub metrics:            Arc<GatewayMetrics>,
     pub graph:              ActorRef<crate::graph::manager::GraphManager>,
+    pub analysis_cache:     Arc<AnalysisCache>,
     pub rerun:              Option<ActorRef<crate::rerun_sink::RerunSink>>,
     pub depth:              usize,
     pub max_subdelegations: usize,
@@ -176,12 +182,13 @@ pub(crate) async fn run_delegate_batch_with_state(
     let results = stream::iter(tasks.into_iter())
         .map(|task| {
             let deps = ReaderDeps {
-                gateway: ctx.gateway.clone(),
-                model:   Arc::clone(&ctx.model),
-                root:    Arc::clone(&ctx.workspace_root),
-                metrics: Arc::clone(&ctx.metrics),
-                graph:   ctx.graph.clone(),
-                rerun:   ctx.rerun.clone(),
+                gateway:        ctx.gateway.clone(),
+                model:          Arc::clone(&ctx.model),
+                root:           Arc::clone(&ctx.workspace_root),
+                metrics:        Arc::clone(&ctx.metrics),
+                graph:          ctx.graph.clone(),
+                analysis_cache: Arc::clone(&ctx.analysis_cache),
+                rerun:          ctx.rerun.clone(),
             };
             let depth = ctx.depth;
             let max_subdelegations = ctx.max_subdelegations;
@@ -299,10 +306,37 @@ impl Message<ExecuteTool> for FileReader {
             actor_name:         Arc::clone(&self.actor_name),
             conversation_id:    Arc::clone(&self.conversation_id),
             rerun:              self.rerun.clone(),
+            analysis_cache:     Arc::clone(&self.analysis_cache),
         };
 
         let tool = (meta.parse)(arguments, &state).map_err(ToolExecutionError::from)?;
 
         tool.execute().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conversation_ids_use_uuid_v4_and_remain_unique() {
+        let actor_name = "FileReader/Root";
+
+        let first = make_conversation_id(actor_name);
+        let second = make_conversation_id(actor_name);
+
+        assert!(first.starts_with(actor_name));
+        assert!(second.starts_with(actor_name));
+
+        let first_uuid = first.split('#').nth(1).expect("missing uuid segment");
+        let second_uuid = second.split('#').nth(1).expect("missing uuid segment");
+
+        let first_parsed = Uuid::parse_str(first_uuid).expect("invalid uuid format");
+        let second_parsed = Uuid::parse_str(second_uuid).expect("invalid uuid format");
+
+        assert_eq!(first_parsed.get_version_num(), 4);
+        assert_eq!(second_parsed.get_version_num(), 4);
+        assert_ne!(first_parsed, second_parsed);
     }
 }

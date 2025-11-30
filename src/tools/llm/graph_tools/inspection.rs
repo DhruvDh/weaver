@@ -214,6 +214,7 @@ impl ToolInstance for GetNodeTool {
                 "episode": ts.episode,
                 "method_tags": ts.method_tags,
                 "source_refs": ts.source_refs,
+                "rationale": ts.rationale,
                 "tags": payload.tags,
             }),
         };

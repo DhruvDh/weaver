@@ -1,19 +1,22 @@
 use std::sync::Arc;
 
+use anyhow::anyhow;
 use async_trait::async_trait;
 use bon::Builder;
 use kameo::prelude::ActorRef;
 use petgraph::visit::EdgeRef;
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::info;
 
-use super::common::{
-    ensure_knowledge_type, map_send_err_inf, paginate, resolve_slug, resolve_slugs,
+use super::{
+    analysis_cache::{AnalysisCache, AnalysisCacheKey, AnalysisKind},
+    common::{ensure_knowledge_type, map_send_err_inf, paginate, resolve_slug, resolve_slugs},
 };
 use crate::{
     analysis,
+    graph::{CurriculumGraph, NodeId},
     schema::types::KnowledgeType,
     tools::llm::{
         CallState, ToolExecutionError, ToolInputError, ToolInputResult, ToolInstance, ToolOutput,
@@ -27,6 +30,181 @@ use crate::{
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NoArgs {}
+
+async fn load_graph_with_version(
+    graph: &ActorRef<crate::graph::manager::GraphManager>,
+) -> Result<(Arc<CurriculumGraph>, u64), ToolExecutionError> {
+    graph
+        .ask(crate::graph::manager::GetGraphWithVersion)
+        .await
+        .map_err(map_send_err_inf)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedAssessmentReach {
+    assessment_slug:                String,
+    reachable_from_first_principle: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedCoverage {
+    covered:                     Vec<String>,
+    missing:                     Vec<String>,
+    unused_observation_features: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedLoBundle {
+    lo_slug:        String,
+    assessments:    Vec<CachedAssessmentReach>,
+    coverage:       CachedCoverage,
+    target_anchors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedExampleGap {
+    slug:        String,
+    description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedSupportEdge {
+    from: String,
+    to:   String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedFadeabilityIssue {
+    assessment_slug: String,
+    support_edges:   Vec<CachedSupportEdge>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedPracticeGap {
+    slug: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedGapBundle {
+    example_gaps:  Vec<CachedExampleGap>,
+    fadeability:   Vec<CachedFadeabilityIssue>,
+    practice_gaps: Vec<CachedPracticeGap>,
+}
+
+fn decode_cached<T: for<'de> Deserialize<'de>>(value: &Value) -> Result<T, ToolExecutionError> {
+    serde_json::from_value(value.clone())
+        .map_err(|err| ToolExecutionError::Internal(anyhow!("cache decode failed: {err}")))
+}
+
+fn cache_lo_bundle(
+    cache: &AnalysisCache,
+    graph_version: u64,
+    graph: &Arc<CurriculumGraph>,
+    lo: NodeId,
+    lo_slug: &str,
+) -> Arc<super::analysis_cache::AnalysisCacheValue> {
+    let cache_key = AnalysisCacheKey {
+        graph_version,
+        kind: AnalysisKind::LoBundle {
+            lo_slug: lo_slug.to_string(),
+        },
+    };
+
+    cache.get_or_insert_with(cache_key, || {
+        let fps = analysis::first_principles(graph);
+        let reach = analysis::lo_reachability(graph, lo, &fps);
+        let coverage = analysis::coverage_report(graph, lo);
+
+        let assessments = reach
+            .assessments
+            .iter()
+            .map(|a| CachedAssessmentReach {
+                assessment_slug:                graph[a.assessment].slug.clone(),
+                reachable_from_first_principle: a.reachable_from_first_principle,
+            })
+            .collect();
+
+        let target_anchors: Vec<_> = graph
+            .edges_directed(lo, petgraph::Direction::Incoming)
+            .filter_map(|e| match &e.weight().kind {
+                crate::graph::EdgeKind::Anchors(attrs)
+                    if matches!(attrs.impact, crate::graph::AnchorImpact::Target) =>
+                {
+                    Some(graph[e.source()].slug.clone())
+                }
+                _ => None,
+            })
+            .collect();
+
+        let bundle = CachedLoBundle {
+            lo_slug: lo_slug.to_string(),
+            assessments,
+            coverage: CachedCoverage {
+                covered:                     coverage.covered_criteria,
+                missing:                     coverage.missing_criteria,
+                unused_observation_features: coverage.unused_observation_features,
+            },
+            target_anchors,
+        };
+
+        serde_json::to_value(bundle).expect("serialize lo bundle")
+    })
+}
+
+fn cache_gap_bundle(
+    cache: &AnalysisCache,
+    graph_version: u64,
+    graph: &Arc<CurriculumGraph>,
+) -> Arc<super::analysis_cache::AnalysisCacheValue> {
+    let cache_key = AnalysisCacheKey {
+        graph_version,
+        kind: AnalysisKind::GapBundle,
+    };
+
+    cache.get_or_insert_with(cache_key, || {
+        let example_gaps = analysis::example_gaps(graph)
+            .into_iter()
+            .map(|gap| CachedExampleGap {
+                slug:        graph[gap.node].slug.clone(),
+                description: gap.description,
+            })
+            .collect();
+
+        let fadeability = analysis::fadeability_issues(graph)
+            .into_iter()
+            .map(|i| {
+                let supports: Vec<_> = i
+                    .support_edges
+                    .into_iter()
+                    .filter_map(|e| graph.edge_endpoints(e))
+                    .map(|(u, v)| CachedSupportEdge {
+                        from: graph[u].slug.clone(),
+                        to:   graph[v].slug.clone(),
+                    })
+                    .collect();
+                CachedFadeabilityIssue {
+                    assessment_slug: graph[i.assessment].slug.clone(),
+                    support_edges:   supports,
+                }
+            })
+            .collect();
+
+        let practice_gaps = analysis::procedural_practice_gaps(graph)
+            .into_iter()
+            .map(|g| CachedPracticeGap {
+                slug: graph[g.node].slug.clone(),
+            })
+            .collect();
+
+        let bundle = CachedGapBundle {
+            example_gaps,
+            fadeability,
+            practice_gaps,
+        };
+
+        serde_json::to_value(bundle).expect("serialize gap bundle")
+    })
+}
 
 // ---------- DAG check ----------
 
@@ -48,37 +226,42 @@ fn parse_dag_check(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn Too
         message: err.to_string(),
     })?;
     Ok(Box::new(DAGCheckTool {
-        graph: state.graph.clone(),
+        graph:          state.graph.clone(),
+        analysis_cache: Arc::clone(&state.analysis_cache),
     }))
 }
 
 struct DAGCheckTool {
-    graph: ActorRef<crate::graph::manager::GraphManager>,
+    graph:          ActorRef<crate::graph::manager::GraphManager>,
+    analysis_cache: Arc<AnalysisCache>,
 }
 
 #[async_trait]
 impl ToolInstance for DAGCheckTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let graph = self
-            .graph
-            .ask(crate::graph::manager::GetGraph)
-            .await
-            .map_err(map_send_err_inf)?;
-        let dag = analysis::requires_is_dag(&graph);
-        let topo = analysis::requires_toposort(&graph).ok();
-        let payload = json!({
-            "type": "graph_analysis",
-            "tool": DAG_CHECK,
-            "is_dag": dag,
-            "topo_order_count": topo.as_ref().map(|v| v.len()),
+        let (graph, graph_version) = load_graph_with_version(&self.graph).await?;
+
+        let cache_key = AnalysisCacheKey {
+            graph_version,
+            kind: AnalysisKind::DagCheck,
+        };
+
+        let cached = self.analysis_cache.get_or_insert_with(cache_key, || {
+            let dag = analysis::requires_is_dag(&graph);
+            let topo = analysis::requires_toposort(&graph).ok();
+            json!({
+                "type": "graph_analysis",
+                "tool": DAG_CHECK,
+                "is_dag": dag,
+                "topo_order_count": topo.as_ref().map(|v| v.len()),
+            })
         });
+
+        let payload = cached.payload.clone();
         info!(
             tool = DAG_CHECK,
-            is_dag = dag,
-            topo_order_count = payload["topo_order_count"]
-                .as_u64()
-                .map(|v| v as usize)
-                .unwrap_or(0),
+            is_dag = payload["is_dag"].as_bool().unwrap_or(false),
+            topo_order_count = payload["topo_order_count"].as_u64(),
             "graph requires dag check"
         );
         Ok(ToolOutput::with_byte_hint(payload.clone(), payload_size_bytes(&payload)))
@@ -435,6 +618,7 @@ fn parse_lo_reach(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn Tool
     Ok(Box::new(LoReachTool {
         args,
         graph: state.graph.clone(),
+        analysis_cache: Arc::clone(&state.analysis_cache),
     }))
 }
 
@@ -451,6 +635,7 @@ fn parse_lo_alignment(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn 
         metrics: Arc::clone(&state.metrics),
         model: Arc::clone(&state.model),
         conversation_id: Arc::clone(&state.conversation_id),
+        analysis_cache: Arc::clone(&state.analysis_cache),
     }))
 }
 
@@ -464,23 +649,21 @@ fn parse_lo_coverage(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn T
     Ok(Box::new(LoCoverageTool {
         args,
         graph: state.graph.clone(),
+        analysis_cache: Arc::clone(&state.analysis_cache),
     }))
 }
 
 struct LoReachTool {
-    args:  LoReachArgs,
-    graph: ActorRef<crate::graph::manager::GraphManager>,
+    args:           LoReachArgs,
+    graph:          ActorRef<crate::graph::manager::GraphManager>,
+    analysis_cache: Arc<AnalysisCache>,
 }
 
 #[async_trait]
 impl ToolInstance for LoReachTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
         let lo = resolve_slug(&self.graph, self.args.lo_slug.clone(), LO_REACH).await?;
-        let graph = self
-            .graph
-            .ask(crate::graph::manager::GetGraph)
-            .await
-            .map_err(map_send_err_inf)?;
+        let (graph, graph_version) = load_graph_with_version(&self.graph).await?;
         ensure_knowledge_type(
             &graph,
             lo,
@@ -488,14 +671,17 @@ impl ToolInstance for LoReachTool {
             KnowledgeType::LearningOutcome,
             LO_REACH,
         )?;
-        let fps = analysis::first_principles(&graph);
-        let report = analysis::lo_reachability(&graph, lo, &fps);
-        let assessments = report
+
+        let cached =
+            cache_lo_bundle(&self.analysis_cache, graph_version, &graph, lo, &self.args.lo_slug);
+        let bundle: CachedLoBundle = decode_cached(&cached.payload)?;
+
+        let assessments = bundle
             .assessments
             .into_iter()
             .map(|a| {
                 json!({
-                    "assessment_slug": graph[a.assessment].slug,
+                    "assessment_slug": a.assessment_slug,
                     "reachable_from_first_principle": a.reachable_from_first_principle,
                 })
             })
@@ -512,19 +698,16 @@ impl ToolInstance for LoReachTool {
 }
 
 struct LoCoverageTool {
-    args:  LoReachArgs,
-    graph: ActorRef<crate::graph::manager::GraphManager>,
+    args:           LoReachArgs,
+    graph:          ActorRef<crate::graph::manager::GraphManager>,
+    analysis_cache: Arc<AnalysisCache>,
 }
 
 #[async_trait]
 impl ToolInstance for LoCoverageTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
         let lo = resolve_slug(&self.graph, self.args.lo_slug.clone(), COVERAGE).await?;
-        let graph = self
-            .graph
-            .ask(crate::graph::manager::GetGraph)
-            .await
-            .map_err(map_send_err_inf)?;
+        let (graph, graph_version) = load_graph_with_version(&self.graph).await?;
         ensure_knowledge_type(
             &graph,
             lo,
@@ -532,14 +715,18 @@ impl ToolInstance for LoCoverageTool {
             KnowledgeType::LearningOutcome,
             COVERAGE,
         )?;
-        let report = analysis::coverage_report(&graph, lo);
+
+        let cached =
+            cache_lo_bundle(&self.analysis_cache, graph_version, &graph, lo, &self.args.lo_slug);
+        let bundle: CachedLoBundle = decode_cached(&cached.payload)?;
+
         let payload = json!({
             "type": "graph_analysis",
             "tool": COVERAGE,
             "lo_slug": self.args.lo_slug,
-            "covered": report.covered_criteria,
-            "missing": report.missing_criteria,
-            "unused_observation_features": report.unused_observation_features,
+            "covered": bundle.coverage.covered,
+            "missing": bundle.coverage.missing,
+            "unused_observation_features": bundle.coverage.unused_observation_features,
         });
         info!(tool = COVERAGE, lo_slug = %self.args.lo_slug, "graph lo coverage");
         Ok(ToolOutput::with_byte_hint(payload.clone(), payload_size_bytes(&payload)))
@@ -552,17 +739,15 @@ struct LoAlignmentTool {
     metrics:         Arc<crate::llm_gateway::GatewayMetrics>,
     model:           Arc<String>,
     conversation_id: Arc<String>,
+    analysis_cache:  Arc<AnalysisCache>,
 }
 
 #[async_trait]
 impl ToolInstance for LoAlignmentTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
         let lo = resolve_slug(&self.graph, self.args.lo_slug.clone(), LO_ALIGNMENT).await?;
-        let graph = self
-            .graph
-            .ask(crate::graph::manager::GetGraph)
-            .await
-            .map_err(map_send_err_inf)?;
+
+        let (graph, graph_version) = load_graph_with_version(&self.graph).await?;
         ensure_knowledge_type(
             &graph,
             lo,
@@ -571,31 +756,21 @@ impl ToolInstance for LoAlignmentTool {
             LO_ALIGNMENT,
         )?;
 
-        let fps = analysis::first_principles(&graph);
-        let reach = analysis::lo_reachability(&graph, lo, &fps);
-        let coverage = analysis::coverage_report(&graph, lo);
+        let cached =
+            cache_lo_bundle(&self.analysis_cache, graph_version, &graph, lo, &self.args.lo_slug);
+        let bundle: CachedLoBundle = decode_cached(&cached.payload)?;
 
-        let mut reachable = Vec::new();
-        let mut unreachable = Vec::new();
-        for a in &reach.assessments {
-            let slug = graph[a.assessment].slug.clone();
-            if a.reachable_from_first_principle {
-                reachable.push(slug);
-            } else {
-                unreachable.push(slug);
-            }
-        }
-
-        let target_anchors: Vec<_> = graph
-            .edges_directed(lo, petgraph::Direction::Incoming)
-            .filter_map(|e| match &e.weight().kind {
-                crate::graph::EdgeKind::Anchors(attrs)
-                    if matches!(attrs.impact, crate::graph::AnchorImpact::Target) =>
-                {
-                    Some(graph[e.source()].slug.clone())
-                }
-                _ => None,
-            })
+        let reachable: Vec<_> = bundle
+            .assessments
+            .iter()
+            .filter(|a| a.reachable_from_first_principle)
+            .map(|a| a.assessment_slug.clone())
+            .collect();
+        let unreachable: Vec<_> = bundle
+            .assessments
+            .iter()
+            .filter(|a| !a.reachable_from_first_principle)
+            .map(|a| a.assessment_slug.clone())
             .collect();
 
         let sample = |list: &Vec<String>| list.iter().take(3).cloned().collect::<Vec<_>>();
@@ -605,23 +780,23 @@ impl ToolInstance for LoAlignmentTool {
             "tool": LO_ALIGNMENT,
             "lo_slug": self.args.lo_slug,
             "assessments": {
-                "total": reach.assessments.len(),
+                "total": bundle.assessments.len(),
                 "reachable": reachable.len(),
                 "unreachable": unreachable.len(),
                 "sample_reachable": sample(&reachable),
                 "sample_unreachable": sample(&unreachable),
             },
             "coverage": {
-                "total_criteria": coverage.covered_criteria.len() + coverage.missing_criteria.len(),
-                "covered": coverage.covered_criteria.len(),
-                "missing": coverage.missing_criteria.len(),
-                "missing_sample": sample(&coverage.missing_criteria),
-                "unused_observation_features": coverage.unused_observation_features.len(),
-                "unused_sample": sample(&coverage.unused_observation_features),
+                "total_criteria": bundle.coverage.covered.len() + bundle.coverage.missing.len(),
+                "covered": bundle.coverage.covered.len(),
+                "missing": bundle.coverage.missing.len(),
+                "missing_sample": sample(&bundle.coverage.missing),
+                "unused_observation_features": bundle.coverage.unused_observation_features.len(),
+                "unused_sample": sample(&bundle.coverage.unused_observation_features),
             },
             "target_anchors": {
-                "total": target_anchors.len(),
-                "sample": sample(&target_anchors),
+                "total": bundle.target_anchors.len(),
+                "sample": sample(&bundle.target_anchors),
             }
         });
 
@@ -674,6 +849,7 @@ fn parse_lo_assessments_view(
     Ok(Box::new(LoAssessmentsViewTool {
         args,
         graph: state.graph.clone(),
+        analysis_cache: Arc::clone(&state.analysis_cache),
     }))
 }
 
@@ -690,6 +866,7 @@ fn parse_lo_missing_criteria_view(
     Ok(Box::new(LoMissingCriteriaViewTool {
         args,
         graph: state.graph.clone(),
+        analysis_cache: Arc::clone(&state.analysis_cache),
     }))
 }
 
@@ -707,19 +884,16 @@ fn parse_lo_anchors_view(raw: Value, state: &CallState) -> ToolInputResult<Box<d
 }
 
 struct LoAssessmentsViewTool {
-    args:  LoAssessmentsViewArgs,
-    graph: ActorRef<crate::graph::manager::GraphManager>,
+    args:           LoAssessmentsViewArgs,
+    graph:          ActorRef<crate::graph::manager::GraphManager>,
+    analysis_cache: Arc<AnalysisCache>,
 }
 
 #[async_trait]
 impl ToolInstance for LoAssessmentsViewTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
         let lo = resolve_slug(&self.graph, self.args.lo_slug.clone(), LO_ASSESSMENTS_VIEW).await?;
-        let graph = self
-            .graph
-            .ask(crate::graph::manager::GetGraph)
-            .await
-            .map_err(map_send_err_inf)?;
+        let (graph, graph_version) = load_graph_with_version(&self.graph).await?;
         ensure_knowledge_type(
             &graph,
             lo,
@@ -728,10 +902,11 @@ impl ToolInstance for LoAssessmentsViewTool {
             LO_ASSESSMENTS_VIEW,
         )?;
 
-        let fps = analysis::first_principles(&graph);
-        let report = analysis::lo_reachability(&graph, lo, &fps);
+        let cached =
+            cache_lo_bundle(&self.analysis_cache, graph_version, &graph, lo, &self.args.lo_slug);
+        let bundle: CachedLoBundle = decode_cached(&cached.payload)?;
 
-        let items: Vec<_> = report
+        let items: Vec<_> = bundle
             .assessments
             .into_iter()
             .filter_map(|a| {
@@ -741,7 +916,7 @@ impl ToolInstance for LoAssessmentsViewTool {
                     return None;
                 }
                 Some(json!({
-                    "assessment_slug": graph[a.assessment].slug.clone(),
+                    "assessment_slug": a.assessment_slug,
                     "reachable_from_first_principle": a.reachable_from_first_principle,
                 }))
             })
@@ -773,8 +948,9 @@ impl ToolInstance for LoAssessmentsViewTool {
 }
 
 struct LoMissingCriteriaViewTool {
-    args:  LoMissingCriteriaViewArgs,
-    graph: ActorRef<crate::graph::manager::GraphManager>,
+    args:           LoMissingCriteriaViewArgs,
+    graph:          ActorRef<crate::graph::manager::GraphManager>,
+    analysis_cache: Arc<AnalysisCache>,
 }
 
 #[async_trait]
@@ -782,11 +958,7 @@ impl ToolInstance for LoMissingCriteriaViewTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
         let lo =
             resolve_slug(&self.graph, self.args.lo_slug.clone(), LO_MISSING_CRITERIA_VIEW).await?;
-        let graph = self
-            .graph
-            .ask(crate::graph::manager::GetGraph)
-            .await
-            .map_err(map_send_err_inf)?;
+        let (graph, graph_version) = load_graph_with_version(&self.graph).await?;
         ensure_knowledge_type(
             &graph,
             lo,
@@ -795,8 +967,10 @@ impl ToolInstance for LoMissingCriteriaViewTool {
             LO_MISSING_CRITERIA_VIEW,
         )?;
 
-        let coverage = analysis::coverage_report(&graph, lo);
-        let missing = coverage.missing_criteria;
+        let cached =
+            cache_lo_bundle(&self.analysis_cache, graph_version, &graph, lo, &self.args.lo_slug);
+        let bundle: CachedLoBundle = decode_cached(&cached.payload)?;
+        let missing = bundle.coverage.missing;
 
         let (missing, offset, limit, has_more) =
             paginate(missing, self.args.limit, self.args.offset);
@@ -962,6 +1136,7 @@ fn parse_gap_summary(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn T
         metrics: Arc::clone(&state.metrics),
         model: Arc::clone(&state.model),
         conversation_id: Arc::clone(&state.conversation_id),
+        analysis_cache: Arc::clone(&state.analysis_cache),
     }))
 }
 
@@ -977,6 +1152,7 @@ fn parse_example_gaps_view(
     Ok(Box::new(ExampleGapsViewTool {
         args,
         graph: state.graph.clone(),
+        analysis_cache: Arc::clone(&state.analysis_cache),
     }))
 }
 
@@ -989,6 +1165,7 @@ fn parse_fadeability_view(raw: Value, state: &CallState) -> ToolInputResult<Box<
     Ok(Box::new(FadeabilityViewTool {
         args,
         graph: state.graph.clone(),
+        analysis_cache: Arc::clone(&state.analysis_cache),
     }))
 }
 
@@ -1004,6 +1181,7 @@ fn parse_practice_gaps_view(
     Ok(Box::new(PracticeGapsViewTool {
         args,
         graph: state.graph.clone(),
+        analysis_cache: Arc::clone(&state.analysis_cache),
     }))
 }
 
@@ -1013,33 +1191,29 @@ struct GapSummaryTool {
     metrics:         Arc<crate::llm_gateway::GatewayMetrics>,
     model:           Arc<String>,
     conversation_id: Arc<String>,
+    analysis_cache:  Arc<AnalysisCache>,
 }
 
 #[async_trait]
 impl ToolInstance for GapSummaryTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let graph = self
-            .graph
-            .ask(crate::graph::manager::GetGraph)
-            .await
-            .map_err(map_send_err_inf)?;
+        let (graph, graph_version) = load_graph_with_version(&self.graph).await?;
 
-        let example = analysis::example_gaps(&graph);
-        let fade = analysis::fadeability_issues(&graph);
-        let practice = analysis::procedural_practice_gaps(&graph);
+        let cached = cache_gap_bundle(&self.analysis_cache, graph_version, &graph);
+        let bundle: CachedGapBundle = decode_cached(&cached.payload)?;
 
         let payload = json!({
             "type": "graph_analysis",
             "tool": GAP_SUMMARY,
             "summary": {
                 "example_gaps": {
-                    "count": example.len(),
+                    "count": bundle.example_gaps.len(),
                 },
                 "fadeability": {
-                    "assessments_with_issues": fade.len(),
+                    "assessments_with_issues": bundle.fadeability.len(),
                 },
                 "practice_gaps": {
-                    "count": practice.len(),
+                    "count": bundle.practice_gaps.len(),
                 },
             }
         });
@@ -1075,26 +1249,22 @@ impl ToolInstance for GapSummaryTool {
 }
 
 struct ExampleGapsViewTool {
-    args:  GapViewArgs,
-    graph: ActorRef<crate::graph::manager::GraphManager>,
+    args:           GapViewArgs,
+    graph:          ActorRef<crate::graph::manager::GraphManager>,
+    analysis_cache: Arc<AnalysisCache>,
 }
 
 #[async_trait]
 impl ToolInstance for ExampleGapsViewTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let graph = self
-            .graph
-            .ask(crate::graph::manager::GetGraph)
-            .await
-            .map_err(map_send_err_inf)?;
-        let gaps = analysis::example_gaps(&graph)
+        let (graph, graph_version) = load_graph_with_version(&self.graph).await?;
+
+        let cached = cache_gap_bundle(&self.analysis_cache, graph_version, &graph);
+        let bundle: CachedGapBundle = decode_cached(&cached.payload)?;
+        let gaps = bundle
+            .example_gaps
             .into_iter()
-            .map(|gap| {
-                json!({
-                    "slug": graph[gap.node].slug.clone(),
-                    "description": gap.description,
-                })
-            })
+            .map(|gap| json!({ "slug": gap.slug, "description": gap.description }))
             .collect::<Vec<_>>();
 
         let (gaps, offset, limit, has_more) = paginate(gaps, self.args.limit, self.args.offset);
@@ -1115,34 +1285,29 @@ impl ToolInstance for ExampleGapsViewTool {
 }
 
 struct FadeabilityViewTool {
-    args:  GapViewArgs,
-    graph: ActorRef<crate::graph::manager::GraphManager>,
+    args:           GapViewArgs,
+    graph:          ActorRef<crate::graph::manager::GraphManager>,
+    analysis_cache: Arc<AnalysisCache>,
 }
 
 #[async_trait]
 impl ToolInstance for FadeabilityViewTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let graph = self
-            .graph
-            .ask(crate::graph::manager::GetGraph)
-            .await
-            .map_err(map_send_err_inf)?;
-        let issues = analysis::fadeability_issues(&graph)
+        let (graph, graph_version) = load_graph_with_version(&self.graph).await?;
+
+        let cached = cache_gap_bundle(&self.analysis_cache, graph_version, &graph);
+        let bundle: CachedGapBundle = decode_cached(&cached.payload)?;
+        let issues = bundle
+            .fadeability
             .into_iter()
             .map(|i| {
                 let supports: Vec<_> = i
                     .support_edges
                     .into_iter()
-                    .filter_map(|e| graph.edge_endpoints(e))
-                    .map(|(u, v)| {
-                        json!({
-                            "from": graph[u].slug.clone(),
-                            "to": graph[v].slug.clone(),
-                        })
-                    })
+                    .map(|e| json!({ "from": e.from, "to": e.to }))
                     .collect();
                 json!({
-                    "assessment_slug": graph[i.assessment].slug.clone(),
+                    "assessment_slug": i.assessment_slug,
                     "support_edges": supports,
                 })
             })
@@ -1166,21 +1331,22 @@ impl ToolInstance for FadeabilityViewTool {
 }
 
 struct PracticeGapsViewTool {
-    args:  GapViewArgs,
-    graph: ActorRef<crate::graph::manager::GraphManager>,
+    args:           GapViewArgs,
+    graph:          ActorRef<crate::graph::manager::GraphManager>,
+    analysis_cache: Arc<AnalysisCache>,
 }
 
 #[async_trait]
 impl ToolInstance for PracticeGapsViewTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let graph = self
-            .graph
-            .ask(crate::graph::manager::GetGraph)
-            .await
-            .map_err(map_send_err_inf)?;
-        let gaps = analysis::procedural_practice_gaps(&graph)
+        let (graph, graph_version) = load_graph_with_version(&self.graph).await?;
+
+        let cached = cache_gap_bundle(&self.analysis_cache, graph_version, &graph);
+        let bundle: CachedGapBundle = decode_cached(&cached.payload)?;
+        let gaps = bundle
+            .practice_gaps
             .into_iter()
-            .map(|g| json!({ "slug": graph[g.node].slug.clone() }))
+            .map(|g| json!({ "slug": g.slug }))
             .collect::<Vec<_>>();
 
         let (gaps, offset, limit, has_more) = paginate(gaps, self.args.limit, self.args.offset);
@@ -1197,6 +1363,111 @@ impl ToolInstance for PracticeGapsViewTool {
         info!(tool = PRACTICE_GAPS_VIEW, offset, limit, has_more, "graph practice gaps view");
 
         Ok(ToolOutput::with_byte_hint(payload.clone(), payload_size_bytes(&payload)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        graph::{GraphService, KnowledgeNode, NodeId},
+        schema::types::{AssessmentScope, EvidenceLink, KnowledgeType, SourceRef},
+    };
+
+    fn mk_source_ref() -> SourceRef {
+        SourceRef {
+            path:       "dummy".into(),
+            start_line: 1,
+            end_line:   2,
+            revision:   "deadbeef".into(),
+        }
+    }
+
+    fn mk_lo_node() -> KnowledgeNode {
+        KnowledgeNode {
+            title: "lo".into(),
+            statement: "lo".into(),
+            knowledge_type: KnowledgeType::LearningOutcome,
+            source_refs: vec![mk_source_ref()],
+            confidence: 1.0,
+            rubric_criteria: vec!["crit1".into()],
+            construct_irrelevant_demands: vec![],
+            grain_level: None,
+            intrinsic_load: None,
+            introduction_scope: crate::graph::IntroductionScope::InCourse,
+        }
+    }
+
+    fn mk_assessment_node() -> KnowledgeNode {
+        KnowledgeNode {
+            title: "a1".into(),
+            statement: "a1".into(),
+            knowledge_type: KnowledgeType::AssessmentItem,
+            source_refs: vec![mk_source_ref()],
+            confidence: 1.0,
+            rubric_criteria: vec![],
+            construct_irrelevant_demands: vec![],
+            grain_level: None,
+            intrinsic_load: None,
+            introduction_scope: crate::graph::IntroductionScope::InCourse,
+        }
+    }
+
+    fn build_minimal_graph() -> (Arc<CurriculumGraph>, u64, NodeId) {
+        let mut svc = GraphService::new();
+        let lo = svc
+            .add_knowledge_node("lo".into(), mk_lo_node(), vec![])
+            .unwrap();
+        let assess = svc
+            .add_knowledge_node("a1".into(), mk_assessment_node(), vec![])
+            .unwrap();
+        svc.add_edge::<crate::graph::AssessesSpec>(
+            assess,
+            lo,
+            crate::graph::AssessesAttrs {
+                evidence_link: EvidenceLink {
+                    claim:                "lo".into(),
+                    observation_features: vec!["crit1".into()],
+                    scope:                AssessmentScope::Target,
+                },
+            },
+            1.0,
+        )
+        .unwrap();
+
+        let version = svc.graph_version();
+        (svc.shared_graph(), version, lo)
+    }
+
+    #[test]
+    fn lo_bundle_cache_reused_across_calls() {
+        let cache = AnalysisCache::new();
+        let (graph, version, lo) = build_minimal_graph();
+
+        let first = cache_lo_bundle(&cache, version, &graph, lo, "lo");
+        let second = cache_lo_bundle(&cache, version, &graph, lo, "lo");
+
+        assert!(Arc::ptr_eq(&first, &second));
+
+        let bundle: CachedLoBundle = decode_cached(&first.payload).unwrap();
+        assert_eq!(bundle.assessments.len(), 1);
+        assert_eq!(bundle.coverage.covered.len(), 1);
+    }
+
+    #[test]
+    fn gap_bundle_cache_reused_across_calls() {
+        let cache = AnalysisCache::new();
+        let (graph, version, _) = build_minimal_graph();
+
+        let first = cache_gap_bundle(&cache, version, &graph);
+        let second = cache_gap_bundle(&cache, version, &graph);
+
+        assert!(Arc::ptr_eq(&first, &second));
+
+        let bundle: CachedGapBundle = decode_cached(&first.payload).unwrap();
+        if let Some(first_gap) = bundle.example_gaps.first() {
+            assert!(!first_gap.slug.is_empty());
+        }
     }
 }
 
@@ -1222,43 +1493,51 @@ fn parse_keystone(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn Tool
         message: err.to_string(),
     })?;
     Ok(Box::new(KeystoneTool {
-        graph: state.graph.clone(),
+        graph:          state.graph.clone(),
+        analysis_cache: Arc::clone(&state.analysis_cache),
     }))
 }
 
 struct KeystoneTool {
-    graph: ActorRef<crate::graph::manager::GraphManager>,
+    graph:          ActorRef<crate::graph::manager::GraphManager>,
+    analysis_cache: Arc<AnalysisCache>,
 }
 
 #[async_trait]
 impl ToolInstance for KeystoneTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let graph = self
-            .graph
-            .ask(crate::graph::manager::GetGraph)
-            .await
-            .map_err(map_send_err_inf)?;
-        let scores = analysis::keystone_scores(&graph);
-        let top_n = 20usize;
-        let rendered: Vec<_> = scores
-            .into_iter()
-            .take(top_n)
-            .map(|score| {
-                json!({
-                    "slug": graph[score.node].slug,
-                    "score": score.score,
-                    "in_reach": score.in_reach,
-                    "out_reach": score.out_reach,
-                })
-            })
-            .collect();
+        let (graph, graph_version) = load_graph_with_version(&self.graph).await?;
 
-        let payload = json!({
-            "type": "graph_analysis",
-            "tool": KEYSTONE,
-            "total_ranked": rendered.len(),
-            "scores": rendered,
+        let cache_key = AnalysisCacheKey {
+            graph_version,
+            kind: AnalysisKind::Keystone,
+        };
+
+        let cached = self.analysis_cache.get_or_insert_with(cache_key, || {
+            let scores = analysis::keystone_scores(&graph);
+            let top_n = 20usize;
+            let rendered: Vec<_> = scores
+                .into_iter()
+                .take(top_n)
+                .map(|score| {
+                    json!({
+                        "slug": graph[score.node].slug,
+                        "score": score.score,
+                        "in_reach": score.in_reach,
+                        "out_reach": score.out_reach,
+                    })
+                })
+                .collect();
+
+            json!({
+                "type": "graph_analysis",
+                "tool": KEYSTONE,
+                "total_ranked": rendered.len(),
+                "scores": rendered,
+            })
         });
+
+        let payload = cached.payload.clone();
 
         info!(
             tool = KEYSTONE,
@@ -1416,6 +1695,7 @@ fn parse_alignment_gaps(raw: Value, state: &CallState) -> ToolInputResult<Box<dy
         metrics: Arc::clone(&state.metrics),
         model: Arc::clone(&state.model),
         conversation_id: Arc::clone(&state.conversation_id),
+        analysis_cache: Arc::clone(&state.analysis_cache),
     }))
 }
 
@@ -1425,26 +1705,33 @@ struct AlignmentGapsTool {
     metrics:         Arc<crate::llm_gateway::GatewayMetrics>,
     model:           Arc<String>,
     conversation_id: Arc<String>,
+    analysis_cache:  Arc<AnalysisCache>,
 }
 
 #[async_trait]
 impl ToolInstance for AlignmentGapsTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let graph = self
-            .graph
-            .ask(crate::graph::manager::GetGraph)
-            .await
-            .map_err(map_send_err_inf)?;
-        let los = analysis::lo_missing_target_assessments(&graph);
-        let orphan = analysis::orphan_assessments(&graph);
-        let unreachable = analysis::unreachable_assessments(&graph);
-        let payload = json!({
-            "type": "graph_analysis",
-            "tool": ALIGNMENT_GAPS,
-            "los_missing_target_assessment": los.into_iter().map(|n| graph[n].slug.clone()).collect::<Vec<_>>(),
-            "assessments_without_lo": orphan.into_iter().map(|n| graph[n].slug.clone()).collect::<Vec<_>>(),
-            "assessments_unreachable": unreachable.into_iter().map(|n| graph[n].slug.clone()).collect::<Vec<_>>(),
+        let (graph, graph_version) = load_graph_with_version(&self.graph).await?;
+
+        let cache_key = AnalysisCacheKey {
+            graph_version,
+            kind: AnalysisKind::AssessmentGaps,
+        };
+
+        let cached = self.analysis_cache.get_or_insert_with(cache_key, || {
+            let los = analysis::lo_missing_target_assessments(&graph);
+            let orphan = analysis::orphan_assessments(&graph);
+            let unreachable = analysis::unreachable_assessments(&graph);
+            json!({
+                "type": "graph_analysis",
+                "tool": ALIGNMENT_GAPS,
+                "los_missing_target_assessment": los.into_iter().map(|n| graph[n].slug.clone()).collect::<Vec<_>>(),
+                "assessments_without_lo": orphan.into_iter().map(|n| graph[n].slug.clone()).collect::<Vec<_>>(),
+                "assessments_unreachable": unreachable.into_iter().map(|n| graph[n].slug.clone()).collect::<Vec<_>>(),
+            })
         });
+
+        let payload = cached.payload.clone();
         let approx_bytes = payload_size_bytes(&payload);
         let estimates = prepare_payload_estimates(&self.metrics, self.model.as_str(), approx_bytes);
         let mode = ToolPayloadMode::from_fetch_flag(self.args.fetch_body);
@@ -1514,30 +1801,39 @@ fn parse_discourse_orphans(
     Ok(Box::new(DiscourseOrphansTool {
         args,
         graph: state.graph.clone(),
+        analysis_cache: Arc::clone(&state.analysis_cache),
     }))
 }
 
 struct DiscourseOrphansTool {
-    args:  DiscourseOrphansArgs,
-    graph: ActorRef<crate::graph::manager::GraphManager>,
+    args:           DiscourseOrphansArgs,
+    graph:          ActorRef<crate::graph::manager::GraphManager>,
+    analysis_cache: Arc<AnalysisCache>,
 }
 
 #[async_trait]
 impl ToolInstance for DiscourseOrphansTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let graph = self
-            .graph
-            .ask(crate::graph::manager::GetGraph)
-            .await
-            .map_err(map_send_err_inf)?;
-        let list = analysis::discourse_orphans(&graph, self.args.episode.as_deref());
-        let slugs: Vec<_> = list.into_iter().map(|n| graph[n].slug.clone()).collect();
-        let payload = json!({
-            "type": "graph_analysis",
-            "tool": DISCOURSE_ORPHANS,
-            "episode": self.args.episode,
-            "orphans": slugs,
+        let (graph, graph_version) = load_graph_with_version(&self.graph).await?;
+
+        let cache_key = AnalysisCacheKey {
+            graph_version,
+            kind: AnalysisKind::DiscourseOrphans {
+                episode: self.args.episode.clone(),
+            },
+        };
+
+        let cached = self.analysis_cache.get_or_insert_with(cache_key, || {
+            let list = analysis::discourse_orphans(&graph, self.args.episode.as_deref());
+            let slugs: Vec<_> = list.into_iter().map(|n| graph[n].slug.clone()).collect();
+            json!({
+                "type": "graph_analysis",
+                "tool": DISCOURSE_ORPHANS,
+                "episode": self.args.episode,
+                "orphans": slugs,
+            })
         });
+        let payload = cached.payload.clone();
         info!(
             tool = DISCOURSE_ORPHANS,
             episode = ?self.args.episode,
@@ -1576,39 +1872,48 @@ fn parse_borrow_ahead(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn 
     Ok(Box::new(BorrowAheadTool {
         args,
         graph: state.graph.clone(),
+        analysis_cache: Arc::clone(&state.analysis_cache),
     }))
 }
 
 struct BorrowAheadTool {
-    args:  BorrowAheadArgs,
-    graph: ActorRef<crate::graph::manager::GraphManager>,
+    args:           BorrowAheadArgs,
+    graph:          ActorRef<crate::graph::manager::GraphManager>,
+    analysis_cache: Arc<AnalysisCache>,
 }
 
 #[async_trait]
 impl ToolInstance for BorrowAheadTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let graph = self
-            .graph
-            .ask(crate::graph::manager::GetGraph)
-            .await
-            .map_err(map_send_err_inf)?;
-        let results = analysis::borrow_ahead(&graph, &self.args.episode);
-        let rendered: Vec<_> = results
-            .into_iter()
-            .map(|b| {
-                json!({
-                    "step_slug": graph[b.step].slug,
-                    "target_slug": graph[b.target].slug,
-                    "severity": b.severity,
+        let (graph, graph_version) = load_graph_with_version(&self.graph).await?;
+
+        let cache_key = AnalysisCacheKey {
+            graph_version,
+            kind: AnalysisKind::BorrowAhead {
+                episode: self.args.episode.clone(),
+            },
+        };
+
+        let cached = self.analysis_cache.get_or_insert_with(cache_key, || {
+            let results = analysis::borrow_ahead(&graph, &self.args.episode);
+            let rendered: Vec<_> = results
+                .into_iter()
+                .map(|b| {
+                    json!({
+                        "step_slug": graph[b.step].slug,
+                        "target_slug": graph[b.target].slug,
+                        "severity": b.severity,
+                    })
                 })
+                .collect();
+            json!({
+                "type": "graph_analysis",
+                "tool": BORROW_AHEAD,
+                "episode": self.args.episode,
+                "borrow_ahead": rendered,
             })
-            .collect();
-        let payload = json!({
-            "type": "graph_analysis",
-            "tool": BORROW_AHEAD,
-            "episode": self.args.episode,
-            "borrow_ahead": rendered,
         });
+        let payload = cached.payload.clone();
         info!(
             tool = BORROW_AHEAD,
             episode = %self.args.episode,

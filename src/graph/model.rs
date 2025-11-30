@@ -67,6 +67,8 @@ pub struct TeachingStepNode {
     pub method_tags: Vec<String>,
     pub episode:     String,
     pub source_refs: Vec<SourceRef>,
+    #[serde(default)]
+    pub rationale:   Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

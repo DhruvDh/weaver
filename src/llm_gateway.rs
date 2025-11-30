@@ -21,6 +21,7 @@ use async_openai::{
         CreateChatCompletionRequest, CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
     },
 };
+use dashmap::DashMap;
 use kameo::{error::SendError, prelude::*, reply::DelegatedReply};
 use kameo_persistence::{BiHashMap, PersistentActor};
 use once_cell::sync::Lazy;
@@ -141,10 +142,10 @@ pub struct GatewayMetrics {
     last_latency_ms:            AtomicU64,
     last_prompt_tokens:         AtomicU64,
     last_completion_tokens:     AtomicU64,
-    estimators:                 RwLock<HashMap<String, TokenEstimator>>,
-    conversation_stats:         RwLock<HashMap<String, ConversationAccumulator>>,
-    conversation_prompt_tokens: RwLock<HashMap<String, u64>>,
-    context_limits:             RwLock<HashMap<String, u32>>,
+    estimators:                 DashMap<String, TokenEstimator>,
+    conversation_stats:         DashMap<String, ConversationAccumulator>,
+    conversation_prompt_tokens: DashMap<String, u64>,
+    context_limits:             DashMap<String, u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -191,20 +192,18 @@ impl GatewayMetrics {
     }
 
     pub fn reset_conversation_prompt_tokens(&self, conversation: &str) {
-        let mut guard = self.conversation_prompt_tokens.write();
-        guard.remove(conversation);
+        self.conversation_prompt_tokens.remove(conversation);
     }
 
     pub fn record_conversation_prompt_tokens(&self, conversation: &str, tokens: u64) {
-        let mut guard = self.conversation_prompt_tokens.write();
-        guard.insert(conversation.to_string(), tokens);
+        self.conversation_prompt_tokens
+            .insert(conversation.to_string(), tokens);
     }
 
     pub fn latest_prompt_tokens_for_conversation(&self, conversation: &str) -> Option<u64> {
         self.conversation_prompt_tokens
-            .read()
             .get(conversation)
-            .copied()
+            .map(|value| *value)
             .filter(|value| *value > 0)
     }
 
@@ -212,8 +211,7 @@ impl GatewayMetrics {
         if bytes == 0 || prompt_delta == 0 {
             return;
         }
-        let mut estimators = self.estimators.write();
-        let estimator = estimators.entry(model.to_string()).or_default();
+        let mut estimator = self.estimators.entry(model.to_string()).or_default();
         estimator.update(bytes, prompt_delta);
     }
 
@@ -221,15 +219,16 @@ impl GatewayMetrics {
         if bytes == 0 {
             return None;
         }
-        let estimators = self.estimators.read();
-        estimators
+        self.estimators
             .get(model)
             .and_then(|estimator| estimator.predict(bytes))
     }
 
     fn record_conversation_tokens(&self, actor: &str, tokens: u64) {
-        let mut stats = self.conversation_stats.write();
-        let entry = stats.entry(actor.to_string()).or_default();
+        let mut entry = self
+            .conversation_stats
+            .entry(actor.to_string())
+            .or_default();
         entry.total_tokens = entry.total_tokens.saturating_add(tokens);
         entry.count = entry.count.saturating_add(1);
     }
@@ -243,8 +242,9 @@ impl GatewayMetrics {
             total_calls,
             total_tokens, prompt_tokens, completion_tokens, "llm_gateway summary"
         );
-        let stats = self.conversation_stats.read();
-        for (actor, acc) in stats.iter() {
+        for entry in self.conversation_stats.iter() {
+            let actor = entry.key();
+            let acc = entry.value();
             if acc.count == 0 {
                 continue;
             }
@@ -268,10 +268,26 @@ impl GatewayMetrics {
             last_latency_ms:            self.last_latency_ms.load(Ordering::Relaxed),
             last_prompt_tokens:         self.last_prompt_tokens.load(Ordering::Relaxed),
             last_completion_tokens:     self.last_completion_tokens.load(Ordering::Relaxed),
-            estimators:                 self.estimators.read().clone(),
-            conversation_stats:         self.conversation_stats.read().clone(),
-            conversation_prompt_tokens: self.conversation_prompt_tokens.read().clone(),
-            context_limits:             self.context_limits.read().clone(),
+            estimators:                 self
+                .estimators
+                .iter()
+                .map(|entry| (entry.key().clone(), *entry.value()))
+                .collect(),
+            conversation_stats:         self
+                .conversation_stats
+                .iter()
+                .map(|entry| (entry.key().clone(), entry.value().clone()))
+                .collect(),
+            conversation_prompt_tokens: self
+                .conversation_prompt_tokens
+                .iter()
+                .map(|entry| (entry.key().clone(), *entry.value()))
+                .collect(),
+            context_limits:             self
+                .context_limits
+                .iter()
+                .map(|entry| (entry.key().clone(), *entry.value()))
+                .collect(),
         }
     }
 
@@ -284,20 +300,19 @@ impl GatewayMetrics {
             last_latency_ms:            AtomicU64::new(state.last_latency_ms),
             last_prompt_tokens:         AtomicU64::new(state.last_prompt_tokens),
             last_completion_tokens:     AtomicU64::new(state.last_completion_tokens),
-            estimators:                 RwLock::new(state.estimators),
-            conversation_stats:         RwLock::new(state.conversation_stats),
-            conversation_prompt_tokens: RwLock::new(state.conversation_prompt_tokens),
-            context_limits:             RwLock::new(state.context_limits),
+            estimators:                 DashMap::from_iter(state.estimators),
+            conversation_stats:         DashMap::from_iter(state.conversation_stats),
+            conversation_prompt_tokens: DashMap::from_iter(state.conversation_prompt_tokens),
+            context_limits:             DashMap::from_iter(state.context_limits),
         }
     }
 
     pub fn context_limit(&self, model: &str) -> u32 {
-        if let Some(limit) = self.context_limits.read().get(model) {
-            return *limit;
-        }
         let fallback = *DEFAULT_CONTEXT_LIMIT;
-        let mut guard = self.context_limits.write();
-        *guard.entry(model.to_string()).or_insert(fallback)
+        *self
+            .context_limits
+            .entry(model.to_string())
+            .or_insert(fallback)
     }
 }
 
@@ -905,5 +920,65 @@ impl Message<ChatCompletionRequest> for LLMGateway {
                 .map_err(|_| anyhow!("llm gateway shutting down"))?;
             Self::run_conversation(client, msg, config, metrics).await
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use uuid::Uuid;
+
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn llm_gateway_persists_metrics() -> anyhow::Result<()> {
+        let state_dir =
+            std::env::temp_dir().join(format!("weaver-gateway-state-{}", Uuid::new_v4()));
+        fs::create_dir_all(&state_dir)?;
+        let state_url = Url::from_directory_path(&state_dir)
+            .map_err(|_| anyhow!("invalid gateway state url"))?;
+
+        let gateway = LLMGateway::from(LLMGatewayState {
+            metrics: GatewayMetrics::default().to_state(),
+        });
+        gateway
+            .metrics
+            .record_completion(10, 5, 15, Duration::from_millis(25));
+        gateway
+            .metrics
+            .record_conversation_prompt_tokens("conv", 42);
+
+        let actor = LLMGateway::spawn_persistent(state_url.clone(), gateway).await?;
+        actor.ask(PersistGatewaySnapshot).await?;
+        actor.stop_gracefully().await.expect("stop gateway");
+        actor.wait_for_shutdown().await;
+        drop(actor);
+
+        let restored = LLMGateway::respawn_persistent(state_url.clone()).await?;
+        let metrics = restored.ask(GetGatewayMetrics).await.unwrap();
+
+        assert_eq!(metrics.total_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.total_tokens.load(Ordering::Relaxed), 15);
+        assert_eq!(
+            metrics
+                .latest_prompt_tokens_for_conversation("conv")
+                .unwrap(),
+            42
+        );
+
+        let bytes = fs::read(state_dir.join("index.bin"))?;
+        let snapshot: LLMGatewayState = postcard::from_bytes(&bytes)?;
+        assert_eq!(snapshot.metrics.total_calls, 1);
+        assert_eq!(snapshot.metrics.total_tokens, 15);
+        assert_eq!(snapshot.metrics.conversation_prompt_tokens.get("conv"), Some(&42));
+
+        restored
+            .stop_gracefully()
+            .await
+            .expect("stop restored gateway");
+        restored.wait_for_shutdown().await;
+
+        Ok(())
     }
 }

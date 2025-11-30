@@ -16,6 +16,7 @@ use crate::{
     constants::MAX_PARALLEL_DELEGATIONS,
     file_reader::run_delegate_batch_with_state,
     llm_gateway::{GatewayMetrics, LLMGateway},
+    tools::llm::analysis_cache::AnalysisCache,
 };
 
 const IDENTIFIER: &str = "delegate_tasks";
@@ -85,6 +86,7 @@ fn parse_delegate_tasks(raw: Value, state: &CallState) -> ToolInputResult<Box<dy
         metrics: Arc::clone(&state.metrics),
         graph: state.graph.clone(),
         rerun: state.rerun.clone(),
+        analysis_cache: Arc::clone(&state.analysis_cache),
     }))
 }
 
@@ -97,6 +99,7 @@ struct DelegateTasksTool {
     model:              Arc<String>,
     metrics:            Arc<GatewayMetrics>,
     graph:              ActorRef<crate::graph::manager::GraphManager>,
+    analysis_cache:     Arc<AnalysisCache>,
     rerun:              Option<ActorRef<crate::rerun_sink::RerunSink>>,
 }
 
@@ -117,6 +120,7 @@ impl ToolInstance for DelegateTasksTool {
             workspace_root:     Arc::clone(&self.workspace_root),
             metrics:            Arc::clone(&self.metrics),
             graph:              self.graph.clone(),
+            analysis_cache:     Arc::clone(&self.analysis_cache),
             rerun:              self.rerun.clone(),
             depth:              self.depth,
             max_subdelegations: self.max_subdelegations,

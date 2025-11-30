@@ -1,5 +1,8 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use bon::Builder;
+use kameo::prelude::ActorRef;
 use petgraph::{
     algo::{
         articulation_points, bridges, dijkstra, greedy_feedback_arc_set, page_rank, tarjan_scc,
@@ -12,12 +15,23 @@ use serde_json::{Value, json};
 use tracing::info;
 
 use crate::{
-    graph::{EdgeKind, traversal},
+    graph::{CurriculumGraph, EdgeKind, traversal},
     tools::llm::{
         CallState, ToolExecutionError, ToolInputError, ToolInputResult, ToolInstance, ToolOutput,
-        ToolPrototype, schema_for_args,
+        ToolPrototype,
+        analysis_cache::{AnalysisCacheKey, AnalysisKind},
+        schema_for_args,
     },
 };
+
+async fn load_graph_with_version(
+    graph: &ActorRef<crate::graph::manager::GraphManager>,
+) -> Result<(Arc<CurriculumGraph>, u64), ToolExecutionError> {
+    graph
+        .ask(crate::graph::manager::GetGraphWithVersion)
+        .await
+        .map_err(super::common::map_send_err_inf)
+}
 
 const REQUIRES_CYCLES: &str = "graph_requires_cycles";
 const REQUIRES_PAGERANK: &str = "graph_requires_pagerank";
@@ -192,37 +206,68 @@ struct CyclesTool {
 #[async_trait]
 impl ToolInstance for CyclesTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let graph = self
+        let (graph, graph_version) = load_graph_with_version(&self.state.graph).await?;
+        let cache_key = AnalysisCacheKey {
+            graph_version,
+            kind: AnalysisKind::RequiresCycles,
+        };
+
+        let cached = self
             .state
-            .graph
-            .ask(crate::graph::manager::GetGraph)
-            .await
-            .map_err(super::common::map_send_err_inf)?;
-
-        let view = traversal::requires_view(&graph);
-        let mut sccs: Vec<Vec<_>> = tarjan_scc(&view)
-            .into_iter()
-            .filter(|c| c.len() > 1)
-            .collect();
-        sccs.sort_by_key(|component| std::cmp::Reverse(component.len()));
-        let limit = self.args.limit.unwrap_or(200).min(500);
-        let items: Vec<_> = sccs
-            .into_iter()
-            .take(limit)
-            .map(|comp| {
-                json!({
-                    "size": comp.len(),
-                    "slugs": comp.into_iter().map(|n| graph[n].slug.clone()).collect::<Vec<_>>()
-                })
+            .analysis_cache
+            .get_or_insert_with_async(cache_key, || {
+                let graph = Arc::clone(&graph);
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        let view = traversal::requires_view(&graph);
+                        let mut sccs: Vec<Vec<_>> = tarjan_scc(&view)
+                            .into_iter()
+                            .filter(|c| c.len() > 1)
+                            .collect();
+                        sccs.sort_by_key(|component| std::cmp::Reverse(component.len()));
+                        let items: Vec<_> = sccs
+                            .into_iter()
+                            .take(500)
+                            .map(|comp| {
+                                json!({
+                                    "size": comp.len(),
+                                    "slugs": comp.into_iter().map(|n| graph[n].slug.clone()).collect::<Vec<_>>()
+                                })
+                            })
+                            .collect();
+                        json!({
+                            "components": items,
+                        })
+                    })
+                    .await
+                    .unwrap()
+                }
             })
-            .collect();
+            .await;
 
-        info!(tool = REQUIRES_CYCLES, count = items.len(), "graph requires cycles");
+        let mut payload = cached.payload.clone();
+        let limit = self.args.limit.unwrap_or(200).min(500);
+        if let Some(arr) = payload["components"].as_array().cloned() {
+            let mut trimmed = arr;
+            if trimmed.len() > limit {
+                trimmed.truncate(limit);
+            }
+            payload["components"] = json!(trimmed);
+        }
+
+        info!(
+            tool = REQUIRES_CYCLES,
+            count = payload["components"]
+                .as_array()
+                .map(|v| v.len())
+                .unwrap_or(0),
+            "graph requires cycles"
+        );
 
         Ok(ToolOutput::new(json!({
             "type": "graph_analysis",
             "tool": REQUIRES_CYCLES,
-            "components": items,
+            "components": payload["components"].clone(),
         })))
     }
 }
@@ -235,27 +280,59 @@ struct PageRankTool {
 #[async_trait]
 impl ToolInstance for PageRankTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let graph = self
-            .state
-            .graph
-            .ask(crate::graph::manager::GetGraph)
-            .await
-            .map_err(super::common::map_send_err_inf)?;
+        let (graph, graph_version) = load_graph_with_version(&self.state.graph).await?;
 
-        let view = traversal::requires_view(&graph);
-        let scores = page_rank(&view, self.args.damping, self.args.iterations);
-        let mut items: Vec<_> = scores
-            .iter()
-            .enumerate()
-            .map(|(idx, score)| (graph[petgraph::graph::NodeIndex::new(idx)].slug.clone(), *score))
-            .collect();
-        items.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let cache_key = AnalysisCacheKey {
+            graph_version,
+            kind: AnalysisKind::RequiresPagerank {
+                damping_bits: self.args.damping.to_bits(),
+                iterations:   self.args.iterations,
+            },
+        };
+
+        let cached = self
+            .state
+            .analysis_cache
+            .get_or_insert_with_async(cache_key, || {
+                let graph = Arc::clone(&graph);
+                let damping = self.args.damping;
+                let iterations = self.args.iterations;
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        let view = traversal::requires_view(&graph);
+                        let scores = page_rank(&view, damping, iterations);
+                        let mut items: Vec<_> = scores
+                            .iter()
+                            .enumerate()
+                            .map(|(idx, score)| {
+                                (graph[petgraph::graph::NodeIndex::new(idx)].slug.clone(), *score)
+                            })
+                            .collect();
+                        items.sort_by(|a, b| {
+                            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        let top = items
+                            .into_iter()
+                            .take(500)
+                            .map(|(slug, score)| json!({ "slug": slug, "score": score }))
+                            .collect::<Vec<_>>();
+                        json!({ "items": top })
+                    })
+                    .await
+                    .unwrap()
+                }
+            })
+            .await;
+
+        let mut items = cached
+            .payload
+            .get("items")
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default();
         let limit = self.args.limit.unwrap_or(50).min(500);
-        let payload: Vec<_> = items
-            .into_iter()
-            .take(limit)
-            .map(|(slug, score)| json!({ "slug": slug, "score": score }))
-            .collect();
+        if items.len() > limit {
+            items.truncate(limit);
+        }
 
         info!(
             tool = REQUIRES_PAGERANK,
@@ -268,7 +345,7 @@ impl ToolInstance for PageRankTool {
         Ok(ToolOutput::new(json!({
             "type": "graph_analysis",
             "tool": REQUIRES_PAGERANK,
-            "items": payload,
+            "items": items,
         })))
     }
 }
@@ -281,51 +358,73 @@ struct BridgesTool {
 #[async_trait]
 impl ToolInstance for BridgesTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let graph = self
-            .state
-            .graph
-            .ask(crate::graph::manager::GetGraph)
-            .await
-            .map_err(super::common::map_send_err_inf)?;
-        // Build an unweighted temp graph to satisfy trait bounds.
-        let mut temp = petgraph::graph::Graph::<(), (), petgraph::Directed>::with_capacity(
-            graph.node_count(),
-            graph.edge_count(),
-        );
-        let mut idx_map = Vec::with_capacity(graph.node_count());
-        for n in graph.node_indices() {
-            let idx = temp.add_node(());
-            idx_map.push((n, idx));
-        }
-        for e in graph.edge_indices() {
-            if let EdgeKind::Requires(_) = graph[e].kind
-                && let Some((u, v)) = graph.edge_endpoints(e)
-            {
-                let u_idx = idx_map.iter().find(|(orig, _)| *orig == u).unwrap().1;
-                let v_idx = idx_map.iter().find(|(orig, _)| *orig == v).unwrap().1;
-                temp.add_edge(u_idx, v_idx, ());
-            }
-        }
+        let (graph, graph_version) = load_graph_with_version(&self.state.graph).await?;
+        let cache_key = AnalysisCacheKey {
+            graph_version,
+            kind: AnalysisKind::RequiresBridges,
+        };
 
-        let mut list: Vec<_> = bridges(&temp)
-            .map(|e| {
-                let (u, v) = (e.source(), e.target());
-                let from_slug = graph[idx_map.iter().find(|(_, idx)| *idx == u).unwrap().0]
-                    .slug
-                    .clone();
-                let to_slug = graph[idx_map.iter().find(|(_, idx)| *idx == v).unwrap().0]
-                    .slug
-                    .clone();
-                json!({"from": from_slug, "to": to_slug})
+        let cached = self
+            .state
+            .analysis_cache
+            .get_or_insert_with_async(cache_key, || {
+                let graph = Arc::clone(&graph);
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        let mut temp =
+                            petgraph::graph::Graph::<(), (), petgraph::Directed>::with_capacity(
+                                graph.node_count(),
+                                graph.edge_count(),
+                            );
+                        let mut idx_map = Vec::with_capacity(graph.node_count());
+                        for n in graph.node_indices() {
+                            let idx = temp.add_node(());
+                            idx_map.push((n, idx));
+                        }
+                        for e in graph.edge_indices() {
+                            if let EdgeKind::Requires(_) = graph[e].kind
+                                && let Some((u, v)) = graph.edge_endpoints(e)
+                            {
+                                let u_idx = idx_map.iter().find(|(orig, _)| *orig == u).unwrap().1;
+                                let v_idx = idx_map.iter().find(|(orig, _)| *orig == v).unwrap().1;
+                                temp.add_edge(u_idx, v_idx, ());
+                            }
+                        }
+
+                        let list: Vec<_> = bridges(&temp)
+                            .map(|e| {
+                                let (u, v) = (e.source(), e.target());
+                                let from_slug = graph
+                                    [idx_map.iter().find(|(_, idx)| *idx == u).unwrap().0]
+                                    .slug
+                                    .clone();
+                                let to_slug = graph
+                                    [idx_map.iter().find(|(_, idx)| *idx == v).unwrap().0]
+                                    .slug
+                                    .clone();
+                                json!({"from": from_slug, "to": to_slug})
+                            })
+                            .collect();
+                        json!({"edges": list})
+                    })
+                    .await
+                    .unwrap()
+                }
             })
-            .collect();
+            .await;
+
         let limit = self.args.limit.unwrap_or(200).min(500);
-        if list.len() > limit {
-            list.truncate(limit);
+        let mut edges = cached
+            .payload
+            .get("edges")
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default();
+        if edges.len() > limit {
+            edges.truncate(limit);
         }
-        info!(tool = REQUIRES_BRIDGES, count = list.len(), "graph requires bridges");
+        info!(tool = REQUIRES_BRIDGES, count = edges.len(), "graph requires bridges");
         Ok(ToolOutput::new(
-            json!({"type": "graph_analysis","tool": REQUIRES_BRIDGES,"edges": list}),
+            json!({"type": "graph_analysis","tool": REQUIRES_BRIDGES,"edges": edges}),
         ))
     }
 }
@@ -338,39 +437,60 @@ struct ArticulationTool {
 #[async_trait]
 impl ToolInstance for ArticulationTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let graph = self
-            .state
-            .graph
-            .ask(crate::graph::manager::GetGraph)
-            .await
-            .map_err(super::common::map_send_err_inf)?;
-        let mut temp = petgraph::graph::Graph::<(), (), petgraph::Directed>::with_capacity(
-            graph.node_count(),
-            graph.edge_count(),
-        );
-        let mut idx_map = Vec::with_capacity(graph.node_count());
-        for n in graph.node_indices() {
-            let idx = temp.add_node(());
-            idx_map.push((n, idx));
-        }
-        for e in graph.edge_indices() {
-            if let EdgeKind::Requires(_) = graph[e].kind
-                && let Some((u, v)) = graph.edge_endpoints(e)
-            {
-                let u_idx = idx_map.iter().find(|(orig, _)| *orig == u).unwrap().1;
-                let v_idx = idx_map.iter().find(|(orig, _)| *orig == v).unwrap().1;
-                temp.add_edge(u_idx, v_idx, ());
-            }
-        }
+        let (graph, graph_version) = load_graph_with_version(&self.state.graph).await?;
+        let cache_key = AnalysisCacheKey {
+            graph_version,
+            kind: AnalysisKind::RequiresArticulation,
+        };
 
-        let mut nodes: Vec<_> = articulation_points::articulation_points(&temp)
-            .into_iter()
-            .map(|n| {
-                let orig = idx_map.iter().find(|(_, idx)| *idx == n).unwrap().0;
-                graph[orig].slug.clone()
+        let cached = self
+            .state
+            .analysis_cache
+            .get_or_insert_with_async(cache_key, || {
+                let graph = Arc::clone(&graph);
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        let mut temp =
+                            petgraph::graph::Graph::<(), (), petgraph::Directed>::with_capacity(
+                                graph.node_count(),
+                                graph.edge_count(),
+                            );
+                        let mut idx_map = Vec::with_capacity(graph.node_count());
+                        for n in graph.node_indices() {
+                            let idx = temp.add_node(());
+                            idx_map.push((n, idx));
+                        }
+                        for e in graph.edge_indices() {
+                            if let EdgeKind::Requires(_) = graph[e].kind
+                                && let Some((u, v)) = graph.edge_endpoints(e)
+                            {
+                                let u_idx = idx_map.iter().find(|(orig, _)| *orig == u).unwrap().1;
+                                let v_idx = idx_map.iter().find(|(orig, _)| *orig == v).unwrap().1;
+                                temp.add_edge(u_idx, v_idx, ());
+                            }
+                        }
+
+                        let nodes: Vec<_> = articulation_points::articulation_points(&temp)
+                            .into_iter()
+                            .map(|n| {
+                                let orig = idx_map.iter().find(|(_, idx)| *idx == n).unwrap().0;
+                                graph[orig].slug.clone()
+                            })
+                            .collect();
+                        json!({"nodes": nodes})
+                    })
+                    .await
+                    .unwrap()
+                }
             })
-            .collect();
+            .await;
+
         let limit = self.args.limit.unwrap_or(200).min(500);
+        let mut nodes = cached
+            .payload
+            .get("nodes")
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default();
         if nodes.len() > limit {
             nodes.truncate(limit);
         }
@@ -389,22 +509,42 @@ struct FeedbackTool {
 #[async_trait]
 impl ToolInstance for FeedbackTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let graph = self
+        let (graph, graph_version) = load_graph_with_version(&self.state.graph).await?;
+        let cache_key = AnalysisCacheKey {
+            graph_version,
+            kind: AnalysisKind::RequiresFeedback,
+        };
+
+        let cached = self
             .state
-            .graph
-            .ask(crate::graph::manager::GetGraph)
-            .await
-            .map_err(super::common::map_send_err_inf)?;
-        let view = traversal::requires_view(&graph);
-        let set = greedy_feedback_arc_set(&view);
-        let mut edges: Vec<_> = set
-            .into_iter()
-            .map(|e| {
-                let (u, v) = (e.source(), e.target());
-                json!({"from": graph[u].slug.clone(), "to": graph[v].slug.clone()})
+            .analysis_cache
+            .get_or_insert_with_async(cache_key, || {
+                let graph = Arc::clone(&graph);
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        let view = traversal::requires_view(&graph);
+                        let set = greedy_feedback_arc_set(&view);
+                        let edges: Vec<_> = set
+                            .into_iter()
+                            .map(|e| {
+                                let (u, v) = (e.source(), e.target());
+                                json!({"from": graph[u].slug.clone(), "to": graph[v].slug.clone()})
+                            })
+                            .collect();
+                        json!({"edges": edges})
+                    })
+                    .await
+                    .unwrap()
+                }
             })
-            .collect();
+            .await;
+
         let limit = self.args.limit.unwrap_or(200).min(500);
+        let mut edges = cached
+            .payload
+            .get("edges")
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default();
         if edges.len() > limit {
             edges.truncate(limit);
         }
@@ -423,12 +563,8 @@ struct ShortestPathTool {
 #[async_trait]
 impl ToolInstance for ShortestPathTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let graph_ref = self
-            .state
-            .graph
-            .ask(crate::graph::manager::GetGraph)
-            .await
-            .map_err(super::common::map_send_err_inf)?;
+        let (graph_ref, graph_version) = load_graph_with_version(&self.state.graph).await?;
+
         // resolve slugs
         let from = graph_ref
             .node_indices()
@@ -449,21 +585,53 @@ impl ToolInstance for ShortestPathTool {
                 })
             })?;
 
-        let view = traversal::requires_view(&graph_ref);
-        let dist = dijkstra(&view, from, Some(to), |_| 1usize);
-        let cost = dist.get(&to).copied();
+        let cache_key = AnalysisCacheKey {
+            graph_version,
+            kind: AnalysisKind::RequiresShortestPath {
+                from: self.args.from_slug.clone(),
+                to:   self.args.to_slug.clone(),
+            },
+        };
 
-        let path = traversal::requires_one_path(&graph_ref, from, to)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|n| graph_ref[n].slug.clone())
-            .collect::<Vec<_>>();
+        let cached = self
+            .state
+            .analysis_cache
+            .get_or_insert_with_async(cache_key, || {
+                let graph_ref = Arc::clone(&graph_ref);
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        let view = traversal::requires_view(&graph_ref);
+                        let dist = dijkstra(&view, from, Some(to), |_| 1usize);
+                        let cost = dist.get(&to).copied();
+
+                        let path = traversal::requires_one_path(&graph_ref, from, to)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|n| graph_ref[n].slug.clone())
+                            .collect::<Vec<_>>();
+                        json!({ "cost": cost, "path": path })
+                    })
+                    .await
+                    .unwrap()
+                }
+            })
+            .await;
+
+        let cost = cached
+            .payload
+            .get("cost")
+            .and_then(|v| v.as_u64().map(|c| c as usize));
+        let path = cached
+            .payload
+            .get("path")
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default();
 
         info!(
             tool = REQUIRES_SHORTEST_PATH,
             from = %self.args.from_slug,
             to = %self.args.to_slug,
-            cost = ?cost,
+            cost,
             "graph requires shortest path"
         );
 

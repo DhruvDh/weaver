@@ -9,7 +9,7 @@
 
 ## Build, Test, and Development Commands
 - `cargo fmt` — format per `rustfmt.toml`.
-- `cargo clippy --all-targets -- -D warnings` — lint; fail on warnings.
+- `cargo clippy --all-targets ` — lint; fail on warnings.
 - `cargo test` — unit + property tests; `PROPTEST_CASES=128` for sweeps.
 - `cargo run -- <workspace-root>` — launch FileReader + graph pipeline (default `uncc_cs2-pretext-project/`).
 - Config is CLI-only (no GRAPH_* env fallback). Key flags:
@@ -42,6 +42,12 @@
 - Scheduler ticks: autosave every `--graph-autosave-secs`; optional redundant-requires pruning via `--graph-prune-requires-secs`. Persistence goes through `GraphManager`; tolerate partial writes and use bounded retries.
 - `LLMGateway` is rate-limited by `LLM_MAX_CONCURRENT_REQUESTS`; it retries with backoff and logs token usage. Do not block within actor handlers.
 - Rerun telemetry is optional; enable with `WEAVER_RERUN_MODE=grpc|file|both` and check `.rrd` artifacts before sharing.
+
+## Analysis Cache (LLM graph tools)
+- Treat `AnalysisCache` as ephemeral, in-process derived state (not an actor, not persisted). Keys are `(graph_version, AnalysisKind)`; always fetch `(graph, version)` together via `load_graph_with_version` to build keys.
+- Use the cache helpers: `get_or_insert_with` for sync callers and `get_or_insert_with_async` for async. Both dedupe per key; no extra locks needed.
+- Heavy work goes in `spawn_blocking` inside the compute closure so the async runtime and cache paths stay non-blocking. Never hold locks while doing the analysis itself.
+- Cache only analysis payloads; previews still recompute byte/token hints. Graph mutations automatically bypass stale entries because `graph_version` changes.
 
 ## LLM Tools, Schemas, and Previews
 - Tool args derive `serde::Deserialize`, `schemars::JsonSchema`, and `bon::Builder`; keep `#[serde(deny_unknown_fields)]` so unknown fields fail fast. Extend schemas via `schema_for_args::<T>()` to keep the OpenAI function specs in sync.

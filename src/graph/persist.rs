@@ -78,6 +78,14 @@ pub async fn save_graph(
             .await
             .with_context(|| format!("fsync temp snapshot {}", tmp_path.display()))?;
     }
+    // On Windows, rename fails if the destination exists; remove it first to
+    // preserve atomic replace semantics across platforms.
+    if fs::metadata(path).await.is_ok() {
+        fs::remove_file(path)
+            .await
+            .with_context(|| format!("remove existing snapshot {}", path.display()))?;
+    }
+
     fs::rename(&tmp_path, path)
         .await
         .with_context(|| format!("rename temp snapshot to {}", path.display()))

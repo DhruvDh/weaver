@@ -164,6 +164,29 @@ pub fn extraneous_knowledge(
     ancestors.difference(intended).copied().collect()
 }
 
+/// Derive intended knowledge for an LO by inspecting target anchors. Any
+/// teaching step that anchors to the LO with impact=target may also anchor to
+/// specific knowledge nodes; those co-anchored knowledge nodes are treated as
+/// the intended construct set.
+pub fn intended_knowledge_from_anchors(g: &CurriculumGraph, lo: NodeId) -> HashSet<NodeId> {
+    let mut intended = HashSet::new();
+    for edge in g.edges_directed(lo, Direction::Incoming) {
+        if let EdgeKind::Anchors(attrs) = &edge.weight().kind
+            && matches!(attrs.impact, AnchorImpact::Target)
+        {
+            let step = edge.source();
+            for out in g.edges_directed(step, Direction::Outgoing) {
+                if let EdgeKind::Anchors(_) = &out.weight().kind
+                    && matches!(&g[out.target()].kind, NodeKind::Knowledge(k) if k.knowledge_type.is_instructional_knowledge())
+                {
+                    intended.insert(out.target());
+                }
+            }
+        }
+    }
+    intended
+}
+
 /// Approximate keystone score: |in_reach| * |out_reach| over requires layer.
 pub struct KeystoneScore {
     pub node:      NodeId,
@@ -345,6 +368,13 @@ pub fn example_gaps(g: &CurriculumGraph) -> Vec<ExampleGap> {
 }
 
 /// Borrow-ahead detection within an episode.
+///
+/// Semantics:
+/// - If the target was introduced earlier in the *same* episode (reachable via
+///   precedes), usage is allowed.
+/// - If introduced only in other episodes, the severity is `CrossEpisode`.
+/// - If introduction_scope is Prior/External, the finding is suppressed.
+/// - If there is no introduction anywhere, severity is `NoIntro`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BorrowSeverity {

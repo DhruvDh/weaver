@@ -105,7 +105,17 @@ impl Actor for GraphManager {
 
     async fn on_start(state: Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         let strict = state.strict_quality;
-        let service = match GraphService::from_parts(state.graph, strict, state.graph_version) {
+        let expected_revision = if state.course_commit.is_empty() {
+            None
+        } else {
+            Some(state.course_commit.clone())
+        };
+        let service = match GraphService::from_parts(
+            state.graph,
+            strict,
+            state.graph_version,
+            expected_revision,
+        ) {
             Ok(svc) => svc,
             Err(err) => {
                 warn!(error = %err, "invalid persisted graph; starting with empty graph");
@@ -479,6 +489,34 @@ impl Message<GetGraph> for GraphManager {
     }
 }
 
+pub struct GetGraphWithVersion;
+
+impl Message<GetGraphWithVersion> for GraphManager {
+    type Reply = Result<(Arc<CurriculumGraph>, u64), Infallible>;
+
+    async fn handle(
+        &mut self,
+        _msg: GetGraphWithVersion,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        Ok((self.service.shared_graph(), self.service.graph_version()))
+    }
+}
+
+pub struct GetGraphVersion;
+
+impl Message<GetGraphVersion> for GraphManager {
+    type Reply = Result<u64, Infallible>;
+
+    async fn handle(
+        &mut self,
+        _msg: GetGraphVersion,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        Ok(self.service.graph_version())
+    }
+}
+
 impl Message<Neighbors> for GraphManager {
     type Reply = Result<Vec<Neighbor>, GraphError>;
 
@@ -698,10 +736,40 @@ impl Message<LoadSnapshot> for GraphManager {
     ) -> Self::Reply {
         let start = Instant::now();
         let snapshot = persist::load_graph(&path).await?;
-        self.service
-            .install_graph(snapshot.graph, snapshot.graph_version)?;
+        if !self.course_commit.is_empty() && snapshot.course_commit != self.course_commit {
+            anyhow::bail!(
+                "snapshot course_commit `{}` does not match runtime course_commit `{}`",
+                snapshot.course_commit,
+                self.course_commit
+            );
+        }
+        let prev_commit = self.course_commit.clone();
+        let prev_expected = self.service.expected_revision().map(|s| s.to_string());
+
+        let new_commit = if self.course_commit.is_empty() {
+            snapshot.course_commit.clone()
+        } else {
+            self.course_commit.clone()
+        };
+        let expected = if new_commit.is_empty() {
+            None
+        } else {
+            Some(new_commit.clone())
+        };
+
+        self.service.set_expected_revision(expected);
+        if let Err(err) = self
+            .service
+            .install_graph(snapshot.graph, snapshot.graph_version)
+        {
+            // rollback commit/expected on failure
+            self.course_commit = prev_commit;
+            self.service.set_expected_revision(prev_expected);
+            return Err(err.into());
+        }
+
+        self.course_commit = new_commit;
         self.service.bump_version();
-        self.course_commit = snapshot.course_commit;
         GraphManager::log_write_latency("load_snapshot", start);
         Ok(())
     }
@@ -726,7 +794,109 @@ impl Message<ApplyRuntimeConfig> for GraphManager {
             return Err(err.into());
         }
 
+        let prev_commit = self.course_commit.clone();
+        let expected = if course_commit.is_empty() {
+            None
+        } else {
+            Some(course_commit.clone())
+        };
+        self.service.set_expected_revision(expected);
         self.course_commit = course_commit;
+
+        if let Err(err) = self.service.validate_global_invariants() {
+            self.course_commit = prev_commit.clone();
+            let prev_expected = if prev_commit.is_empty() {
+                None
+            } else {
+                Some(prev_commit)
+            };
+            self.service.set_expected_revision(prev_expected);
+            return Err(err.into());
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, path::PathBuf};
+
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::schema::types::{KnowledgeType, SourceRef};
+
+    fn mk_kn(title: &str, kt: KnowledgeType) -> KnowledgeNode {
+        KnowledgeNode {
+            title: title.to_string(),
+            statement: title.to_string(),
+            knowledge_type: kt,
+            source_refs: vec![SourceRef {
+                path:       "dummy".into(),
+                start_line: 1,
+                end_line:   2,
+                revision:   "deadbeef".into(),
+            }],
+            confidence: 1.0,
+            rubric_criteria: vec![],
+            construct_irrelevant_demands: vec![],
+            grain_level: None,
+            intrinsic_load: None,
+            introduction_scope: crate::graph::IntroductionScope::InCourse,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn graph_manager_persists_and_restores_state() -> anyhow::Result<()> {
+        let state_dir: PathBuf =
+            std::env::temp_dir().join(format!("weaver-graph-state-{}", Uuid::new_v4()));
+        fs::create_dir_all(&state_dir)?;
+        let state_url = Url::from_directory_path(&state_dir)
+            .map_err(|_| anyhow::anyhow!("invalid state url"))?;
+
+        let mut svc = GraphService::new();
+        svc.add_knowledge_node("k1".into(), mk_kn("k1", KnowledgeType::Conceptual), vec![])?;
+        let base_version = svc.graph_version();
+
+        let state =
+            GraphManagerState::new(svc.snapshot_graph(), String::new(), false, base_version);
+
+        let actor = GraphManager::spawn_persistent(state_url.clone(), state).await?;
+
+        actor
+            .ask(InsertKnowledge {
+                slug:    "k2".into(),
+                payload: mk_kn("k2", KnowledgeType::Procedural),
+                tags:    vec![],
+            })
+            .await?;
+
+        actor.ask(PersistSnapshot).await?;
+        actor.stop_gracefully().await.expect("stop graph manager");
+        actor.wait_for_shutdown().await;
+        drop(actor);
+
+        let restored = GraphManager::respawn_persistent(state_url.clone()).await?;
+        restored
+            .ask(ResolveSlug { slug: "k1".into() })
+            .await
+            .expect("k1 restored");
+        restored
+            .ask(ResolveSlug { slug: "k2".into() })
+            .await
+            .expect("k2 restored");
+
+        let snapshot_bytes = fs::read(state_dir.join("index.bin"))?;
+        let snapshot: GraphManagerState = postcard::from_bytes(&snapshot_bytes)?;
+        assert_eq!(snapshot.graph_version, base_version + 1);
+        assert!(snapshot.course_commit.is_empty());
+
+        restored
+            .stop_gracefully()
+            .await
+            .expect("stop restored graph manager");
+        restored.wait_for_shutdown().await;
 
         Ok(())
     }

@@ -45,3 +45,22 @@ All command outputs now follow `{type: "graph_command", tool: <id>, status: "ok"
 - Views are always bounded (`limit`/`offset`); use `has_more` to paginate.
 - Summaries are compact; heavy tools provide previews unless `fetch_body=true`.
 - Edge kind filters use the `EdgeKindFilter` enum—stringly values are rejected.
+- Strict mode: `--graph-strict-quality` promotes alignment/coverage/practice/example/discourse warnings to errors. Use it in CI; leave it off locally while staging edits.
+- Supports: all supports must carry a `case_tag`; supports into high `intrinsic_load` targets must include `coverage_tags`.
+- Purity & provenance: extraneous prerequisites and SourceRef revision mismatches are fatal regardless of strictness.
+- Teaching steps: when unanchored, provide `rationale` (new optional field on insert/update teaching-step commands).
+
+## Actor persistence
+- GraphManager snapshots live under `<graph_snapshot_path>.state/graph_manager` (derived from the
+  CLI `--graph-snapshot-path`) and are restored on startup before autosave.
+- LLMGateway metrics persist under `<graph_snapshot_path>.state/llm_gateway` alongside the graph
+  state.
+- FileReader actors are intentionally ephemeral; conversation IDs use UUIDs so they remain unique
+  across restarts, and no `.state/file_reader` snapshot is kept.
+- Autosave ticks persist to the kameo state directories only; run `graph_save_now` when you need a
+  legacy `graph_snapshot.json` dump.
+- Analysis cache: see `docs/cache_coverage.md` for which graph tools share cached analyses.
+
+## Cache guardrails
+- When adding memoization (e.g., Foyer/Moka), key entries by `(graph_version, query_kind, args)` so
+  graph mutations automatically invalidate cached results.
