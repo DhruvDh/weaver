@@ -1,6 +1,6 @@
 use weaver::{
     analysis,
-    graph::{self, GraphService, KnowledgeNode, NodeId, traversal},
+    graph::{self, GraphService, KnowledgeNode, NodeId, manager::GraphManagerState, traversal},
     schema::types::{IntendedEffect, KnowledgeType, SourceRef, SupportKind},
 };
 
@@ -132,38 +132,27 @@ fn borrow_ahead_flags_use_without_intro() {
 }
 
 #[test]
-fn fadeability_detects_support_only_path() {
+fn supports_guard_rejects_prereq_load() {
     let mut svc = GraphService::new();
     // first principle
     let fp = svc
         .add_knowledge_node("fp".into(), mk_kn("fp", KnowledgeType::Conceptual), vec![])
         .unwrap();
-    // intermediate concept reachable only via support
-    let concept = svc
-        .add_knowledge_node("c".into(), mk_kn("c", KnowledgeType::Conceptual), vec![])
-        .unwrap();
-    // assessment item
+    // assessment item reachable only via support (would carry prerequisite load)
     let assess = svc
         .add_knowledge_node("a".into(), mk_kn("a", KnowledgeType::AssessmentItem), vec![])
         .unwrap();
-    // support edge fp -> concept
-    add_support(
-        &mut svc,
+    // support edge fp -> assessment (allowed combo but should be rejected as
+    // non-fadeable)
+    let err = svc.add_edge::<graph::SupportsSpec>(
         fp,
-        concept,
-        SupportKind::WorkedExample,
-        IntendedEffect::ReduceExtraneousLoad,
-        Some(graph::CaseTag::Typical),
-        vec!["tag".into()],
-    );
-    // requires concept -> assessment
-    svc.add_edge::<graph::RequiresSpec>(
-        concept,
         assess,
-        graph::RequiresAttrs {
-            strength:      weaver::schema::types::Strength::Necessary,
-            rationale:     "r".into(),
-            evidence_refs: vec![SourceRef {
+        graph::SupportsAttrs {
+            support_kind:    SupportKind::RubricNote,
+            intended_effect: IntendedEffect::Motivate,
+            case_tag:        None,
+            coverage_tags:   vec![],
+            evidence_refs:   vec![SourceRef {
                 path:       "dummy".into(),
                 start_line: 1,
                 end_line:   2,
@@ -171,15 +160,9 @@ fn fadeability_detects_support_only_path() {
             }],
         },
         1.0,
-    )
-    .unwrap();
-
-    let issues = analysis::fadeability_issues(svc.graph());
-    if issues.is_empty() {
-        return;
-    }
-    assert_eq!(svc.graph()[issues[0].assessment].slug, "a");
-    assert_eq!(issues[0].support_edges.len(), 1);
+    );
+    assert!(err.is_err(), "support edge should be rejected as non-fadeable");
+    assert!(svc.graph().find_edge(fp, assess).is_none());
 }
 
 #[test]
@@ -295,4 +278,28 @@ fn requires_transitive_reduction_identifies_redundant_edge() {
     assert!(redundants.contains(&(a, c)));
     // reachability still holds
     assert!(traversal::requires_path_exists(svc.graph(), a, c));
+}
+
+#[test]
+fn graph_manager_state_round_trip_preserves_version() {
+    let mut svc = GraphService::new();
+    let _ = svc
+        .add_knowledge_node("k".into(), mk_kn("k", KnowledgeType::Conceptual), vec![])
+        .unwrap();
+    let version = svc.graph_version();
+
+    let state = GraphManagerState::new(svc.snapshot_graph(), "deadbeef".into(), false, version);
+
+    let data = postcard::to_stdvec(&state).expect("serialize state");
+    let decoded: GraphManagerState = postcard::from_bytes(&data).expect("deserialize state");
+
+    let restored = GraphService::from_parts(
+        decoded.graph.clone(),
+        decoded.strict_quality,
+        decoded.graph_version,
+    )
+    .expect("restored graph should validate");
+
+    assert_eq!(restored.graph_version(), version);
+    restored.validate_global_invariants().unwrap();
 }

@@ -201,3 +201,15 @@ pub(crate) async fn resolve_slug(
         .await
         .map_err(|e| map_send_err(e, tool))
 }
+
+/// Batch slug resolution to reduce actor round-trips.
+pub(crate) async fn resolve_slugs(
+    graph: &ActorRef<crate::graph::manager::GraphManager>,
+    slugs: Vec<String>,
+    tool: &'static str,
+) -> Result<Vec<crate::graph::NodeId>, ToolExecutionError> {
+    graph
+        .ask(crate::graph::manager::ResolveSlugs { slugs })
+        .await
+        .map_err(|e| map_send_err(e, tool))
+}

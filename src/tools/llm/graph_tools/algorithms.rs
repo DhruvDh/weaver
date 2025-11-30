@@ -197,14 +197,14 @@ impl ToolInstance for CyclesTool {
             .graph
             .ask(crate::graph::manager::GetGraph)
             .await
-            .map_err(|e| super::common::map_send_err_inf(e))?;
+            .map_err(super::common::map_send_err_inf)?;
 
         let view = traversal::requires_view(&graph);
         let mut sccs: Vec<Vec<_>> = tarjan_scc(&view)
             .into_iter()
             .filter(|c| c.len() > 1)
             .collect();
-        sccs.sort_by(|a, b| b.len().cmp(&a.len()));
+        sccs.sort_by_key(|component| std::cmp::Reverse(component.len()));
         let limit = self.args.limit.unwrap_or(200).min(500);
         let items: Vec<_> = sccs
             .into_iter()
@@ -240,7 +240,7 @@ impl ToolInstance for PageRankTool {
             .graph
             .ask(crate::graph::manager::GetGraph)
             .await
-            .map_err(|e| super::common::map_send_err_inf(e))?;
+            .map_err(super::common::map_send_err_inf)?;
 
         let view = traversal::requires_view(&graph);
         let scores = page_rank(&view, self.args.damping, self.args.iterations);
@@ -286,7 +286,7 @@ impl ToolInstance for BridgesTool {
             .graph
             .ask(crate::graph::manager::GetGraph)
             .await
-            .map_err(|e| super::common::map_send_err_inf(e))?;
+            .map_err(super::common::map_send_err_inf)?;
         // Build an unweighted temp graph to satisfy trait bounds.
         let mut temp = petgraph::graph::Graph::<(), (), petgraph::Directed>::with_capacity(
             graph.node_count(),
@@ -298,17 +298,16 @@ impl ToolInstance for BridgesTool {
             idx_map.push((n, idx));
         }
         for e in graph.edge_indices() {
-            if let EdgeKind::Requires(_) = graph[e].kind {
-                if let Some((u, v)) = graph.edge_endpoints(e) {
-                    let u_idx = idx_map.iter().find(|(orig, _)| *orig == u).unwrap().1;
-                    let v_idx = idx_map.iter().find(|(orig, _)| *orig == v).unwrap().1;
-                    temp.add_edge(u_idx, v_idx, ());
-                }
+            if let EdgeKind::Requires(_) = graph[e].kind
+                && let Some((u, v)) = graph.edge_endpoints(e)
+            {
+                let u_idx = idx_map.iter().find(|(orig, _)| *orig == u).unwrap().1;
+                let v_idx = idx_map.iter().find(|(orig, _)| *orig == v).unwrap().1;
+                temp.add_edge(u_idx, v_idx, ());
             }
         }
 
         let mut list: Vec<_> = bridges(&temp)
-            .into_iter()
             .map(|e| {
                 let (u, v) = (e.source(), e.target());
                 let from_slug = graph[idx_map.iter().find(|(_, idx)| *idx == u).unwrap().0]
@@ -344,7 +343,7 @@ impl ToolInstance for ArticulationTool {
             .graph
             .ask(crate::graph::manager::GetGraph)
             .await
-            .map_err(|e| super::common::map_send_err_inf(e))?;
+            .map_err(super::common::map_send_err_inf)?;
         let mut temp = petgraph::graph::Graph::<(), (), petgraph::Directed>::with_capacity(
             graph.node_count(),
             graph.edge_count(),
@@ -355,12 +354,12 @@ impl ToolInstance for ArticulationTool {
             idx_map.push((n, idx));
         }
         for e in graph.edge_indices() {
-            if let EdgeKind::Requires(_) = graph[e].kind {
-                if let Some((u, v)) = graph.edge_endpoints(e) {
-                    let u_idx = idx_map.iter().find(|(orig, _)| *orig == u).unwrap().1;
-                    let v_idx = idx_map.iter().find(|(orig, _)| *orig == v).unwrap().1;
-                    temp.add_edge(u_idx, v_idx, ());
-                }
+            if let EdgeKind::Requires(_) = graph[e].kind
+                && let Some((u, v)) = graph.edge_endpoints(e)
+            {
+                let u_idx = idx_map.iter().find(|(orig, _)| *orig == u).unwrap().1;
+                let v_idx = idx_map.iter().find(|(orig, _)| *orig == v).unwrap().1;
+                temp.add_edge(u_idx, v_idx, ());
             }
         }
 
@@ -395,7 +394,7 @@ impl ToolInstance for FeedbackTool {
             .graph
             .ask(crate::graph::manager::GetGraph)
             .await
-            .map_err(|e| super::common::map_send_err_inf(e))?;
+            .map_err(super::common::map_send_err_inf)?;
         let view = traversal::requires_view(&graph);
         let set = greedy_feedback_arc_set(&view);
         let mut edges: Vec<_> = set
@@ -429,7 +428,7 @@ impl ToolInstance for ShortestPathTool {
             .graph
             .ask(crate::graph::manager::GetGraph)
             .await
-            .map_err(|e| super::common::map_send_err_inf(e))?;
+            .map_err(super::common::map_send_err_inf)?;
         // resolve slugs
         let from = graph_ref
             .node_indices()

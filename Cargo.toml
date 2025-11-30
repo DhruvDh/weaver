@@ -42,6 +42,14 @@ parking_lot = "0.12"
 reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls"] }
 petgraph = { version = "0.8.3", features = ["all", "serde-1"] }
 rayon = "1.10"
+kameo-persistence = "0.1.0"
+foyer = { version = "0.20.1", features = ["tracing", "serde", "nightly"] }
+url = "2.5"
+state = "0.6.0"
 
 [dev-dependencies]
 proptest = "1.5"
+postcard = "1.0"
+
+[patch.crates-io]
+kameo-persistence = { path = "vendor/kameo-persistence" }

@@ -20,11 +20,13 @@ pub struct GraphSnapshot {
     pub version:       u32,
     pub saved_at_sec:  u64,
     pub course_commit: String,
+    #[serde(default)]
+    pub graph_version: u64,
     pub graph:         CurriculumGraph,
 }
 
 impl GraphSnapshot {
-    pub fn new(graph: CurriculumGraph, course_commit: String) -> Self {
+    pub fn new(graph: CurriculumGraph, course_commit: String, graph_version: u64) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -33,6 +35,7 @@ impl GraphSnapshot {
             version: SNAPSHOT_VERSION,
             saved_at_sec: now,
             course_commit,
+            graph_version,
             graph,
         }
     }
@@ -43,8 +46,9 @@ pub async fn save_graph(
     graph: &CurriculumGraph,
     path: impl AsRef<Path>,
     course_commit: &str,
+    graph_version: u64,
 ) -> anyhow::Result<()> {
-    let snapshot = GraphSnapshot::new(graph.clone(), course_commit.to_string());
+    let snapshot = GraphSnapshot::new(graph.clone(), course_commit.to_string(), graph_version);
 
     // Serialize in a blocking task to avoid hogging async executors on large
     // graphs.

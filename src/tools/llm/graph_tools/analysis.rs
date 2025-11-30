@@ -9,7 +9,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::info;
 
-use super::common::{ensure_knowledge_type, map_send_err_inf, paginate, resolve_slug};
+use super::common::{
+    ensure_knowledge_type, map_send_err_inf, paginate, resolve_slug, resolve_slugs,
+};
 use crate::{
     analysis,
     schema::types::KnowledgeType,
@@ -1351,9 +1353,10 @@ impl ToolInstance for ExtraneousTool {
         )?;
 
         let mut intended = std::collections::HashSet::new();
-        for slug in &self.args.intended_slugs {
-            let id = resolve_slug(&self.graph, slug.clone(), EXTRANEOUS).await?;
-            intended.insert(id);
+        if !self.args.intended_slugs.is_empty() {
+            let ids =
+                resolve_slugs(&self.graph, self.args.intended_slugs.clone(), EXTRANEOUS).await?;
+            intended.extend(ids);
         }
         if intended.is_empty() {
             let derived = crate::analysis::requires_ancestors(&graph, lo);

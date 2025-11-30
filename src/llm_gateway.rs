@@ -1,8 +1,9 @@
 use std::{
     collections::HashMap,
+    convert::Infallible,
     env,
     sync::{
-        Arc,
+        Arc, LazyLock,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -21,16 +22,19 @@ use async_openai::{
     },
 };
 use kameo::{error::SendError, prelude::*, reply::DelegatedReply};
+use kameo_persistence::{BiHashMap, PersistentActor};
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 use rand::{Rng, rng};
 use reqwest::Client as HttpClient;
+use serde::{Deserialize, Serialize};
 use serde_json::{self, json};
 use tokio::{
     sync::Semaphore,
     time::{sleep, timeout},
 };
 use tracing::{debug, error, info, warn};
+use url::Url;
 
 use crate::{
     constants::{
@@ -100,7 +104,7 @@ impl IterationState {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
 struct TokenEstimator {
     observed_bytes:  u64,
     observed_tokens: u64,
@@ -122,7 +126,7 @@ impl TokenEstimator {
     }
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
 struct ConversationAccumulator {
     total_tokens: u64,
     count:        u64,
@@ -141,6 +145,21 @@ pub struct GatewayMetrics {
     conversation_stats:         RwLock<HashMap<String, ConversationAccumulator>>,
     conversation_prompt_tokens: RwLock<HashMap<String, u64>>,
     context_limits:             RwLock<HashMap<String, u32>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatewayMetricsState {
+    total_calls:                u64,
+    total_tokens:               u64,
+    prompt_tokens:              u64,
+    completion_tokens:          u64,
+    last_latency_ms:            u64,
+    last_prompt_tokens:         u64,
+    last_completion_tokens:     u64,
+    estimators:                 HashMap<String, TokenEstimator>,
+    conversation_stats:         HashMap<String, ConversationAccumulator>,
+    conversation_prompt_tokens: HashMap<String, u64>,
+    context_limits:             HashMap<String, u32>,
 }
 
 impl GatewayMetrics {
@@ -240,6 +259,38 @@ impl GatewayMetrics {
         }
     }
 
+    pub fn to_state(&self) -> GatewayMetricsState {
+        GatewayMetricsState {
+            total_calls:                self.total_calls.load(Ordering::Relaxed),
+            total_tokens:               self.total_tokens.load(Ordering::Relaxed),
+            prompt_tokens:              self.prompt_tokens.load(Ordering::Relaxed),
+            completion_tokens:          self.completion_tokens.load(Ordering::Relaxed),
+            last_latency_ms:            self.last_latency_ms.load(Ordering::Relaxed),
+            last_prompt_tokens:         self.last_prompt_tokens.load(Ordering::Relaxed),
+            last_completion_tokens:     self.last_completion_tokens.load(Ordering::Relaxed),
+            estimators:                 self.estimators.read().clone(),
+            conversation_stats:         self.conversation_stats.read().clone(),
+            conversation_prompt_tokens: self.conversation_prompt_tokens.read().clone(),
+            context_limits:             self.context_limits.read().clone(),
+        }
+    }
+
+    pub fn from_state(state: GatewayMetricsState) -> Self {
+        Self {
+            total_calls:                AtomicU64::new(state.total_calls),
+            total_tokens:               AtomicU64::new(state.total_tokens),
+            prompt_tokens:              AtomicU64::new(state.prompt_tokens),
+            completion_tokens:          AtomicU64::new(state.completion_tokens),
+            last_latency_ms:            AtomicU64::new(state.last_latency_ms),
+            last_prompt_tokens:         AtomicU64::new(state.last_prompt_tokens),
+            last_completion_tokens:     AtomicU64::new(state.last_completion_tokens),
+            estimators:                 RwLock::new(state.estimators),
+            conversation_stats:         RwLock::new(state.conversation_stats),
+            conversation_prompt_tokens: RwLock::new(state.conversation_prompt_tokens),
+            context_limits:             RwLock::new(state.context_limits),
+        }
+    }
+
     pub fn context_limit(&self, model: &str) -> u32 {
         if let Some(limit) = self.context_limits.read().get(model) {
             return *limit;
@@ -309,6 +360,71 @@ async fn log_completion_metrics(
     }
 }
 
+fn build_openai_client() -> Result<Client<OpenAIConfig>> {
+    let mut config = OpenAIConfig::default();
+    if let Ok(url) = env::var("OPENAI_API_BASE") {
+        config = config.with_api_base(url);
+    }
+    let http_client = HttpClient::builder()
+        .user_agent("weaver-llm-gateway")
+        .build()
+        .context("failed to build http client")?;
+    Ok(Client::with_config(config).with_http_client(http_client))
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LLMGatewayState {
+    metrics: GatewayMetricsState,
+}
+
+impl From<&LLMGateway> for LLMGatewayState {
+    fn from(gateway: &LLMGateway) -> Self {
+        Self {
+            metrics: gateway.metrics.to_state(),
+        }
+    }
+}
+
+impl From<LLMGatewayState> for LLMGateway {
+    fn from(state: LLMGatewayState) -> Self {
+        let client = build_openai_client().unwrap_or_else(|err| {
+            warn!(error = %err, "failed to rebuild OpenAI client from env; using default config");
+            Client::with_config(OpenAIConfig::default())
+        });
+        Self {
+            client,
+            semaphore: Arc::new(Semaphore::new(LLM_MAX_CONCURRENT_REQUESTS)),
+            config: GatewayConfig::default(),
+            metrics: Arc::new(GatewayMetrics::from_state(state.metrics)),
+        }
+    }
+}
+
+static LLM_GATEWAY_REGISTRY: LazyLock<RwLock<BiHashMap<Url, WeakActorRef<LLMGateway>>>> =
+    LazyLock::new(|| RwLock::new(BiHashMap::new()));
+
+impl PersistentActor for LLMGateway {
+    type Snapshot = LLMGatewayState;
+
+    fn register_persistent(persistence_key: Url, actor_ref: &ActorRef<Self>) -> anyhow::Result<()> {
+        let mut registry = LLM_GATEWAY_REGISTRY.write();
+        let _ = registry.insert(persistence_key, actor_ref.downgrade());
+        Ok(())
+    }
+
+    fn persistence_key(actor_ref: &ActorRef<Self>) -> Option<Url> {
+        let registry = LLM_GATEWAY_REGISTRY.read();
+        registry.get_left(&actor_ref.downgrade()).cloned()
+    }
+
+    fn lookup_persistent(persistence_key: &Url) -> Option<ActorRef<Self>> {
+        let registry = LLM_GATEWAY_REGISTRY.read();
+        registry
+            .get_right(persistence_key)
+            .and_then(|weak| weak.upgrade())
+    }
+}
+
 #[derive(Actor)]
 pub struct LLMGateway {
     client:    Client<OpenAIConfig>,
@@ -317,18 +433,24 @@ pub struct LLMGateway {
     metrics:   Arc<GatewayMetrics>,
 }
 
+pub struct PersistGatewaySnapshot;
+
+impl Message<PersistGatewaySnapshot> for LLMGateway {
+    type Reply = anyhow::Result<()>;
+
+    async fn handle(
+        &mut self,
+        _msg: PersistGatewaySnapshot,
+        ctx: &mut kameo::message::Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.save_snapshot(ctx.actor_ref()).await
+    }
+}
+
 impl LLMGateway {
     /// Build a gateway using environment configuration.
     pub fn from_env() -> Result<Self> {
-        let mut config = OpenAIConfig::default();
-        if let Ok(url) = env::var("OPENAI_API_BASE") {
-            config = config.with_api_base(url);
-        }
-        let http_client = HttpClient::builder()
-            .user_agent("weaver-llm-gateway")
-            .build()
-            .context("failed to build http client")?;
-        let client = Client::with_config(config).with_http_client(http_client);
+        let client = build_openai_client()?;
         Ok(Self {
             client,
             semaphore: Arc::new(Semaphore::new(LLM_MAX_CONCURRENT_REQUESTS)),
@@ -733,6 +855,20 @@ impl LLMGateway {
             "LLM tool loop did not terminate with a message after {} iterations",
             request.max_iterations
         ))
+    }
+}
+
+pub struct GetGatewayMetrics;
+
+impl Message<GetGatewayMetrics> for LLMGateway {
+    type Reply = std::result::Result<Arc<GatewayMetrics>, Infallible>;
+
+    async fn handle(
+        &mut self,
+        _msg: GetGatewayMetrics,
+        _ctx: &mut kameo::message::Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        Ok(Arc::clone(&self.metrics))
     }
 }
 

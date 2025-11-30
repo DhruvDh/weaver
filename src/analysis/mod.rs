@@ -416,7 +416,13 @@ pub fn borrow_ahead(g: &CurriculumGraph, episode: &str) -> Vec<BorrowAhead> {
     for &step in &steps_in_episode {
         for edge in g.edges_directed(step, Direction::Outgoing) {
             if let EdgeKind::Anchors(attrs) = &edge.weight().kind
-                && matches!(attrs.impact, AnchorImpact::Use | AnchorImpact::Motivate)
+                && matches!(
+                    attrs.impact,
+                    AnchorImpact::Use
+                        | AnchorImpact::Motivate
+                        | AnchorImpact::Refine
+                        | AnchorImpact::Target
+                )
             {
                 let target = edge.target();
 

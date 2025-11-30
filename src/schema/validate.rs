@@ -103,10 +103,14 @@ pub fn validate_supports(
         });
     }
     if to.is_assessment_item() {
-        return Err(SchemaError::InvalidEdgeTo {
-            edge: "supports",
-            kind: to,
-        });
+        let allowed =
+            kind == SupportKind::RubricNote && matches!(intended_effect, IntendedEffect::Motivate);
+        if !allowed {
+            return Err(SchemaError::InvalidEdgeTo {
+                edge: "supports",
+                kind: to,
+            });
+        }
     }
     match kind {
         SupportKind::RubricNote

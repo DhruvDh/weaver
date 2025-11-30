@@ -1,20 +1,32 @@
-use std::{convert::Infallible, env, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    convert::Infallible,
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context as _, Result, anyhow};
 use bpaf::{OptionParser, Parser, construct, long, positional};
-use kameo::prelude::*;
+use kameo::{error::SendError, prelude::*};
 use kameo_actors::scheduler::{Scheduler, SetInterval};
+use kameo_persistence::PersistentActor;
+use state::InitCell;
 use tracing::{debug, error};
 use tracing_subscriber::EnvFilter;
+use url::Url;
 use weaver::{
     constants::PRETEXT_SUBDIR,
     file_reader::{FileReader, FileReaderQuery},
     graph::{
-        GraphConfig, GraphService,
-        manager::{GraphManager, RedundantRequires, SaveSnapshot},
+        CurriculumGraph, GraphConfig,
+        manager::{
+            ApplyRuntimeConfig, GraphManager, GraphManagerState, PersistSnapshot,
+            RedundantRequires, SaveSnapshot,
+        },
         persist,
     },
-    llm_gateway::LLMGateway,
+    llm_gateway::{GatewayMetrics, GetGatewayMetrics, LLMGateway, PersistGatewaySnapshot},
     rerun_sink::{RerunSink, RerunTarget},
 };
 
@@ -48,9 +60,10 @@ enum RerunMode {
 
 #[derive(Clone)]
 struct AutosaveWorker {
-    graph: ActorRef<GraphManager>,
-    path:  PathBuf,
-    rerun: Option<ActorRef<RerunSink>>,
+    graph:   ActorRef<GraphManager>,
+    gateway: Option<ActorRef<LLMGateway>>,
+    path:    PathBuf,
+    rerun:   Option<ActorRef<RerunSink>>,
 }
 
 impl Actor for AutosaveWorker {
@@ -86,27 +99,58 @@ impl Message<AutosaveTick> for AutosaveWorker {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let start = std::time::Instant::now();
-        let path = self.path.clone();
-        match self.graph.ask(SaveSnapshot { path }).await {
-            Ok(()) => {
-                debug!("graph autosave completed");
-                log_scalar(
-                    &self.rerun,
-                    "metrics/autosave/duration_ms",
-                    start.elapsed().as_secs_f64() * 1000.0,
-                );
-                log_scalar(&self.rerun, "metrics/autosave/success", 1.0);
+        let persist: Result<(), anyhow::Error> = match self.graph.ask(PersistSnapshot).await {
+            Ok(()) => Ok(()),
+            Err(SendError::HandlerError(e)) => Err(e),
+            Err(e) => Err(anyhow!(e)),
+        };
+        let snapshot: Result<(), anyhow::Error> = match self
+            .graph
+            .ask(SaveSnapshot {
+                path: self.path.clone(),
+            })
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(SendError::HandlerError(e)) => Err(e),
+            Err(e) => Err(anyhow!(e)),
+        };
+        let gateway_persist: Result<(), anyhow::Error> = if let Some(gateway) = &self.gateway {
+            match gateway.ask(PersistGatewaySnapshot).await {
+                Ok(()) => Ok(()),
+                Err(SendError::HandlerError(e)) => Err(e),
+                Err(e) => Err(anyhow!(e)),
             }
-            Err(err) => {
-                error!(error = ?err, "graph autosave failed");
-                log_scalar(
-                    &self.rerun,
-                    "metrics/autosave/duration_ms",
-                    start.elapsed().as_secs_f64() * 1000.0,
-                );
-                log_scalar(&self.rerun, "metrics/autosave/success", 0.0);
-            }
+        } else {
+            Ok(())
+        };
+        let ok = persist.is_ok() && snapshot.is_ok() && gateway_persist.is_ok();
+
+        if ok {
+            debug!("graph autosave completed (persistence + legacy snapshot)");
+        } else {
+            error!(
+                persist_error = persist
+                    .as_ref()
+                    .err()
+                    .map(|e: &anyhow::Error| e.to_string()),
+                snapshot_error = snapshot
+                    .as_ref()
+                    .err()
+                    .map(|e: &anyhow::Error| e.to_string()),
+                gateway_error = gateway_persist
+                    .as_ref()
+                    .err()
+                    .map(|e: &anyhow::Error| e.to_string()),
+                "graph autosave failed"
+            );
         }
+        log_scalar(
+            &self.rerun,
+            "metrics/autosave/duration_ms",
+            start.elapsed().as_secs_f64() * 1000.0,
+        );
+        log_scalar(&self.rerun, "metrics/autosave/success", if ok { 1.0 } else { 0.0 });
     }
 }
 
@@ -144,9 +188,40 @@ impl Message<PruneTick> for PruneWorker {
 
 #[derive(Clone, Debug)]
 struct Cli {
-    rerun_mode: RerunMode,
-    rerun_file: PathBuf,
-    workspace:  PathBuf,
+    rerun_mode:             RerunMode,
+    rerun_file:             PathBuf,
+    workspace:              PathBuf,
+    graph_snapshot_path:    PathBuf,
+    graph_autosave_secs:    u64,
+    graph_course_commit:    String,
+    graph_strict_quality:   bool,
+    graph_prune_requires_s: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+struct AppConfig {
+    rerun_mode:             RerunMode,
+    rerun_file:             PathBuf,
+    workspace:              PathBuf,
+    graph_snapshot_path:    PathBuf,
+    graph_autosave_secs:    u64,
+    graph_course_commit:    String,
+    graph_strict_quality:   bool,
+    graph_prune_requires_s: Option<u64>,
+}
+
+static APP_CONFIG: InitCell<AppConfig> = InitCell::new();
+
+fn app_config() -> &'static AppConfig {
+    APP_CONFIG.get()
+}
+
+fn ensure_parent_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create directory {}", parent.display()))?;
+    }
+    Ok(())
 }
 
 fn cli() -> OptionParser<Cli> {
@@ -168,24 +243,40 @@ fn cli() -> OptionParser<Cli> {
         .help("Path to write Rerun .rrd when rerun-mode includes file (default weaver.rrd)")
         .argument::<PathBuf>("path")
         .fallback(PathBuf::from("weaver.rrd"));
-    construct! { Cli { rerun_mode, rerun_file, workspace } }.to_options()
-}
+    let graph_snapshot_path = long("graph-snapshot-path")
+        .help("Path for the legacy JSON graph snapshot (default graph_snapshot.json)")
+        .argument::<PathBuf>("path")
+        .fallback(PathBuf::from("graph_snapshot.json"));
+    let graph_autosave_secs = long("graph-autosave-secs")
+        .help("Autosave interval in seconds (default 300)")
+        .argument::<u64>("secs")
+        .fallback(300);
+    let graph_course_commit = long("graph-course-commit")
+        .help("Course commit hash to embed in snapshots (default empty)")
+        .argument::<String>("hash")
+        .fallback(String::new());
+    let graph_strict_quality = long("graph-strict-quality")
+        .short('q')
+        .help("Enable strict graph quality checks (promote warnings to errors)")
+        .switch();
+    let graph_prune_requires_s = long("graph-prune-requires-secs")
+        .help("Optional interval (seconds) to prune redundant requires edges; omit to disable")
+        .argument::<u64>("secs")
+        .optional();
 
-fn env_override_mode(default: RerunMode) -> RerunMode {
-    match env::var("WEAVER_RERUN_MODE").ok().as_deref() {
-        Some("grpc") => RerunMode::Grpc,
-        Some("file") => RerunMode::File,
-        Some("both") => RerunMode::Both,
-        Some("none") => RerunMode::None,
-        _ => default,
+    construct! {
+        Cli {
+            rerun_mode,
+            rerun_file,
+            workspace,
+            graph_snapshot_path,
+            graph_autosave_secs,
+            graph_course_commit,
+            graph_strict_quality,
+            graph_prune_requires_s,
+        }
     }
-}
-
-fn env_override_file(default: PathBuf) -> PathBuf {
-    env::var("WEAVER_RERUN_FILE")
-        .ok()
-        .map(PathBuf::from)
-        .unwrap_or(default)
+    .to_options()
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -194,10 +285,26 @@ async fn main() -> Result<()> {
         rerun_mode,
         rerun_file,
         workspace,
+        graph_snapshot_path,
+        graph_autosave_secs,
+        graph_course_commit,
+        graph_strict_quality,
+        graph_prune_requires_s,
     } = cli().run();
-    // Env vars act as defaults; CLI takes precedence when provided.
-    let rerun_mode = env_override_mode(rerun_mode);
-    let rerun_file = env_override_file(rerun_file);
+
+    let app_cfg = AppConfig {
+        rerun_mode,
+        rerun_file,
+        workspace,
+        graph_snapshot_path,
+        graph_autosave_secs,
+        graph_course_commit,
+        graph_strict_quality,
+        graph_prune_requires_s,
+    };
+    APP_CONFIG.set(app_cfg.clone());
+    let app_cfg = app_config().clone();
+
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     tracing_subscriber::fmt()
@@ -208,63 +315,132 @@ async fn main() -> Result<()> {
 
     debug!("FileReader demo starting");
 
-    let course_commit = env::var("GRAPH_COURSE_COMMIT").unwrap_or_default();
-    let autosave_path =
-        env::var("GRAPH_SNAPSHOT_PATH").unwrap_or_else(|_| "graph_snapshot.json".to_string());
-    let autosave_secs = env::var("GRAPH_AUTOSAVE_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(300);
-    let mut graph_config = GraphConfig {
-        course_commit: course_commit.clone(),
-        autosave_path: autosave_path.clone().into(),
-        autosave_secs,
+    let graph_config = GraphConfig {
+        course_commit:  app_cfg.graph_course_commit.clone(),
+        autosave_path:  app_cfg.graph_snapshot_path.clone(),
+        autosave_secs:  app_cfg.graph_autosave_secs,
+        strict_quality: app_cfg.graph_strict_quality,
     };
 
-    // Load snapshot first (if present) to avoid autosaving an empty graph.
-    let snapshot_path: PathBuf = autosave_path.clone().into();
-    let loaded_snapshot = if snapshot_path.exists() {
-        match persist::load_graph(&snapshot_path).await {
-            Ok(snapshot) => {
-                debug!(path = %snapshot_path.display(), "loaded existing graph snapshot");
-                Some(snapshot)
+    let snapshot_path: PathBuf = graph_config.autosave_path.clone();
+    let state_root = if snapshot_path.extension().is_some() {
+        snapshot_path.with_extension("state")
+    } else {
+        snapshot_path.clone()
+    };
+    let graph_state_dir = state_root.join("graph_manager");
+    let gateway_state_dir = state_root.join("llm_gateway");
+
+    let cwd = std::env::current_dir()?;
+    let graph_state_url = Url::from_directory_path(cwd.join(&graph_state_dir))
+        .map_err(|_| anyhow!("invalid graph state path {}", graph_state_dir.display()))?;
+    let gateway_state_url = Url::from_directory_path(cwd.join(&gateway_state_dir))
+        .map_err(|_| anyhow!("invalid gateway state path {}", gateway_state_dir.display()))?;
+    ensure_parent_dir(&graph_config.autosave_path)?;
+    fs::create_dir_all(&graph_state_dir)
+        .with_context(|| format!("create graph state dir {}", graph_state_dir.display()))?;
+    fs::create_dir_all(&gateway_state_dir)
+        .with_context(|| format!("create gateway state dir {}", gateway_state_dir.display()))?;
+    ensure_parent_dir(&app_cfg.rerun_file)?;
+
+    let graph_actor = match GraphManager::respawn_persistent(graph_state_url.clone()).await {
+        Ok(actor) => {
+            debug!(path = %graph_state_dir.display(), "restored graph manager from persistent snapshot");
+            // Apply current CLI config to ensure strict_quality/course_commit match this
+            // run.
+            if let Err(err) = actor
+                .ask(ApplyRuntimeConfig {
+                    course_commit:  graph_config.course_commit.clone(),
+                    strict_quality: graph_config.strict_quality,
+                })
+                .await
+            {
+                error!(error = ?err, "failed to apply runtime graph config after restore");
+                std::process::exit(1);
             }
-            Err(err) => {
-                error!(
-                    error = %err,
-                    path = %snapshot_path.display(),
-                    "failed to load graph snapshot; starting with empty graph"
-                );
-                None
+            // Persist the updated settings so subsequent restarts align.
+            if let Err(err) = actor.ask(PersistSnapshot).await {
+                error!(error = ?err, "failed to persist graph manager after applying runtime config");
             }
+            actor
         }
-    } else {
-        None
+        Err(err) => {
+            debug!(
+                error = %err,
+                path = %graph_state_dir.display(),
+                "graph state restore unavailable; falling back to legacy snapshot or empty graph"
+            );
+            let state = if snapshot_path.exists() {
+                match persist::load_graph(&snapshot_path).await {
+                    Ok(snapshot) => {
+                        debug!(path = %snapshot_path.display(), "loaded legacy graph snapshot");
+                        GraphManagerState::new(
+                            snapshot.graph,
+                            graph_config.course_commit.clone(),
+                            graph_config.strict_quality,
+                            snapshot.graph_version,
+                        )
+                    }
+                    Err(err) => {
+                        error!(
+                            error = %err,
+                            path = %snapshot_path.display(),
+                            "failed to load graph snapshot; starting with empty graph"
+                        );
+                        GraphManagerState::new(
+                            CurriculumGraph::default(),
+                            graph_config.course_commit.clone(),
+                            graph_config.strict_quality,
+                            0,
+                        )
+                    }
+                }
+            } else {
+                GraphManagerState::new(
+                    CurriculumGraph::default(),
+                    graph_config.course_commit.clone(),
+                    graph_config.strict_quality,
+                    0,
+                )
+            };
+            GraphManager::spawn_persistent(graph_state_url.clone(), state).await?
+        }
     };
 
-    let service = if let Some(snapshot) = loaded_snapshot {
-        graph_config.course_commit = snapshot.course_commit.clone();
-        GraphService::from_graph(snapshot.graph)
-    } else {
-        GraphService::new()
+    let (gateway, metrics) = match LLMGateway::respawn_persistent(gateway_state_url.clone()).await {
+        Ok(actor) => {
+            debug!(path = %gateway_state_dir.display(), "restored LLM gateway from persistent snapshot");
+            let metrics = actor.ask(GetGatewayMetrics).await.unwrap_or_else(|err| {
+                error!(error = ?err, "failed to fetch gateway metrics after restore");
+                Arc::new(GatewayMetrics::default())
+            });
+            (actor, metrics)
+        }
+        Err(err) => {
+            debug!(
+                error = %err,
+                path = %gateway_state_dir.display(),
+                "gateway state restore unavailable; creating new gateway"
+            );
+            let instance = LLMGateway::from_env()?;
+            let metrics = instance.metrics();
+            let actor = LLMGateway::spawn_persistent(gateway_state_url.clone(), instance).await?;
+            (actor, metrics)
+        }
     };
 
-    let gateway_instance = LLMGateway::from_env()?;
-    let metrics = gateway_instance.metrics();
-    let gateway = LLMGateway::spawn(gateway_instance);
-    let graph_actor = GraphManager::spawn(GraphManager::new(service, graph_config.clone()));
     let scheduler = Scheduler::spawn(Scheduler::new());
 
     let mut rerun_targets = Vec::new();
-    if matches!(rerun_mode, RerunMode::Grpc | RerunMode::Both) {
+    if matches!(app_cfg.rerun_mode, RerunMode::Grpc | RerunMode::Both) {
         rerun_targets.push(RerunTarget::Grpc {
             name: "weaver".into(),
         });
     }
-    if matches!(rerun_mode, RerunMode::File | RerunMode::Both) {
+    if matches!(app_cfg.rerun_mode, RerunMode::File | RerunMode::Both) {
         rerun_targets.push(RerunTarget::File {
             name: "weaver".into(),
-            path: rerun_file.clone(),
+            path: app_cfg.rerun_file.clone(),
         });
     }
     let rerun_actor = if rerun_targets.is_empty() {
@@ -276,9 +452,10 @@ async fn main() -> Result<()> {
     // Autosave the graph periodically via scheduler to keep interval logic inside
     // the actor system.
     let autosave_worker = AutosaveWorker {
-        graph: graph_actor.clone(),
-        path:  graph_config.autosave_path.clone(),
-        rerun: rerun_actor.clone(),
+        graph:   graph_actor.clone(),
+        gateway: Some(gateway.clone()),
+        path:    graph_config.autosave_path.clone(),
+        rerun:   rerun_actor.clone(),
     };
     let autosave_ref = AutosaveWorker::spawn(autosave_worker);
     let autosave_interval = SetInterval::new(
@@ -292,27 +469,22 @@ async fn main() -> Result<()> {
         .expect("scheduler actor not running");
 
     // Optional periodic prune of redundant requires edges.
-    if let Some(prune_secs) = env::var("GRAPH_PRUNE_REQUIRES_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-    {
-        if prune_secs > 0 {
-            let prune_worker = PruneWorker {
-                graph: graph_actor.clone(),
-                rerun: rerun_actor.clone(),
-            };
-            let prune_ref = PruneWorker::spawn(prune_worker);
-            let prune_interval =
-                SetInterval::new(prune_ref.downgrade(), Duration::from_secs(prune_secs), PruneTick);
-            scheduler
-                .tell(prune_interval)
-                .await
-                .expect("scheduler actor not running");
-        }
+    if let Some(prune_secs) = app_cfg.graph_prune_requires_s.filter(|value| *value > 0) {
+        let prune_worker = PruneWorker {
+            graph: graph_actor.clone(),
+            rerun: rerun_actor.clone(),
+        };
+        let prune_ref = PruneWorker::spawn(prune_worker);
+        let prune_interval =
+            SetInterval::new(prune_ref.downgrade(), Duration::from_secs(prune_secs), PruneTick);
+        scheduler
+            .tell(prune_interval)
+            .await
+            .expect("scheduler actor not running");
     }
 
     let actor = match FileReader::from_env(
-        workspace,
+        app_cfg.workspace.clone(),
         gateway.clone(),
         Arc::clone(&metrics),
         graph_actor.clone(),

@@ -1,15 +1,48 @@
-use std::{convert::Infallible, path::PathBuf, sync::Arc};
+use std::{
+    convert::Infallible,
+    path::PathBuf,
+    sync::{Arc, LazyLock, RwLock},
+    time::Instant,
+};
 
 use anyhow::Result;
 use kameo::prelude::*;
+use kameo_persistence::{BiHashMap, PersistentActor};
 use petgraph::{Direction, visit::EdgeRef};
 use schemars::JsonSchema;
+use tracing::warn;
+use url::Url;
 
 use crate::graph::{
     AnchorImpact, AnchorsAttrs, AssessesAttrs, CurriculumGraph, EdgeKind, GraphConfig, GraphError,
     GraphService, KnowledgeNode, NodeId, NodePayload, PrecedesAttrs, RequiresAttrs, SupportsAttrs,
     TeachingStepNode, persist,
 };
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct GraphManagerState {
+    pub graph:          CurriculumGraph,
+    pub course_commit:  String,
+    pub strict_quality: bool,
+    #[serde(default)]
+    pub graph_version:  u64,
+}
+
+impl GraphManagerState {
+    pub fn new(
+        graph: CurriculumGraph,
+        course_commit: String,
+        strict_quality: bool,
+        graph_version: u64,
+    ) -> Self {
+        Self {
+            graph,
+            course_commit,
+            strict_quality,
+            graph_version,
+        }
+    }
+}
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct Neighbor {
@@ -36,15 +69,81 @@ pub enum NeighborDirection {
     Both,
 }
 
-#[derive(Actor)]
 pub struct GraphManager {
-    service: GraphService,
-    config:  GraphConfig,
+    service:       GraphService,
+    course_commit: String,
 }
 
 impl GraphManager {
     pub fn new(service: GraphService, config: GraphConfig) -> Self {
-        Self { service, config }
+        Self {
+            service,
+            course_commit: config.course_commit,
+        }
+    }
+
+    fn log_write_latency(op: &str, start: Instant) {
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        tracing::debug!(target: "weaver.graph.write_latency", op, elapsed_ms);
+    }
+}
+
+impl From<&GraphManager> for GraphManagerState {
+    fn from(manager: &GraphManager) -> Self {
+        GraphManagerState {
+            graph:          manager.service.snapshot_graph(),
+            course_commit:  manager.course_commit.clone(),
+            strict_quality: manager.service.strict_quality(),
+            graph_version:  manager.service.graph_version(),
+        }
+    }
+}
+
+impl Actor for GraphManager {
+    type Args = GraphManagerState;
+    type Error = Infallible;
+
+    async fn on_start(state: Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
+        let strict = state.strict_quality;
+        let service = match GraphService::from_parts(state.graph, strict, state.graph_version) {
+            Ok(svc) => svc,
+            Err(err) => {
+                warn!(error = %err, "invalid persisted graph; starting with empty graph");
+                GraphService::new().with_strict(strict)
+            }
+        };
+
+        Ok(Self {
+            service,
+            course_commit: state.course_commit,
+        })
+    }
+}
+
+static GRAPH_MANAGER_REGISTRY: LazyLock<RwLock<BiHashMap<Url, WeakActorRef<GraphManager>>>> =
+    LazyLock::new(|| RwLock::new(BiHashMap::new()));
+
+impl PersistentActor for GraphManager {
+    type Snapshot = GraphManagerState;
+
+    fn register_persistent(persistence_key: Url, actor_ref: &ActorRef<Self>) -> anyhow::Result<()> {
+        let mut registry = GRAPH_MANAGER_REGISTRY
+            .write()
+            .map_err(|_| anyhow::anyhow!("graph manager registry poisoned"))?;
+        let _ = registry.insert(persistence_key, actor_ref.downgrade());
+        Ok(())
+    }
+
+    fn persistence_key(actor_ref: &ActorRef<Self>) -> Option<Url> {
+        let registry = GRAPH_MANAGER_REGISTRY.read().ok()?;
+        registry.get_left(&actor_ref.downgrade()).cloned()
+    }
+
+    fn lookup_persistent(persistence_key: &Url) -> Option<ActorRef<Self>> {
+        let registry = GRAPH_MANAGER_REGISTRY.read().ok()?;
+        registry
+            .get_right(persistence_key)
+            .and_then(|weak| weak.upgrade())
     }
 }
 
@@ -94,7 +193,12 @@ impl Message<InsertKnowledge> for GraphManager {
         }: InsertKnowledge,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.service.add_knowledge_node(slug, payload, tags)
+        let start = Instant::now();
+        let res = self.service.add_knowledge_node(slug, payload, tags);
+        if res.is_ok() {
+            GraphManager::log_write_latency("insert_knowledge", start);
+        }
+        res
     }
 }
 
@@ -110,7 +214,12 @@ impl Message<UpdateKnowledge> for GraphManager {
         }: UpdateKnowledge,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.service.update_knowledge_node(&slug, payload, tags)
+        let start = Instant::now();
+        let res = self.service.update_knowledge_node(&slug, payload, tags);
+        if res.is_ok() {
+            GraphManager::log_write_latency("update_knowledge", start);
+        }
+        res
     }
 }
 
@@ -138,7 +247,12 @@ impl Message<InsertTeachingStep> for GraphManager {
         }: InsertTeachingStep,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.service.add_teaching_step(slug, payload, tags)
+        let start = Instant::now();
+        let res = self.service.add_teaching_step(slug, payload, tags);
+        if res.is_ok() {
+            GraphManager::log_write_latency("insert_teaching_step", start);
+        }
+        res
     }
 }
 
@@ -154,7 +268,12 @@ impl Message<UpdateTeachingStep> for GraphManager {
         }: UpdateTeachingStep,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.service.update_teaching_step(&slug, payload, tags)
+        let start = Instant::now();
+        let res = self.service.update_teaching_step(&slug, payload, tags);
+        if res.is_ok() {
+            GraphManager::log_write_latency("update_teaching_step", start);
+        }
+        res
     }
 }
 
@@ -178,11 +297,16 @@ impl Message<AddRequires> for GraphManager {
         }: AddRequires,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        let start = Instant::now();
         let from_id = self.service.node_by_slug(&from)?;
         let to_id = self.service.node_by_slug(&to)?;
-        self.service
-            .add_edge::<crate::graph::RequiresSpec>(from_id, to_id, attrs, confidence)?;
-        Ok(())
+        let res = self
+            .service
+            .add_edge::<crate::graph::RequiresSpec>(from_id, to_id, attrs, confidence);
+        if res.is_ok() {
+            GraphManager::log_write_latency("add_requires", start);
+        }
+        res.map(|_| ())
     }
 }
 
@@ -206,11 +330,16 @@ impl Message<AddSupports> for GraphManager {
         }: AddSupports,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        let start = Instant::now();
         let from_id = self.service.node_by_slug(&from)?;
         let to_id = self.service.node_by_slug(&to)?;
-        self.service
-            .add_edge::<crate::graph::SupportsSpec>(from_id, to_id, attrs, confidence)?;
-        Ok(())
+        let res = self
+            .service
+            .add_edge::<crate::graph::SupportsSpec>(from_id, to_id, attrs, confidence);
+        if res.is_ok() {
+            GraphManager::log_write_latency("add_supports", start);
+        }
+        res.map(|_| ())
     }
 }
 
@@ -234,11 +363,16 @@ impl Message<AddAssesses> for GraphManager {
         }: AddAssesses,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        let start = Instant::now();
         let from_id = self.service.node_by_slug(&from)?;
         let to_id = self.service.node_by_slug(&to)?;
-        self.service
-            .add_edge::<crate::graph::AssessesSpec>(from_id, to_id, attrs, confidence)?;
-        Ok(())
+        let res = self
+            .service
+            .add_edge::<crate::graph::AssessesSpec>(from_id, to_id, attrs, confidence);
+        if res.is_ok() {
+            GraphManager::log_write_latency("add_assesses", start);
+        }
+        res.map(|_| ())
     }
 }
 
@@ -262,15 +396,19 @@ impl Message<AddPrecedes> for GraphManager {
         }: AddPrecedes,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        let start = Instant::now();
         let from_id = self.service.node_by_slug(&from)?;
         let to_id = self.service.node_by_slug(&to)?;
-        self.service.add_edge::<crate::graph::PrecedesSpec>(
+        let res = self.service.add_edge::<crate::graph::PrecedesSpec>(
             from_id,
             to_id,
             PrecedesAttrs { episode },
             confidence,
-        )?;
-        Ok(())
+        );
+        if res.is_ok() {
+            GraphManager::log_write_latency("add_precedes", start);
+        }
+        res.map(|_| ())
     }
 }
 
@@ -294,15 +432,19 @@ impl Message<AddAnchors> for GraphManager {
         }: AddAnchors,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        let start = Instant::now();
         let from_id = self.service.node_by_slug(&from)?;
         let to_id = self.service.node_by_slug(&to)?;
-        self.service.add_edge::<crate::graph::AnchorsSpec>(
+        let res = self.service.add_edge::<crate::graph::AnchorsSpec>(
             from_id,
             to_id,
             AnchorsAttrs { impact },
             confidence,
-        )?;
-        Ok(())
+        );
+        if res.is_ok() {
+            GraphManager::log_write_latency("add_anchors", start);
+        }
+        res.map(|_| ())
     }
 }
 
@@ -401,6 +543,22 @@ impl Message<ResolveSlug> for GraphManager {
     }
 }
 
+impl Message<ResolveSlugs> for GraphManager {
+    type Reply = Result<Vec<NodeId>, GraphError>;
+
+    async fn handle(
+        &mut self,
+        ResolveSlugs { slugs }: ResolveSlugs,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let mut ids = Vec::with_capacity(slugs.len());
+        for slug in slugs {
+            ids.push(self.service.node_by_slug(&slug)?);
+        }
+        Ok(ids)
+    }
+}
+
 impl Message<RenameNode> for GraphManager {
     type Reply = Result<(), GraphError>;
 
@@ -409,7 +567,12 @@ impl Message<RenameNode> for GraphManager {
         RenameNode { old_slug, new_slug }: RenameNode,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.service.rename_node(&old_slug, new_slug)
+        let start = Instant::now();
+        let res = self.service.rename_node(&old_slug, new_slug);
+        if res.is_ok() {
+            GraphManager::log_write_latency("rename_node", start);
+        }
+        res
     }
 }
 
@@ -421,13 +584,20 @@ impl Message<RemoveNode> for GraphManager {
         RemoveNode { slug }: RemoveNode,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.service.remove_node(&slug)
+        let start = Instant::now();
+        let res = self.service.remove_node(&slug);
+        if res.is_ok() {
+            GraphManager::log_write_latency("remove_node", start);
+        }
+        res
     }
 }
 
 pub struct SaveSnapshot {
     pub path: PathBuf,
 }
+
+pub struct PersistSnapshot;
 
 pub struct Neighbors {
     pub slug:      String,
@@ -448,8 +618,17 @@ pub struct ResolveSlug {
     pub slug: String,
 }
 
+pub struct ResolveSlugs {
+    pub slugs: Vec<String>,
+}
+
 pub struct RedundantRequires {
     pub prune: bool,
+}
+
+pub struct ApplyRuntimeConfig {
+    pub course_commit:  String,
+    pub strict_quality: bool,
 }
 
 impl Message<SaveSnapshot> for GraphManager {
@@ -461,7 +640,20 @@ impl Message<SaveSnapshot> for GraphManager {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let graph = self.service.shared_graph();
-        persist::save_graph(graph.as_ref(), path, &self.config.course_commit).await
+        persist::save_graph(graph.as_ref(), path, &self.course_commit, self.service.graph_version())
+            .await
+    }
+}
+
+impl Message<PersistSnapshot> for GraphManager {
+    type Reply = Result<()>;
+
+    async fn handle(
+        &mut self,
+        _msg: PersistSnapshot,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.save_snapshot(ctx.actor_ref()).await
     }
 }
 
@@ -473,6 +665,7 @@ impl Message<RedundantRequires> for GraphManager {
         RedundantRequires { prune }: RedundantRequires,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        let start = Instant::now();
         let edges: Vec<(String, String)> = self
             .service
             .redundant_requires()
@@ -482,7 +675,10 @@ impl Message<RedundantRequires> for GraphManager {
             })
             .collect();
         if prune {
-            let _ = self.service.prune_redundant_requires();
+            let removed = self.service.prune_redundant_requires();
+            if removed > 0 {
+                GraphManager::log_write_latency("prune_redundant_requires", start);
+            }
         }
         Ok(edges)
     }
@@ -500,9 +696,38 @@ impl Message<LoadSnapshot> for GraphManager {
         LoadSnapshot { path }: LoadSnapshot,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        let start = Instant::now();
         let snapshot = persist::load_graph(&path).await?;
-        self.service.replace_graph(snapshot.graph)?;
-        self.config.course_commit = snapshot.course_commit;
+        self.service
+            .install_graph(snapshot.graph, snapshot.graph_version)?;
+        self.service.bump_version();
+        self.course_commit = snapshot.course_commit;
+        GraphManager::log_write_latency("load_snapshot", start);
+        Ok(())
+    }
+}
+
+impl Message<ApplyRuntimeConfig> for GraphManager {
+    type Reply = Result<()>;
+
+    async fn handle(
+        &mut self,
+        ApplyRuntimeConfig {
+            course_commit,
+            strict_quality,
+        }: ApplyRuntimeConfig,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let prev_strict = self.service.strict_quality();
+
+        if strict_quality != prev_strict
+            && let Err(err) = self.service.set_strict_quality(strict_quality)
+        {
+            return Err(err.into());
+        }
+
+        self.course_commit = course_commit;
+
         Ok(())
     }
 }
