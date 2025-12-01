@@ -31,6 +31,7 @@ Cost/preview: summary tools accept `fetch_body` (default `false`). In preview mo
 | `graph_assessment_gaps` | analysis | LOS w/o target assessments; orphan/unreachable assessments | `fetch_body` |
 | `graph_discourse_orphans` | analysis | TeachingSteps lacking precedes links | `episode` (optional) |
 | `graph_borrow_ahead` | analysis | Borrow-ahead uses within an episode | `episode` |
+| `graph_analysis_cache_clear` | admin | Clear all cached graph analyses (ops) | — |
 
 ### Commands (mutations)
 All command outputs now follow `{type: "graph_command", tool: <id>, status: "ok", ...}` and may echo key fields (e.g., slugs, path):

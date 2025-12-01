@@ -12,17 +12,19 @@ use tracing::info;
 
 use super::{
     analysis_cache::{AnalysisCache, AnalysisCacheKey, AnalysisKind},
-    common::{ensure_knowledge_type, map_send_err_inf, paginate, resolve_slug, resolve_slugs},
+    common::{
+        ensure_knowledge_type, map_send_err_inf, paginate, parse_args_with_builder, resolve_slug,
+        resolve_slugs,
+    },
 };
 use crate::{
     analysis,
     graph::{CurriculumGraph, NodeId},
     schema::types::KnowledgeType,
     tools::llm::{
-        CallState, ToolExecutionError, ToolInputError, ToolInputResult, ToolInstance, ToolOutput,
-        ToolPayloadMode, ToolPrototype, apply_preview_cost, build_cost_preview,
-        estimate_tokens_from_characters, payload_size_bytes, prepare_payload_estimates,
-        require_string, schema_for_args,
+        CallState, ToolExecutionError, ToolInputResult, ToolInstance, ToolOutput, ToolPayloadMode,
+        ToolPrototype, apply_preview_cost, build_cost_preview, estimate_tokens_from_characters,
+        payload_size_bytes, prepare_payload_estimates, require_string, schema_for_args,
     },
 };
 
@@ -33,11 +35,40 @@ pub struct NoArgs {}
 
 async fn load_graph_with_version(
     graph: &ActorRef<crate::graph::manager::GraphManager>,
+    cache: &AnalysisCache,
 ) -> Result<(Arc<CurriculumGraph>, u64), ToolExecutionError> {
-    graph
+    let (g, version): (Arc<CurriculumGraph>, u64) = graph
         .ask(crate::graph::manager::GetGraphWithVersion)
         .await
-        .map_err(map_send_err_inf)
+        .map_err(map_send_err_inf)?;
+    cache.prune_for_version(version);
+    Ok((g, version))
+}
+
+async fn load_lo_with_graph(
+    graph: &ActorRef<crate::graph::manager::GraphManager>,
+    cache: &AnalysisCache,
+    lo_slug: &str,
+    tool: &'static str,
+) -> Result<(Arc<CurriculumGraph>, u64, NodeId), ToolExecutionError> {
+    let lo = resolve_slug(graph, lo_slug.to_string(), tool).await?;
+    let (g, version) = load_graph_with_version(graph, cache).await?;
+    ensure_knowledge_type(&g, lo, lo_slug, KnowledgeType::LearningOutcome, tool)?;
+    Ok((g, version, lo))
+}
+
+async fn load_lo_with_graph_only(
+    graph: &ActorRef<crate::graph::manager::GraphManager>,
+    lo_slug: &str,
+    tool: &'static str,
+) -> Result<(Arc<CurriculumGraph>, NodeId), ToolExecutionError> {
+    let lo = resolve_slug(graph, lo_slug.to_string(), tool).await?;
+    let g: Arc<CurriculumGraph> = graph
+        .ask(crate::graph::manager::GetGraph)
+        .await
+        .map_err(map_send_err_inf)?;
+    ensure_knowledge_type(&g, lo, lo_slug, KnowledgeType::LearningOutcome, tool)?;
+    Ok((g, lo))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +125,45 @@ struct CachedGapBundle {
 fn decode_cached<T: for<'de> Deserialize<'de>>(value: &Value) -> Result<T, ToolExecutionError> {
     serde_json::from_value(value.clone())
         .map_err(|err| ToolExecutionError::Internal(anyhow!("cache decode failed: {err}")))
+}
+
+fn finalize_summary_tool(
+    tool: &'static str,
+    payload: serde_json::Value,
+    fetch_body: bool,
+    metrics: &crate::tools::llm::GatewayMetrics,
+    model: &str,
+    conversation_id: &str,
+    hint_prefix: &str,
+    meta: &crate::graph::manager::GraphMeta,
+) -> Result<ToolOutput, ToolExecutionError> {
+    let payload_with_meta = super::common::attach_meta(payload, meta);
+    let approx_bytes = payload_size_bytes(&payload_with_meta);
+    let estimates = prepare_payload_estimates(metrics, model, approx_bytes);
+    let mode = ToolPayloadMode::from_fetch_flag(fetch_body);
+    info!(tool = tool, mode = mode.as_str(), approx_bytes, "graph summary tool");
+
+    match mode {
+        ToolPayloadMode::Preview => {
+            let hints = vec![format!(
+                "{hint_prefix} ~{} bytes; set fetch_body=true to retrieve it.",
+                approx_bytes
+            )];
+            let mut preview = build_cost_preview(tool, approx_bytes, estimates.safe_tokens, hints);
+            let preview_bytes = payload_size_bytes(&preview);
+            let preview_tokens = estimate_tokens_from_characters(preview_bytes as usize);
+            apply_preview_cost(
+                &mut preview,
+                metrics,
+                model,
+                conversation_id,
+                preview_tokens,
+                estimates.safe_tokens,
+            );
+            Ok(ToolOutput::with_byte_hint(preview, preview_bytes))
+        }
+        ToolPayloadMode::Body => Ok(ToolOutput::with_byte_hint(payload_with_meta, approx_bytes)),
+    }
 }
 
 fn cache_lo_bundle(
@@ -221,10 +291,7 @@ pub(super) fn dag_check_meta() -> ToolPrototype {
 }
 
 fn parse_dag_check(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let _: NoArgs = serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-        tool:    DAG_CHECK,
-        message: err.to_string(),
-    })?;
+    parse_args_with_builder(DAG_CHECK, raw, |args: NoArgs| Ok(args))?;
     Ok(Box::new(DAGCheckTool {
         graph:          state.graph.clone(),
         analysis_cache: Arc::clone(&state.analysis_cache),
@@ -239,7 +306,9 @@ struct DAGCheckTool {
 #[async_trait]
 impl ToolInstance for DAGCheckTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let (graph, graph_version) = load_graph_with_version(&self.graph).await?;
+        let (graph, graph_version) =
+            load_graph_with_version(&self.graph, &self.analysis_cache).await?;
+        let meta = super::common::graph_meta(&self.graph).await?;
 
         let cache_key = AnalysisCacheKey {
             graph_version,
@@ -250,14 +319,14 @@ impl ToolInstance for DAGCheckTool {
             let dag = analysis::requires_is_dag(&graph);
             let topo = analysis::requires_toposort(&graph).ok();
             json!({
-                "type": "graph_analysis",
-                "tool": DAG_CHECK,
+                    "type": "graph_analysis",
+                    "tool": DAG_CHECK,
                 "is_dag": dag,
                 "topo_order_count": topo.as_ref().map(|v| v.len()),
             })
         });
 
-        let payload = cached.payload.clone();
+        let payload = super::common::attach_meta(cached.payload.clone(), &meta);
         info!(
             tool = DAG_CHECK,
             is_dag = payload["is_dag"].as_bool().unwrap_or(false),
@@ -319,10 +388,9 @@ fn parse_first_principles_view(
     raw: Value,
     state: &CallState,
 ) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let args: FirstPrinciplesViewArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    FIRST_PRINCIPLES_VIEW,
-            message: err.to_string(),
+    let args =
+        parse_args_with_builder(FIRST_PRINCIPLES_VIEW, raw, |args: FirstPrinciplesViewArgs| {
+            Ok(args)
         })?;
     Ok(Box::new(FirstPrinciplesViewTool {
         args,
@@ -334,11 +402,11 @@ fn parse_first_principles_summary(
     raw: Value,
     state: &CallState,
 ) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let args: FirstPrinciplesSummaryArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    FIRST_PRINCIPLES_SUMMARY,
-            message: err.to_string(),
-        })?;
+    let args = parse_args_with_builder(
+        FIRST_PRINCIPLES_SUMMARY,
+        raw,
+        |args: FirstPrinciplesSummaryArgs| Ok(args),
+    )?;
     Ok(Box::new(FirstPrinciplesSummaryTool {
         args,
         graph: state.graph.clone(),
@@ -356,7 +424,7 @@ struct FirstPrinciplesViewTool {
 #[async_trait]
 impl ToolInstance for FirstPrinciplesViewTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let graph = self
+        let graph: Arc<CurriculumGraph> = self
             .graph
             .ask(crate::graph::manager::GetGraph)
             .await
@@ -405,11 +473,12 @@ struct FirstPrinciplesSummaryTool {
 #[async_trait]
 impl ToolInstance for FirstPrinciplesSummaryTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let graph = self
+        let graph: Arc<CurriculumGraph> = self
             .graph
             .ask(crate::graph::manager::GetGraph)
             .await
             .map_err(map_send_err_inf)?;
+        let meta = super::common::graph_meta(&self.graph).await?;
 
         let fps = analysis::first_principles(&graph);
         let mut counts = std::collections::HashMap::new();
@@ -432,42 +501,16 @@ impl ToolInstance for FirstPrinciplesSummaryTool {
             }
         });
 
-        let approx_bytes = payload_size_bytes(&payload);
-        let estimates = prepare_payload_estimates(&self.metrics, self.model.as_str(), approx_bytes);
-        let mode = ToolPayloadMode::from_fetch_flag(self.args.fetch_body);
-        info!(
-            tool = FIRST_PRINCIPLES_SUMMARY,
-            mode = mode.as_str(),
-            approx_bytes,
-            "graph first_principles summary"
-        );
-
-        match mode {
-            ToolPayloadMode::Preview => {
-                let hints = vec![format!(
-                    "Summary is ~{} bytes; set fetch_body=true to retrieve it.",
-                    approx_bytes
-                )];
-                let mut preview = build_cost_preview(
-                    FIRST_PRINCIPLES_SUMMARY,
-                    approx_bytes,
-                    estimates.safe_tokens,
-                    hints,
-                );
-                let preview_bytes = payload_size_bytes(&preview);
-                let preview_tokens = estimate_tokens_from_characters(preview_bytes as usize);
-                apply_preview_cost(
-                    &mut preview,
-                    &self.metrics,
-                    self.model.as_str(),
-                    self.conversation_id.as_str(),
-                    preview_tokens,
-                    estimates.safe_tokens,
-                );
-                Ok(ToolOutput::with_byte_hint(preview, preview_bytes))
-            }
-            ToolPayloadMode::Body => Ok(ToolOutput::with_byte_hint(payload.clone(), approx_bytes)),
-        }
+        finalize_summary_tool(
+            FIRST_PRINCIPLES_SUMMARY,
+            payload,
+            self.args.fetch_body,
+            &self.metrics,
+            &self.model,
+            &self.conversation_id,
+            "Summary is",
+            &meta,
+        )
     }
 }
 
@@ -609,12 +652,10 @@ pub(super) fn coverage_meta() -> ToolPrototype {
 }
 
 fn parse_lo_reach(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let mut args: LoReachArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    LO_REACH,
-            message: err.to_string(),
-        })?;
-    args.lo_slug = require_string(args.lo_slug.clone(), LO_REACH, "lo_slug")?;
+    let args = parse_args_with_builder(LO_REACH, raw, |mut input: LoReachArgs| {
+        input.lo_slug = require_string(input.lo_slug, LO_REACH, "lo_slug")?;
+        Ok(input)
+    })?;
     Ok(Box::new(LoReachTool {
         args,
         graph: state.graph.clone(),
@@ -623,12 +664,10 @@ fn parse_lo_reach(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn Tool
 }
 
 fn parse_lo_alignment(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let mut args: LoAlignmentArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    LO_ALIGNMENT,
-            message: err.to_string(),
-        })?;
-    args.lo_slug = require_string(args.lo_slug.clone(), LO_ALIGNMENT, "lo_slug")?;
+    let args = parse_args_with_builder(LO_ALIGNMENT, raw, |mut input: LoAlignmentArgs| {
+        input.lo_slug = require_string(input.lo_slug, LO_ALIGNMENT, "lo_slug")?;
+        Ok(input)
+    })?;
     Ok(Box::new(LoAlignmentTool {
         args,
         graph: state.graph.clone(),
@@ -640,12 +679,10 @@ fn parse_lo_alignment(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn 
 }
 
 fn parse_lo_coverage(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let mut args: LoReachArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    COVERAGE,
-            message: err.to_string(),
-        })?;
-    args.lo_slug = require_string(args.lo_slug.clone(), COVERAGE, "lo_slug")?;
+    let args = parse_args_with_builder(COVERAGE, raw, |mut input: LoReachArgs| {
+        input.lo_slug = require_string(input.lo_slug, COVERAGE, "lo_slug")?;
+        Ok(input)
+    })?;
     Ok(Box::new(LoCoverageTool {
         args,
         graph: state.graph.clone(),
@@ -662,15 +699,10 @@ struct LoReachTool {
 #[async_trait]
 impl ToolInstance for LoReachTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let lo = resolve_slug(&self.graph, self.args.lo_slug.clone(), LO_REACH).await?;
-        let (graph, graph_version) = load_graph_with_version(&self.graph).await?;
-        ensure_knowledge_type(
-            &graph,
-            lo,
-            &self.args.lo_slug,
-            KnowledgeType::LearningOutcome,
-            LO_REACH,
-        )?;
+        let (graph, graph_version, lo) =
+            load_lo_with_graph(&self.graph, &self.analysis_cache, &self.args.lo_slug, LO_REACH)
+                .await?;
+        let meta = super::common::graph_meta(&self.graph).await?;
 
         let cached =
             cache_lo_bundle(&self.analysis_cache, graph_version, &graph, lo, &self.args.lo_slug);
@@ -693,6 +725,7 @@ impl ToolInstance for LoReachTool {
             "assessments": assessments,
         });
         info!(tool = LO_REACH, lo_slug = %self.args.lo_slug, "graph lo reachability");
+        let payload = super::common::attach_meta(payload, &meta);
         Ok(ToolOutput::with_byte_hint(payload.clone(), payload_size_bytes(&payload)))
     }
 }
@@ -706,15 +739,10 @@ struct LoCoverageTool {
 #[async_trait]
 impl ToolInstance for LoCoverageTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let lo = resolve_slug(&self.graph, self.args.lo_slug.clone(), COVERAGE).await?;
-        let (graph, graph_version) = load_graph_with_version(&self.graph).await?;
-        ensure_knowledge_type(
-            &graph,
-            lo,
-            &self.args.lo_slug,
-            KnowledgeType::LearningOutcome,
-            COVERAGE,
-        )?;
+        let (graph, graph_version, lo) =
+            load_lo_with_graph(&self.graph, &self.analysis_cache, &self.args.lo_slug, COVERAGE)
+                .await?;
+        let meta = super::common::graph_meta(&self.graph).await?;
 
         let cached =
             cache_lo_bundle(&self.analysis_cache, graph_version, &graph, lo, &self.args.lo_slug);
@@ -729,6 +757,7 @@ impl ToolInstance for LoCoverageTool {
             "unused_observation_features": bundle.coverage.unused_observation_features,
         });
         info!(tool = COVERAGE, lo_slug = %self.args.lo_slug, "graph lo coverage");
+        let payload = super::common::attach_meta(payload, &meta);
         Ok(ToolOutput::with_byte_hint(payload.clone(), payload_size_bytes(&payload)))
     }
 }
@@ -745,16 +774,10 @@ struct LoAlignmentTool {
 #[async_trait]
 impl ToolInstance for LoAlignmentTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let lo = resolve_slug(&self.graph, self.args.lo_slug.clone(), LO_ALIGNMENT).await?;
-
-        let (graph, graph_version) = load_graph_with_version(&self.graph).await?;
-        ensure_knowledge_type(
-            &graph,
-            lo,
-            &self.args.lo_slug,
-            KnowledgeType::LearningOutcome,
-            LO_ALIGNMENT,
-        )?;
+        let (graph, graph_version, lo) =
+            load_lo_with_graph(&self.graph, &self.analysis_cache, &self.args.lo_slug, LO_ALIGNMENT)
+                .await?;
+        let meta = super::common::graph_meta(&self.graph).await?;
 
         let cached =
             cache_lo_bundle(&self.analysis_cache, graph_version, &graph, lo, &self.args.lo_slug);
@@ -800,39 +823,16 @@ impl ToolInstance for LoAlignmentTool {
             }
         });
 
-        let approx_bytes = payload_size_bytes(&payload);
-        let estimates = prepare_payload_estimates(&self.metrics, self.model.as_str(), approx_bytes);
-        let mode = ToolPayloadMode::from_fetch_flag(self.args.fetch_body);
-        info!(
-            tool = LO_ALIGNMENT,
-            lo_slug = %self.args.lo_slug,
-            mode = mode.as_str(),
-            approx_bytes,
-            "graph lo alignment summary"
-        );
-
-        match mode {
-            ToolPayloadMode::Preview => {
-                let hints = vec![format!(
-                    "Summary is ~{} bytes; set fetch_body=true to retrieve it.",
-                    approx_bytes
-                )];
-                let mut preview =
-                    build_cost_preview(LO_ALIGNMENT, approx_bytes, estimates.safe_tokens, hints);
-                let preview_bytes = payload_size_bytes(&preview);
-                let preview_tokens = estimate_tokens_from_characters(preview_bytes as usize);
-                apply_preview_cost(
-                    &mut preview,
-                    &self.metrics,
-                    self.model.as_str(),
-                    self.conversation_id.as_str(),
-                    preview_tokens,
-                    estimates.safe_tokens,
-                );
-                Ok(ToolOutput::with_byte_hint(preview, preview_bytes))
-            }
-            ToolPayloadMode::Body => Ok(ToolOutput::with_byte_hint(payload.clone(), approx_bytes)),
-        }
+        finalize_summary_tool(
+            LO_ALIGNMENT,
+            payload,
+            self.args.fetch_body,
+            &self.metrics,
+            &self.model,
+            &self.conversation_id,
+            "Summary is",
+            &meta,
+        )
     }
 }
 
@@ -840,12 +840,11 @@ fn parse_lo_assessments_view(
     raw: Value,
     state: &CallState,
 ) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let mut args: LoAssessmentsViewArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    LO_ASSESSMENTS_VIEW,
-            message: err.to_string(),
+    let args =
+        parse_args_with_builder(LO_ASSESSMENTS_VIEW, raw, |mut input: LoAssessmentsViewArgs| {
+            input.lo_slug = require_string(input.lo_slug, LO_ASSESSMENTS_VIEW, "lo_slug")?;
+            Ok(input)
         })?;
-    args.lo_slug = require_string(args.lo_slug.clone(), LO_ASSESSMENTS_VIEW, "lo_slug")?;
     Ok(Box::new(LoAssessmentsViewTool {
         args,
         graph: state.graph.clone(),
@@ -857,12 +856,14 @@ fn parse_lo_missing_criteria_view(
     raw: Value,
     state: &CallState,
 ) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let mut args: LoMissingCriteriaViewArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    LO_MISSING_CRITERIA_VIEW,
-            message: err.to_string(),
-        })?;
-    args.lo_slug = require_string(args.lo_slug.clone(), LO_MISSING_CRITERIA_VIEW, "lo_slug")?;
+    let args = parse_args_with_builder(
+        LO_MISSING_CRITERIA_VIEW,
+        raw,
+        |mut input: LoMissingCriteriaViewArgs| {
+            input.lo_slug = require_string(input.lo_slug, LO_MISSING_CRITERIA_VIEW, "lo_slug")?;
+            Ok(input)
+        },
+    )?;
     Ok(Box::new(LoMissingCriteriaViewTool {
         args,
         graph: state.graph.clone(),
@@ -871,12 +872,10 @@ fn parse_lo_missing_criteria_view(
 }
 
 fn parse_lo_anchors_view(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let mut args: LoAnchorsViewArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    LO_ANCHORS_VIEW,
-            message: err.to_string(),
-        })?;
-    args.lo_slug = require_string(args.lo_slug.clone(), LO_ANCHORS_VIEW, "lo_slug")?;
+    let args = parse_args_with_builder(LO_ANCHORS_VIEW, raw, |mut input: LoAnchorsViewArgs| {
+        input.lo_slug = require_string(input.lo_slug, LO_ANCHORS_VIEW, "lo_slug")?;
+        Ok(input)
+    })?;
     Ok(Box::new(LoAnchorsViewTool {
         args,
         graph: state.graph.clone(),
@@ -892,15 +891,14 @@ struct LoAssessmentsViewTool {
 #[async_trait]
 impl ToolInstance for LoAssessmentsViewTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let lo = resolve_slug(&self.graph, self.args.lo_slug.clone(), LO_ASSESSMENTS_VIEW).await?;
-        let (graph, graph_version) = load_graph_with_version(&self.graph).await?;
-        ensure_knowledge_type(
-            &graph,
-            lo,
+        let (graph, graph_version, lo) = load_lo_with_graph(
+            &self.graph,
+            &self.analysis_cache,
             &self.args.lo_slug,
-            KnowledgeType::LearningOutcome,
             LO_ASSESSMENTS_VIEW,
-        )?;
+        )
+        .await?;
+        let meta = super::common::graph_meta(&self.graph).await?;
 
         let cached =
             cache_lo_bundle(&self.analysis_cache, graph_version, &graph, lo, &self.args.lo_slug);
@@ -943,6 +941,7 @@ impl ToolInstance for LoAssessmentsViewTool {
             "graph lo assessments view"
         );
 
+        let payload = super::common::attach_meta(payload, &meta);
         Ok(ToolOutput::with_byte_hint(payload.clone(), payload_size_bytes(&payload)))
     }
 }
@@ -956,16 +955,14 @@ struct LoMissingCriteriaViewTool {
 #[async_trait]
 impl ToolInstance for LoMissingCriteriaViewTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let lo =
-            resolve_slug(&self.graph, self.args.lo_slug.clone(), LO_MISSING_CRITERIA_VIEW).await?;
-        let (graph, graph_version) = load_graph_with_version(&self.graph).await?;
-        ensure_knowledge_type(
-            &graph,
-            lo,
+        let (graph, graph_version, lo) = load_lo_with_graph(
+            &self.graph,
+            &self.analysis_cache,
             &self.args.lo_slug,
-            KnowledgeType::LearningOutcome,
             LO_MISSING_CRITERIA_VIEW,
-        )?;
+        )
+        .await?;
+        let meta = super::common::graph_meta(&self.graph).await?;
 
         let cached =
             cache_lo_bundle(&self.analysis_cache, graph_version, &graph, lo, &self.args.lo_slug);
@@ -994,6 +991,7 @@ impl ToolInstance for LoMissingCriteriaViewTool {
             "graph lo missing criteria view"
         );
 
+        let payload = super::common::attach_meta(payload, &meta);
         Ok(ToolOutput::with_byte_hint(payload.clone(), payload_size_bytes(&payload)))
     }
 }
@@ -1006,19 +1004,9 @@ struct LoAnchorsViewTool {
 #[async_trait]
 impl ToolInstance for LoAnchorsViewTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let lo = resolve_slug(&self.graph, self.args.lo_slug.clone(), LO_ANCHORS_VIEW).await?;
-        let graph = self
-            .graph
-            .ask(crate::graph::manager::GetGraph)
-            .await
-            .map_err(map_send_err_inf)?;
-        ensure_knowledge_type(
-            &graph,
-            lo,
-            &self.args.lo_slug,
-            KnowledgeType::LearningOutcome,
-            LO_ANCHORS_VIEW,
-        )?;
+        let (graph, lo) =
+            load_lo_with_graph_only(&self.graph, &self.args.lo_slug, LO_ANCHORS_VIEW).await?;
+        let meta = super::common::graph_meta(&self.graph).await?;
 
         let anchors: Vec<_> = graph
             .edges_directed(lo, petgraph::Direction::Incoming)
@@ -1053,6 +1041,7 @@ impl ToolInstance for LoAnchorsViewTool {
             "graph lo anchors view"
         );
 
+        let payload = super::common::attach_meta(payload, &meta);
         Ok(ToolOutput::with_byte_hint(payload.clone(), payload_size_bytes(&payload)))
     }
 }
@@ -1125,11 +1114,7 @@ pub(super) fn practice_gaps_view_meta() -> ToolPrototype {
 }
 
 fn parse_gap_summary(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let args: GapSummaryArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    GAP_SUMMARY,
-            message: err.to_string(),
-        })?;
+    let args = parse_args_with_builder(GAP_SUMMARY, raw, |args: GapSummaryArgs| Ok(args))?;
     Ok(Box::new(GapSummaryTool {
         args,
         graph: state.graph.clone(),
@@ -1144,11 +1129,7 @@ fn parse_example_gaps_view(
     raw: Value,
     state: &CallState,
 ) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let args: GapViewArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    EXAMPLE_GAPS_VIEW,
-            message: err.to_string(),
-        })?;
+    let args = parse_args_with_builder(EXAMPLE_GAPS_VIEW, raw, |args: GapViewArgs| Ok(args))?;
     Ok(Box::new(ExampleGapsViewTool {
         args,
         graph: state.graph.clone(),
@@ -1157,11 +1138,7 @@ fn parse_example_gaps_view(
 }
 
 fn parse_fadeability_view(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let args: GapViewArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    FADEABILITY_VIEW,
-            message: err.to_string(),
-        })?;
+    let args = parse_args_with_builder(FADEABILITY_VIEW, raw, |args: GapViewArgs| Ok(args))?;
     Ok(Box::new(FadeabilityViewTool {
         args,
         graph: state.graph.clone(),
@@ -1173,11 +1150,7 @@ fn parse_practice_gaps_view(
     raw: Value,
     state: &CallState,
 ) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let args: GapViewArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    PRACTICE_GAPS_VIEW,
-            message: err.to_string(),
-        })?;
+    let args = parse_args_with_builder(PRACTICE_GAPS_VIEW, raw, |args: GapViewArgs| Ok(args))?;
     Ok(Box::new(PracticeGapsViewTool {
         args,
         graph: state.graph.clone(),
@@ -1197,7 +1170,9 @@ struct GapSummaryTool {
 #[async_trait]
 impl ToolInstance for GapSummaryTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let (graph, graph_version) = load_graph_with_version(&self.graph).await?;
+        let (graph, graph_version) =
+            load_graph_with_version(&self.graph, &self.analysis_cache).await?;
+        let meta = super::common::graph_meta(&self.graph).await?;
 
         let cached = cache_gap_bundle(&self.analysis_cache, graph_version, &graph);
         let bundle: CachedGapBundle = decode_cached(&cached.payload)?;
@@ -1218,33 +1193,16 @@ impl ToolInstance for GapSummaryTool {
             }
         });
 
-        let approx_bytes = payload_size_bytes(&payload);
-        let estimates = prepare_payload_estimates(&self.metrics, self.model.as_str(), approx_bytes);
-        let mode = ToolPayloadMode::from_fetch_flag(self.args.fetch_body);
-        info!(tool = GAP_SUMMARY, mode = mode.as_str(), approx_bytes, "graph gap summary");
-
-        match mode {
-            ToolPayloadMode::Preview => {
-                let hints = vec![format!(
-                    "Summary is ~{} bytes; set fetch_body=true to retrieve it.",
-                    approx_bytes
-                )];
-                let mut preview =
-                    build_cost_preview(GAP_SUMMARY, approx_bytes, estimates.safe_tokens, hints);
-                let preview_bytes = payload_size_bytes(&preview);
-                let preview_tokens = estimate_tokens_from_characters(preview_bytes as usize);
-                apply_preview_cost(
-                    &mut preview,
-                    &self.metrics,
-                    self.model.as_str(),
-                    self.conversation_id.as_str(),
-                    preview_tokens,
-                    estimates.safe_tokens,
-                );
-                Ok(ToolOutput::with_byte_hint(preview, preview_bytes))
-            }
-            ToolPayloadMode::Body => Ok(ToolOutput::with_byte_hint(payload.clone(), approx_bytes)),
-        }
+        finalize_summary_tool(
+            GAP_SUMMARY,
+            payload,
+            self.args.fetch_body,
+            &self.metrics,
+            &self.model,
+            &self.conversation_id,
+            "Summary is",
+            &meta,
+        )
     }
 }
 
@@ -1257,7 +1215,9 @@ struct ExampleGapsViewTool {
 #[async_trait]
 impl ToolInstance for ExampleGapsViewTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let (graph, graph_version) = load_graph_with_version(&self.graph).await?;
+        let (graph, graph_version) =
+            load_graph_with_version(&self.graph, &self.analysis_cache).await?;
+        let meta = super::common::graph_meta(&self.graph).await?;
 
         let cached = cache_gap_bundle(&self.analysis_cache, graph_version, &graph);
         let bundle: CachedGapBundle = decode_cached(&cached.payload)?;
@@ -1280,6 +1240,7 @@ impl ToolInstance for ExampleGapsViewTool {
 
         info!(tool = EXAMPLE_GAPS_VIEW, offset, limit, has_more, "graph example gaps view");
 
+        let payload = super::common::attach_meta(payload, &meta);
         Ok(ToolOutput::with_byte_hint(payload.clone(), payload_size_bytes(&payload)))
     }
 }
@@ -1293,7 +1254,9 @@ struct FadeabilityViewTool {
 #[async_trait]
 impl ToolInstance for FadeabilityViewTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let (graph, graph_version) = load_graph_with_version(&self.graph).await?;
+        let (graph, graph_version) =
+            load_graph_with_version(&self.graph, &self.analysis_cache).await?;
+        let meta = super::common::graph_meta(&self.graph).await?;
 
         let cached = cache_gap_bundle(&self.analysis_cache, graph_version, &graph);
         let bundle: CachedGapBundle = decode_cached(&cached.payload)?;
@@ -1326,6 +1289,7 @@ impl ToolInstance for FadeabilityViewTool {
 
         info!(tool = FADEABILITY_VIEW, offset, limit, has_more, "graph fadeability view");
 
+        let payload = super::common::attach_meta(payload, &meta);
         Ok(ToolOutput::with_byte_hint(payload.clone(), payload_size_bytes(&payload)))
     }
 }
@@ -1339,7 +1303,9 @@ struct PracticeGapsViewTool {
 #[async_trait]
 impl ToolInstance for PracticeGapsViewTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let (graph, graph_version) = load_graph_with_version(&self.graph).await?;
+        let (graph, graph_version) =
+            load_graph_with_version(&self.graph, &self.analysis_cache).await?;
+        let meta = super::common::graph_meta(&self.graph).await?;
 
         let cached = cache_gap_bundle(&self.analysis_cache, graph_version, &graph);
         let bundle: CachedGapBundle = decode_cached(&cached.payload)?;
@@ -1362,6 +1328,7 @@ impl ToolInstance for PracticeGapsViewTool {
 
         info!(tool = PRACTICE_GAPS_VIEW, offset, limit, has_more, "graph practice gaps view");
 
+        let payload = super::common::attach_meta(payload, &meta);
         Ok(ToolOutput::with_byte_hint(payload.clone(), payload_size_bytes(&payload)))
     }
 }
@@ -1488,10 +1455,7 @@ pub(super) fn keystone_meta() -> ToolPrototype {
 }
 
 fn parse_keystone(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let _: NoArgs = serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-        tool:    KEYSTONE,
-        message: err.to_string(),
-    })?;
+    parse_args_with_builder(KEYSTONE, raw, |args: NoArgs| Ok(args))?;
     Ok(Box::new(KeystoneTool {
         graph:          state.graph.clone(),
         analysis_cache: Arc::clone(&state.analysis_cache),
@@ -1506,7 +1470,8 @@ struct KeystoneTool {
 #[async_trait]
 impl ToolInstance for KeystoneTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let (graph, graph_version) = load_graph_with_version(&self.graph).await?;
+        let (graph, graph_version) =
+            load_graph_with_version(&self.graph, &self.analysis_cache).await?;
 
         let cache_key = AnalysisCacheKey {
             graph_version,
@@ -1586,14 +1551,12 @@ pub(super) fn extraneous_meta() -> ToolPrototype {
 }
 
 fn parse_extraneous(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let mut args: ExtraneousArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    EXTRANEOUS,
-            message: err.to_string(),
-        })?;
-    args.assessment_slug =
-        require_string(args.assessment_slug.clone(), EXTRANEOUS, "assessment_slug")?;
-    args.lo_slug = require_string(args.lo_slug.clone(), EXTRANEOUS, "lo_slug")?;
+    let args = parse_args_with_builder(EXTRANEOUS, raw, |mut input: ExtraneousArgs| {
+        input.assessment_slug =
+            require_string(input.assessment_slug, EXTRANEOUS, "assessment_slug")?;
+        input.lo_slug = require_string(input.lo_slug, EXTRANEOUS, "lo_slug")?;
+        Ok(input)
+    })?;
     Ok(Box::new(ExtraneousTool {
         args,
         graph: state.graph.clone(),
@@ -1611,7 +1574,7 @@ impl ToolInstance for ExtraneousTool {
         let assessment =
             resolve_slug(&self.graph, self.args.assessment_slug.clone(), EXTRANEOUS).await?;
         let lo = resolve_slug(&self.graph, self.args.lo_slug.clone(), EXTRANEOUS).await?;
-        let graph = self
+        let graph: Arc<CurriculumGraph> = self
             .graph
             .ask(crate::graph::manager::GetGraph)
             .await
@@ -1684,11 +1647,7 @@ pub(super) fn alignment_gaps_meta() -> ToolPrototype {
 }
 
 fn parse_alignment_gaps(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let args: AlignmentGapsArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    ALIGNMENT_GAPS,
-            message: err.to_string(),
-        })?;
+    let args = parse_args_with_builder(ALIGNMENT_GAPS, raw, |args: AlignmentGapsArgs| Ok(args))?;
     Ok(Box::new(AlignmentGapsTool {
         args,
         graph: state.graph.clone(),
@@ -1711,7 +1670,9 @@ struct AlignmentGapsTool {
 #[async_trait]
 impl ToolInstance for AlignmentGapsTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let (graph, graph_version) = load_graph_with_version(&self.graph).await?;
+        let (graph, graph_version) =
+            load_graph_with_version(&self.graph, &self.analysis_cache).await?;
+        let meta = super::common::graph_meta(&self.graph).await?;
 
         let cache_key = AnalysisCacheKey {
             graph_version,
@@ -1731,38 +1692,16 @@ impl ToolInstance for AlignmentGapsTool {
             })
         });
 
-        let payload = cached.payload.clone();
-        let approx_bytes = payload_size_bytes(&payload);
-        let estimates = prepare_payload_estimates(&self.metrics, self.model.as_str(), approx_bytes);
-        let mode = ToolPayloadMode::from_fetch_flag(self.args.fetch_body);
-        info!(
-            tool = ALIGNMENT_GAPS,
-            mode = mode.as_str(),
-            approx_bytes,
-            "graph assessment gaps"
-        );
-        match mode {
-            ToolPayloadMode::Preview => {
-                let hints = vec![format!(
-                    "Payload is ~{} bytes; set fetch_body=true to retrieve it.",
-                    approx_bytes
-                )];
-                let mut preview =
-                    build_cost_preview(ALIGNMENT_GAPS, approx_bytes, estimates.safe_tokens, hints);
-                let preview_bytes = payload_size_bytes(&preview);
-                let preview_tokens = estimate_tokens_from_characters(preview_bytes as usize);
-                apply_preview_cost(
-                    &mut preview,
-                    &self.metrics,
-                    self.model.as_str(),
-                    self.conversation_id.as_str(),
-                    preview_tokens,
-                    estimates.safe_tokens,
-                );
-                Ok(ToolOutput::with_byte_hint(preview, preview_bytes))
-            }
-            ToolPayloadMode::Body => Ok(ToolOutput::with_byte_hint(payload.clone(), approx_bytes)),
-        }
+        finalize_summary_tool(
+            ALIGNMENT_GAPS,
+            cached.payload.clone(),
+            self.args.fetch_body,
+            &self.metrics,
+            &self.model,
+            &self.conversation_id,
+            "Payload is",
+            &meta,
+        )
     }
 }
 
@@ -1793,11 +1732,8 @@ fn parse_discourse_orphans(
     raw: Value,
     state: &CallState,
 ) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let args: DiscourseOrphansArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    DISCOURSE_ORPHANS,
-            message: err.to_string(),
-        })?;
+    let args =
+        parse_args_with_builder(DISCOURSE_ORPHANS, raw, |args: DiscourseOrphansArgs| Ok(args))?;
     Ok(Box::new(DiscourseOrphansTool {
         args,
         graph: state.graph.clone(),
@@ -1814,7 +1750,8 @@ struct DiscourseOrphansTool {
 #[async_trait]
 impl ToolInstance for DiscourseOrphansTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let (graph, graph_version) = load_graph_with_version(&self.graph).await?;
+        let (graph, graph_version) =
+            load_graph_with_version(&self.graph, &self.analysis_cache).await?;
 
         let cache_key = AnalysisCacheKey {
             graph_version,
@@ -1863,12 +1800,10 @@ pub(super) fn borrow_ahead_meta() -> ToolPrototype {
 }
 
 fn parse_borrow_ahead(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let mut args: BorrowAheadArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    BORROW_AHEAD,
-            message: err.to_string(),
-        })?;
-    args.episode = require_string(args.episode.clone(), BORROW_AHEAD, "episode")?;
+    let args = parse_args_with_builder(BORROW_AHEAD, raw, |mut input: BorrowAheadArgs| {
+        input.episode = require_string(input.episode, BORROW_AHEAD, "episode")?;
+        Ok(input)
+    })?;
     Ok(Box::new(BorrowAheadTool {
         args,
         graph: state.graph.clone(),
@@ -1885,7 +1820,8 @@ struct BorrowAheadTool {
 #[async_trait]
 impl ToolInstance for BorrowAheadTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let (graph, graph_version) = load_graph_with_version(&self.graph).await?;
+        let (graph, graph_version) =
+            load_graph_with_version(&self.graph, &self.analysis_cache).await?;
 
         let cache_key = AnalysisCacheKey {
             graph_version,

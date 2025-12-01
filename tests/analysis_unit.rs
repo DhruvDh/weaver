@@ -1,7 +1,16 @@
+use std::time::Instant;
+
 use weaver::{
     analysis,
-    graph::{self, GraphService, KnowledgeNode, NodeId, manager::GraphManagerState, traversal},
-    schema::types::{IntendedEffect, KnowledgeType, SourceRef, SupportKind},
+    graph::{
+        self, AnchorImpact, AnchorsAttrs, EdgeKind, EdgePayload, GraphService, KnowledgeNode,
+        NodeId, PrecedesAttrs, TeachingPurpose, TeachingStepNode, manager::GraphManagerState,
+        traversal,
+    },
+    schema::types::{
+        AssessmentScope, EvidenceLink, IntendedEffect, KnowledgeType, SourceRef, Strength,
+        SupportKind,
+    },
 };
 
 fn mk_kn(title: &str, kt: KnowledgeType) -> KnowledgeNode {
@@ -207,8 +216,8 @@ mod practice_alignment {
             assert!(
                 violations
                     .iter()
-                    .any(|v| v.contains("learning_outcome") && v.contains("assesses")),
-                "violations missing stranded LO message: {violations:?}"
+                    .any(|v| v.code == graph::InvariantCode::LoTargetAssessment),
+                "violations missing stranded LO code: {violations:?}"
             );
         } else {
             panic!("expected invariant violation, got {err:?}");
@@ -227,8 +236,8 @@ mod practice_alignment {
             assert!(
                 violations
                     .iter()
-                    .any(|v| v.contains("lacks reachable assessment")),
-                "violations missing practice gap: {violations:?}"
+                    .any(|v| v.code == graph::InvariantCode::ProceduralPractice),
+                "violations missing practice gap code: {violations:?}"
             );
         } else {
             panic!("expected invariant violation, got {err:?}");
@@ -303,7 +312,12 @@ mod practice_alignment {
             .set_strict_quality(true)
             .expect_err("strict mode should reject missing rubric coverage");
         if let graph::GraphError::InvariantViolation { violations } = err {
-            assert!(violations.iter().any(|v| v.contains("missing coverage")));
+            assert!(
+                violations
+                    .iter()
+                    .any(|v| v.code == graph::InvariantCode::RubricCoverage),
+                "expected rubric coverage code, got {violations:?}"
+            );
         } else {
             panic!("expected invariant violation, got {err:?}");
         }
@@ -360,7 +374,12 @@ mod practice_alignment {
             .set_strict_quality(true)
             .expect_err("rubric drift with missing coverage should fail validation");
         if let graph::GraphError::InvariantViolation { violations } = err {
-            assert!(violations.iter().any(|v| v.contains("missing coverage")));
+            assert!(
+                violations
+                    .iter()
+                    .any(|v| v.code == graph::InvariantCode::RubricCoverage),
+                "expected rubric coverage code after drift, got {violations:?}"
+            );
         } else {
             panic!("expected invariant violation, got {err:?}");
         }
@@ -478,7 +497,12 @@ mod purity {
             )
             .expect_err("purity violation should block assesses edge");
         if let graph::GraphError::InvariantViolation { violations } = err {
-            assert!(violations.iter().any(|v| v.contains("purity violation")));
+            assert!(
+                violations
+                    .iter()
+                    .any(|v| v.code == graph::InvariantCode::PurityExtraneous),
+                "expected purity_extraneous code, got {violations:?}"
+            );
         } else {
             panic!("expected invariant violation, got {err:?}");
         }
@@ -528,7 +552,7 @@ mod discourse {
             assert!(
                 violations
                     .iter()
-                    .any(|v| v.contains("borrow-ahead") && v.contains("NoIntro"))
+                    .any(|v| v.code == graph::InvariantCode::BorrowAhead),
             );
         } else {
             panic!("expected invariant violation, got {err:?}");
@@ -561,7 +585,12 @@ mod discourse {
             .set_strict_quality(true)
             .expect_err("strict mode should reject discourse orphans");
         if let graph::GraphError::InvariantViolation { violations } = err {
-            assert!(violations.iter().any(|v| v.contains("orphaned")));
+            assert!(
+                violations
+                    .iter()
+                    .any(|v| v.code == graph::InvariantCode::DiscourseOrphan),
+                "expected discourse_orphan code"
+            );
         } else {
             panic!("expected invariant violation, got {err:?}");
         }
@@ -631,6 +660,17 @@ mod discourse {
             1.0,
         )
         .expect_err("cross-episode borrow-ahead should be flagged");
+        let err = svc
+            .set_strict_quality(true)
+            .expect_err("should still flag borrow-ahead");
+        if let graph::GraphError::InvariantViolation { violations } = err {
+            assert!(
+                violations
+                    .iter()
+                    .any(|v| v.code == graph::InvariantCode::BorrowAhead),
+                "expected borrow_ahead code"
+            );
+        }
     }
 
     #[test]
@@ -756,5 +796,196 @@ mod persistence_topology {
         let redundants = traversal::requires_transitive_reduction(svc.graph()).unwrap();
         assert!(redundants.contains(&(a, c)));
         assert!(traversal::requires_path_exists(svc.graph(), a, c));
+    }
+
+    #[test]
+    fn borrow_ahead_handles_long_episode() {
+        let mut g = graph::CurriculumGraph::default();
+        let src = SourceRef {
+            path:       "dummy".into(),
+            start_line: 1,
+            end_line:   2,
+            revision:   "deadbeef".into(),
+        };
+        let target = g.add_node(graph::NodePayload {
+            logical_id: uuid::Uuid::new_v4(),
+            slug:       "k".into(),
+            kind:       graph::NodeKind::Knowledge(KnowledgeNode {
+                title: "k".into(),
+                statement: "k".into(),
+                knowledge_type: KnowledgeType::Conceptual,
+                source_refs: vec![src.clone()],
+                confidence: 1.0,
+                rubric_criteria: vec![],
+                construct_irrelevant_demands: vec![],
+                grain_level: None,
+                intrinsic_load: None,
+                introduction_scope: graph::IntroductionScope::InCourse,
+            }),
+            tags:       vec![],
+        });
+
+        let episode = "episode-1";
+        let mut steps = Vec::new();
+        for i in 0..200usize {
+            let node = graph::NodePayload {
+                logical_id: uuid::Uuid::new_v4(),
+                slug:       format!("ts{i}"),
+                kind:       graph::NodeKind::TeachingStep(TeachingStepNode {
+                    title:       format!("Step {i}"),
+                    statement:   format!("step {i}"),
+                    purpose:     TeachingPurpose::Use,
+                    method_tags: vec![],
+                    episode:     episode.into(),
+                    source_refs: vec![src.clone()],
+                    rationale:   None,
+                }),
+                tags:       vec![],
+            };
+            steps.push(g.add_node(node));
+        }
+
+        for window in steps.windows(2) {
+            if let [from, to] = *window {
+                g.add_edge(
+                    from,
+                    to,
+                    EdgePayload {
+                        kind:       EdgeKind::Precedes(PrecedesAttrs {
+                            episode: episode.into(),
+                        }),
+                        confidence: 1.0,
+                    },
+                );
+            }
+        }
+
+        let intro_idx = 120usize;
+        g.add_edge(
+            steps[intro_idx],
+            target,
+            EdgePayload {
+                kind:       EdgeKind::Anchors(AnchorsAttrs {
+                    impact: AnchorImpact::Introduce,
+                }),
+                confidence: 1.0,
+            },
+        );
+
+        for (idx, step) in steps.iter().enumerate() {
+            if idx == intro_idx {
+                continue;
+            }
+            g.add_edge(
+                *step,
+                target,
+                EdgePayload {
+                    kind:       EdgeKind::Anchors(AnchorsAttrs {
+                        impact: AnchorImpact::Use,
+                    }),
+                    confidence: 1.0,
+                },
+            );
+        }
+
+        let start = std::time::Instant::now();
+        let results = analysis::borrow_ahead(&g, episode);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "borrow_ahead should remain near-linear even for long episodes (elapsed: {:?})",
+            elapsed
+        );
+        assert_eq!(results.len(), intro_idx, "uses before introduction should be flagged");
+        assert!(
+            results
+                .iter()
+                .all(|b| matches!(b.severity, analysis::BorrowSeverity::InEpisode))
+        );
+    }
+
+    #[test]
+    fn invariant_validation_latency_is_bounded_under_mutation_load() {
+        let mut svc = GraphService::new();
+
+        let evidence = SourceRef {
+            path:       "dummy".into(),
+            start_line: 1,
+            end_line:   2,
+            revision:   "deadbeef".into(),
+        };
+
+        let mut first_principles = Vec::new();
+        for i in 0..8 {
+            first_principles.push(
+                svc.add_knowledge_node(
+                    format!("fp-{i}"),
+                    KnowledgeNode {
+                        introduction_scope: graph::IntroductionScope::Prior,
+                        ..mk_kn(&format!("fp-{i}"), KnowledgeType::Factual)
+                    },
+                    vec![],
+                )
+                .expect("first principle insertion should succeed"),
+            );
+        }
+
+        let mut assessments = Vec::new();
+        for i in 0..48 {
+            let lo_slug = format!("lo-{i}");
+            let crit = format!("crit-{i}");
+            let mut lo = mk_kn(&lo_slug, KnowledgeType::LearningOutcome);
+            lo.rubric_criteria = vec![crit.clone()];
+            let lo_id = svc
+                .add_knowledge_node(lo_slug.clone(), lo, vec![])
+                .expect("add lo");
+
+            let assess_slug = format!("assess-{i}");
+            let assess = mk_kn(&assess_slug, KnowledgeType::AssessmentItem);
+            let assess_id = svc
+                .add_knowledge_node(assess_slug, assess, vec![])
+                .expect("add assessment");
+
+            svc.add_edge::<graph::AssessesSpec>(
+                assess_id,
+                lo_id,
+                graph::AssessesAttrs {
+                    evidence_link: EvidenceLink {
+                        claim:                lo_slug,
+                        observation_features: vec![crit],
+                        scope:                AssessmentScope::Target,
+                    },
+                },
+                1.0,
+            )
+            .expect("assesses edge");
+
+            assessments.push(assess_id);
+        }
+
+        let requires_attr = |label: String| graph::RequiresAttrs {
+            strength:      Strength::Necessary,
+            rationale:     label,
+            evidence_refs: vec![evidence.clone()],
+        };
+
+        let start = Instant::now();
+        for (i, assess) in assessments.iter().enumerate() {
+            let fp = first_principles[i % first_principles.len()];
+            svc.add_edge::<graph::RequiresSpec>(
+                fp,
+                *assess,
+                requires_attr(format!("fp->{i}")),
+                1.0,
+            )
+            .expect("requires edge");
+        }
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+        assert!(
+            elapsed_ms < 2500.0,
+            "batched invariant checks should stay bounded (elapsed_ms={elapsed_ms})"
+        );
     }
 }

@@ -1,6 +1,6 @@
 # Step 3 – Concrete Fixes to Bring the Graph Stack Up to the Quality Bar (expanded)
 
-This document turns the Step 2 audit into an actionable, file-scoped plan. It preserves the intentional architecture (actors, preview-first ergonomics, observability) and applies the white-paper contract. Lengthy by design so nothing is implicit.
+This document turns the Step 2 audit into an actionable, file-scoped plan. It preserves the intentional architecture (actors, existing analysis previews/pagination/cache) and applies the white-paper contract. Lengthy by design so nothing is implicit.
 
 ## 0) Design principles carried forward
 
@@ -32,9 +32,9 @@ This document turns the Step 2 audit into an actionable, file-scoped plan. It 
 
 ### 1.3 Preview/body envelope for graph tools
 
-- Shared helper (like file tools) to build previews: counts, first page (default 20), `bytes_total`, `approx_tokens`, `remaining_tokens`, `remaining_ratio`, and narrowing hints. Apply to neighbors, gap/assessment/keystone/requires-cycles/redundant-requires, alignment/purity/borrow-ahead reports, and any algorithmic or semantic tools.
-- Add `limit`/`offset` to list-producing tools; wire to `paginate` helper; cap default limit (e.g., 50) and max (200).
-- Every response includes `meta`: `{graph_version, course_commit, strict_quality}`.
+- Extend the existing preview/pagination/byte-hint helper (used by analysis tools) to **mutating** and large inspection tools; add remaining-budget fields.
+- Ensure all list-producing tools use `paginate` with sane limits (many already do); cap defaults/max consistently.
+- Every response includes `meta`: `{graph_version, course_commit, strict_quality}` (commands/admin included).
 
 ## 2) Structured errors & codes
 
@@ -59,24 +59,16 @@ This document turns the Step 2 audit into an actionable, file-scoped plan. It 
 
 ### 3.2 New/expanded checks in `validate_global_invariants`
 
-- Always run: requires DAG, fadeability, example/practice gaps, coverage gaps, alignment gaps, orphan/unreachable assessments, discourse episode DAG, borrow-ahead, keystone/granularity.
-- Default severity: cycles/fadeability/alignment/discourse_cycle = errors; coverage/example/practice/borrow-ahead/keystone/granularity/purity/orphans/unreachable = warnings.
-- Strict mode: adds purity, borrow-ahead, keystone/granularity as errors and promotes all warnings to errors. Strict mode should **expand** the check set, not just harden severities.
+- Always run: requires DAG, fadeability, example/practice gaps, coverage gaps, alignment reachability (already present), purity (already present), borrow-ahead (already present), plus **orphan/unreachable assessments**, **keystone/granularity**, and a **full precedes DAG** check.
+- Default severity: cycles/fadeability/alignment/discourse_cycle = errors; coverage/example/practice/borrow-ahead/keystone/granularity/orphans/unreachable = warnings.
+- Strict mode: promotes warnings to errors and **expands** to include keystone/granularity/orphan/unreachable if not run in default; surface codes/severity.
 
-### 3.3 Purity/extraneous implementation
-
-- For each assessment → LO (scope=target): compute requires ancestors; subtract intended knowledge + allowed construct_irrelevant_demands; produce extraneous set and code it as `Purity` issue.
-
-### 3.4 Alignment reachability
-
-- Ensure every LO has a target assessment reachable from a first principle via requires*. If not, emit `AlignmentGap` with missing assessments and a suggested path if any.
-
-### 3.5 Borrow-ahead/discourse
+### 3.3 Borrow-ahead/discourse
 
 - Re-run per-episode precedes DAG over all edges (not just incremental) to catch cycles introduced indirectly.
 - Borrow-ahead severities: suppress when introduction_scope is prior/external; otherwise classify InEpisode/CrossEpisode/NoIntro and emit issues accordingly.
 
-### 3.6 Keystone/granularity
+### 3.4 Keystone/granularity
 
 - Use existing reach counts to flag top-N keystones; require extra supports for high keystones (warn default, error strict).
 - Grain rules per white paper: over-bundle (statement >2 sentences & indegree >=4) and fragment (statement <15 tokens & no assesses/supports). Emit `Granularity` codes.
@@ -96,8 +88,8 @@ This document turns the Step 2 audit into an actionable, file-scoped plan. It 
 **Files:** `src/tools/llm/graph_tools/persist.rs`, `src/tools/llm/mod.rs`, `src/graph/persist.rs`, `src/schema/validate.rs`
 
 - Path sandboxing: resolve snapshot paths via `resolve_workspace_path`; reject escapes; preview before execute.
-- Source ref pinning: enforce `SourceRef.revision == course_commit` on insert/update and snapshot load (configurable override flag). Reject mismatches with structured error.
-- Snapshot metadata: add `schema_version`, `graph_hash` (blake3), `course_commit` (mandatory). Load verifies version/hash/commit and returns specific codes `schema_version_mismatch`, `commit_mismatch`, `hash_mismatch`.
+- Source refs: keep revision enforcement; add path containment to the workspace root.
+- Snapshot metadata: add `schema_version`, `graph_hash` (blake3), `course_commit` (mandatory). Load verifies version/hash/commit and returns specific codes `schema_version_mismatch`, `commit_mismatch`, `hash_mismatch`. Default to fail-closed; expose an explicit force flag for drift if needed.
 
 ## 6) Semantic macro tools (cognitive economy)
 

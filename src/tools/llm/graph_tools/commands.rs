@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::info;
 
-use super::common::{GraphCommandTool, default_confidence, map_send_err, parse_graph_command};
+use super::common::{
+    GraphCommandTool, MaybeApply, default_confidence, map_send_err, parse_graph_command,
+};
 use crate::{
     graph::{
         AnchorImpact, AssessesAttrs, CaseTag, IntroductionScope, KnowledgeNode, RequiresAttrs,
@@ -19,8 +21,7 @@ use crate::{
         SupportKind,
     },
     tools::llm::{
-        CallState, ToolInputError, ToolInputResult, ToolInstance, ToolPrototype, require_string,
-        schema_for_args,
+        CallState, ToolInputResult, ToolInstance, ToolPrototype, require_string, schema_for_args,
     },
 };
 
@@ -108,6 +109,18 @@ pub struct InsertKnowledgeArgs {
                        misconception, keystone)."
     )]
     pub tags: Vec<String>,
+    #[serde(default)]
+    #[builder(default = false)]
+    #[schemars(
+        description = "Set apply=true to perform the mutation; default false returns a preview."
+    )]
+    pub apply: bool,
+}
+
+impl MaybeApply for InsertKnowledgeArgs {
+    fn apply_flag(&self) -> bool {
+        self.apply
+    }
 }
 
 pub(super) fn insert_knowledge_meta() -> ToolPrototype {
@@ -149,14 +162,16 @@ fn build_insert_knowledge(args: &InsertKnowledgeArgs) -> crate::graph::manager::
 }
 
 fn parse_insert_knowledge(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let mut args: InsertKnowledgeArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    INSERT_KNOWLEDGE,
-            message: err.to_string(),
-        })?;
-    args.slug = require_string(args.slug, INSERT_KNOWLEDGE, "slug")?;
-    args.title = require_string(args.title, INSERT_KNOWLEDGE, "title")?;
-    args.statement = require_string(args.statement, INSERT_KNOWLEDGE, "statement")?;
+    let args = super::common::parse_args_with_builder(
+        INSERT_KNOWLEDGE,
+        raw,
+        |mut input: InsertKnowledgeArgs| {
+            input.slug = require_string(input.slug, INSERT_KNOWLEDGE, "slug")?;
+            input.title = require_string(input.title, INSERT_KNOWLEDGE, "title")?;
+            input.statement = require_string(input.statement, INSERT_KNOWLEDGE, "statement")?;
+            Ok(input)
+        },
+    )?;
 
     parse_graph_command::<InsertKnowledgeArgs, crate::graph::manager::InsertKnowledge>(
         INSERT_KNOWLEDGE,
@@ -183,14 +198,16 @@ pub(super) fn update_knowledge_meta() -> ToolPrototype {
 }
 
 fn parse_update_knowledge(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let mut args: InsertKnowledgeArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    UPDATE_KNOWLEDGE,
-            message: err.to_string(),
-        })?;
-    args.slug = require_string(args.slug, UPDATE_KNOWLEDGE, "slug")?;
-    args.title = require_string(args.title, UPDATE_KNOWLEDGE, "title")?;
-    args.statement = require_string(args.statement, UPDATE_KNOWLEDGE, "statement")?;
+    let args = super::common::parse_args_with_builder(
+        UPDATE_KNOWLEDGE,
+        raw,
+        |mut input: InsertKnowledgeArgs| {
+            input.slug = require_string(input.slug, UPDATE_KNOWLEDGE, "slug")?;
+            input.title = require_string(input.title, UPDATE_KNOWLEDGE, "title")?;
+            input.statement = require_string(input.statement, UPDATE_KNOWLEDGE, "statement")?;
+            Ok(input)
+        },
+    )?;
 
     parse_graph_command::<InsertKnowledgeArgs, UpdateKnowledge>(
         UPDATE_KNOWLEDGE,
@@ -260,6 +277,18 @@ pub struct InsertTeachingArgs {
     #[serde(default)]
     #[schemars(description = "Rationale when a step intentionally has no anchors.")]
     pub rationale:   Option<String>,
+    #[serde(default)]
+    #[builder(default = false)]
+    #[schemars(
+        description = "Set apply=true to perform the mutation; default false returns a preview."
+    )]
+    pub apply:       bool,
+}
+
+impl MaybeApply for InsertTeachingArgs {
+    fn apply_flag(&self) -> bool {
+        self.apply
+    }
 }
 
 pub(super) fn insert_teaching_meta() -> ToolPrototype {
@@ -291,15 +320,17 @@ fn build_insert_teaching(args: &InsertTeachingArgs) -> crate::graph::manager::In
 }
 
 fn parse_insert_teaching(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let mut args: InsertTeachingArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    INSERT_TEACHING,
-            message: err.to_string(),
-        })?;
-    args.slug = require_string(args.slug, INSERT_TEACHING, "slug")?;
-    args.title = require_string(args.title, INSERT_TEACHING, "title")?;
-    args.statement = require_string(args.statement, INSERT_TEACHING, "statement")?;
-    args.episode = require_string(args.episode, INSERT_TEACHING, "episode")?;
+    let args = super::common::parse_args_with_builder(
+        INSERT_TEACHING,
+        raw,
+        |mut input: InsertTeachingArgs| {
+            input.slug = require_string(input.slug, INSERT_TEACHING, "slug")?;
+            input.title = require_string(input.title, INSERT_TEACHING, "title")?;
+            input.statement = require_string(input.statement, INSERT_TEACHING, "statement")?;
+            input.episode = require_string(input.episode, INSERT_TEACHING, "episode")?;
+            Ok(input)
+        },
+    )?;
 
     parse_graph_command::<InsertTeachingArgs, crate::graph::manager::InsertTeachingStep>(
         INSERT_TEACHING,
@@ -325,15 +356,17 @@ pub(super) fn update_teaching_meta() -> ToolPrototype {
 }
 
 fn parse_update_teaching(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let mut args: InsertTeachingArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    UPDATE_TEACHING,
-            message: err.to_string(),
-        })?;
-    args.slug = require_string(args.slug, UPDATE_TEACHING, "slug")?;
-    args.title = require_string(args.title, UPDATE_TEACHING, "title")?;
-    args.statement = require_string(args.statement, UPDATE_TEACHING, "statement")?;
-    args.episode = require_string(args.episode, UPDATE_TEACHING, "episode")?;
+    let args = super::common::parse_args_with_builder(
+        UPDATE_TEACHING,
+        raw,
+        |mut input: InsertTeachingArgs| {
+            input.slug = require_string(input.slug, UPDATE_TEACHING, "slug")?;
+            input.title = require_string(input.title, UPDATE_TEACHING, "title")?;
+            input.statement = require_string(input.statement, UPDATE_TEACHING, "statement")?;
+            input.episode = require_string(input.episode, UPDATE_TEACHING, "episode")?;
+            Ok(input)
+        },
+    )?;
 
     parse_graph_command::<InsertTeachingArgs, UpdateTeachingStep>(
         UPDATE_TEACHING,
@@ -387,6 +420,15 @@ pub struct AddRequiresArgs {
     pub evidence_refs: Vec<SourceRef>,
     #[serde(default = "default_confidence")]
     pub confidence:    f32,
+    #[serde(default)]
+    #[builder(default = false)]
+    pub apply:         bool,
+}
+
+impl MaybeApply for AddRequiresArgs {
+    fn apply_flag(&self) -> bool {
+        self.apply
+    }
 }
 
 pub(super) fn add_requires_meta() -> ToolPrototype {
@@ -400,14 +442,13 @@ pub(super) fn add_requires_meta() -> ToolPrototype {
 }
 
 fn parse_add_requires(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let mut args: AddRequiresArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    ADD_REQUIRES,
-            message: err.to_string(),
+    let args =
+        super::common::parse_args_with_builder(ADD_REQUIRES, raw, |mut input: AddRequiresArgs| {
+            input.from_slug = require_string(input.from_slug, ADD_REQUIRES, "from_slug")?;
+            input.to_slug = require_string(input.to_slug, ADD_REQUIRES, "to_slug")?;
+            input.rationale = require_string(input.rationale, ADD_REQUIRES, "rationale")?;
+            Ok(input)
         })?;
-    args.from_slug = require_string(args.from_slug, ADD_REQUIRES, "from_slug")?;
-    args.to_slug = require_string(args.to_slug, ADD_REQUIRES, "to_slug")?;
-    args.rationale = require_string(args.rationale, ADD_REQUIRES, "rationale")?;
 
     parse_graph_command::<AddRequiresArgs, AddRequires>(
         ADD_REQUIRES,
@@ -470,6 +511,15 @@ pub struct AddSupportsArgs {
     pub evidence_refs:   Vec<SourceRef>,
     #[serde(default = "default_confidence")]
     pub confidence:      f32,
+    #[serde(default)]
+    #[builder(default = false)]
+    pub apply:           bool,
+}
+
+impl MaybeApply for AddSupportsArgs {
+    fn apply_flag(&self) -> bool {
+        self.apply
+    }
 }
 
 pub(super) fn add_supports_meta() -> ToolPrototype {
@@ -485,13 +535,12 @@ pub(super) fn add_supports_meta() -> ToolPrototype {
 }
 
 fn parse_add_supports(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let mut args: AddSupportsArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    ADD_SUPPORTS,
-            message: err.to_string(),
+    let args =
+        super::common::parse_args_with_builder(ADD_SUPPORTS, raw, |mut input: AddSupportsArgs| {
+            input.from_slug = require_string(input.from_slug, ADD_SUPPORTS, "from_slug")?;
+            input.to_slug = require_string(input.to_slug, ADD_SUPPORTS, "to_slug")?;
+            Ok(input)
         })?;
-    args.from_slug = require_string(args.from_slug, ADD_SUPPORTS, "from_slug")?;
-    args.to_slug = require_string(args.to_slug, ADD_SUPPORTS, "to_slug")?;
 
     parse_graph_command::<AddSupportsArgs, AddSupports>(
         ADD_SUPPORTS,
@@ -543,6 +592,15 @@ pub struct AddAssessesArgs {
     pub observation_features: Vec<String>,
     #[serde(default = "default_confidence")]
     pub confidence:           f32,
+    #[serde(default)]
+    #[builder(default = false)]
+    pub apply:                bool,
+}
+
+impl MaybeApply for AddAssessesArgs {
+    fn apply_flag(&self) -> bool {
+        self.apply
+    }
 }
 
 pub(super) fn add_assesses_meta() -> ToolPrototype {
@@ -556,13 +614,12 @@ pub(super) fn add_assesses_meta() -> ToolPrototype {
 }
 
 fn parse_add_assesses(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let mut args: AddAssessesArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    ADD_ASSESSES,
-            message: err.to_string(),
+    let args =
+        super::common::parse_args_with_builder(ADD_ASSESSES, raw, |mut input: AddAssessesArgs| {
+            input.from_slug = require_string(input.from_slug, ADD_ASSESSES, "from_slug")?;
+            input.to_slug = require_string(input.to_slug, ADD_ASSESSES, "to_slug")?;
+            Ok(input)
         })?;
-    args.from_slug = require_string(args.from_slug, ADD_ASSESSES, "from_slug")?;
-    args.to_slug = require_string(args.to_slug, ADD_ASSESSES, "to_slug")?;
 
     parse_graph_command::<AddAssessesArgs, AddAssesses>(
         ADD_ASSESSES,
@@ -611,6 +668,15 @@ pub struct AddPrecedesArgs {
     )]
     #[serde(default = "default_confidence")]
     pub confidence: f32,
+    #[serde(default)]
+    #[builder(default = false)]
+    pub apply:      bool,
+}
+
+impl MaybeApply for AddPrecedesArgs {
+    fn apply_flag(&self) -> bool {
+        self.apply
+    }
 }
 
 pub(super) fn add_precedes_meta() -> ToolPrototype {
@@ -624,14 +690,13 @@ pub(super) fn add_precedes_meta() -> ToolPrototype {
 }
 
 fn parse_add_precedes(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let mut args: AddPrecedesArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    ADD_PRECEDES,
-            message: err.to_string(),
+    let args =
+        super::common::parse_args_with_builder(ADD_PRECEDES, raw, |mut input: AddPrecedesArgs| {
+            input.from_slug = require_string(input.from_slug, ADD_PRECEDES, "from_slug")?;
+            input.to_slug = require_string(input.to_slug, ADD_PRECEDES, "to_slug")?;
+            input.episode = require_string(input.episode, ADD_PRECEDES, "episode")?;
+            Ok(input)
         })?;
-    args.from_slug = require_string(args.from_slug, ADD_PRECEDES, "from_slug")?;
-    args.to_slug = require_string(args.to_slug, ADD_PRECEDES, "to_slug")?;
-    args.episode = require_string(args.episode, ADD_PRECEDES, "episode")?;
 
     parse_graph_command::<AddPrecedesArgs, AddPrecedes>(
         ADD_PRECEDES,
@@ -675,6 +740,15 @@ pub struct AddAnchorsArgs {
     #[serde(default = "default_confidence")]
     #[schemars(description = "Confidence for this anchor; defaults to 1.0 if omitted.")]
     pub confidence: f32,
+    #[serde(default)]
+    #[builder(default = false)]
+    pub apply:      bool,
+}
+
+impl MaybeApply for AddAnchorsArgs {
+    fn apply_flag(&self) -> bool {
+        self.apply
+    }
 }
 
 pub(super) fn add_anchors_meta() -> ToolPrototype {
@@ -690,13 +764,12 @@ pub(super) fn add_anchors_meta() -> ToolPrototype {
 }
 
 fn parse_add_anchors(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let mut args: AddAnchorsArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    ADD_ANCHORS,
-            message: err.to_string(),
+    let args =
+        super::common::parse_args_with_builder(ADD_ANCHORS, raw, |mut input: AddAnchorsArgs| {
+            input.from_slug = require_string(input.from_slug, ADD_ANCHORS, "from_slug")?;
+            input.to_slug = require_string(input.to_slug, ADD_ANCHORS, "to_slug")?;
+            Ok(input)
         })?;
-    args.from_slug = require_string(args.from_slug, ADD_ANCHORS, "from_slug")?;
-    args.to_slug = require_string(args.to_slug, ADD_ANCHORS, "to_slug")?;
 
     parse_graph_command::<AddAnchorsArgs, AddAnchors>(
         ADD_ANCHORS,
@@ -727,8 +800,23 @@ const REMOVE_NODE: &str = "graph_remove_node";
 #[derive(Debug, Clone, Builder, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RenameNodeArgs {
+    #[builder(with = |v: String| -> ToolInputResult<_> {
+        require_string(v, RENAME_NODE, "old_slug")
+    })]
     pub old_slug: String,
+    #[builder(with = |v: String| -> ToolInputResult<_> {
+        require_string(v, RENAME_NODE, "new_slug")
+    })]
     pub new_slug: String,
+    #[serde(default)]
+    #[builder(default = false)]
+    pub apply:    bool,
+}
+
+impl MaybeApply for RenameNodeArgs {
+    fn apply_flag(&self) -> bool {
+        self.apply
+    }
 }
 
 pub(super) fn rename_node_meta() -> ToolPrototype {
@@ -741,13 +829,12 @@ pub(super) fn rename_node_meta() -> ToolPrototype {
 }
 
 fn parse_rename_node(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let mut args: RenameNodeArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    RENAME_NODE,
-            message: err.to_string(),
+    let args =
+        super::common::parse_args_with_builder(RENAME_NODE, raw, |mut input: RenameNodeArgs| {
+            input.old_slug = require_string(input.old_slug, RENAME_NODE, "old_slug")?;
+            input.new_slug = require_string(input.new_slug, RENAME_NODE, "new_slug")?;
+            Ok(input)
         })?;
-    args.old_slug = require_string(args.old_slug, RENAME_NODE, "old_slug")?;
-    args.new_slug = require_string(args.new_slug, RENAME_NODE, "new_slug")?;
     Ok(Box::new(GraphCommandTool::new(
         args,
         state.graph.clone(),
@@ -759,13 +846,26 @@ fn parse_rename_node(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn T
             command_ok(RENAME_NODE, json!({"old_slug": args.old_slug, "new_slug": args.new_slug}))
         },
         |e| map_send_err(e, RENAME_NODE),
+        RENAME_NODE,
     )))
 }
 
 #[derive(Debug, Clone, Builder, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RemoveNodeArgs {
-    pub slug: String,
+    #[builder(with = |v: String| -> ToolInputResult<_> {
+        require_string(v, REMOVE_NODE, "slug")
+    })]
+    pub slug:  String,
+    #[serde(default)]
+    #[builder(default = false)]
+    pub apply: bool,
+}
+
+impl MaybeApply for RemoveNodeArgs {
+    fn apply_flag(&self) -> bool {
+        self.apply
+    }
 }
 
 pub(super) fn remove_node_meta() -> ToolPrototype {
@@ -778,12 +878,11 @@ pub(super) fn remove_node_meta() -> ToolPrototype {
 }
 
 fn parse_remove_node(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let mut args: RemoveNodeArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    REMOVE_NODE,
-            message: err.to_string(),
+    let args =
+        super::common::parse_args_with_builder(REMOVE_NODE, raw, |mut input: RemoveNodeArgs| {
+            input.slug = require_string(input.slug, REMOVE_NODE, "slug")?;
+            Ok(input)
         })?;
-    args.slug = require_string(args.slug.clone(), REMOVE_NODE, "slug")?;
 
     Ok(Box::new(GraphCommandTool::new(
         args,
@@ -796,6 +895,7 @@ fn parse_remove_node(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn T
             command_ok(REMOVE_NODE, json!({"slug": args.slug}))
         },
         |e| map_send_err(e, REMOVE_NODE),
+        REMOVE_NODE,
     )))
 }
 

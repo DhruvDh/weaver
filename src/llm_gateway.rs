@@ -392,6 +392,12 @@ pub struct LLMGatewayState {
     metrics: GatewayMetricsState,
 }
 
+impl LLMGatewayState {
+    pub fn new(metrics: GatewayMetricsState) -> Self {
+        Self { metrics }
+    }
+}
+
 impl From<&LLMGateway> for LLMGatewayState {
     fn from(gateway: &LLMGateway) -> Self {
         Self {
@@ -640,6 +646,21 @@ impl LLMGateway {
                             },
                             parsed_args.clone(),
                             input_err.to_string(),
+                        );
+                        ToolOutput::new(payload)
+                    }
+                    llm::ToolExecutionError::Execution(exec_err) => {
+                        error!(
+                            iteration,
+                            tool = tool_name.as_str(),
+                            error = ?exec_err,
+                            "tool execution panic or cancellation"
+                        );
+                        let payload = Self::tool_error_payload(
+                            &tool_name,
+                            "execution_error",
+                            parsed_args.clone(),
+                            exec_err.to_string(),
                         );
                         ToolOutput::new(payload)
                     }

@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::info;
 
-use super::common::{map_send_err_anyhow, parse_graph_command};
+use super::common::{
+    MaybeApply, map_send_err_anyhow, parse_args_with_builder, parse_graph_command,
+};
 use crate::{
     graph::manager::{LoadSnapshot, SaveSnapshot},
     tools::llm::{
@@ -41,7 +43,16 @@ const LOAD_SNAPSHOT: &str = "graph_load_snapshot";
 #[serde(deny_unknown_fields)]
 pub struct SaveSnapshotArgs {
     #[serde(default)]
-    pub path: Option<String>,
+    pub path:  Option<String>,
+    #[serde(default)]
+    #[builder(default = false)]
+    pub apply: bool,
+}
+
+impl MaybeApply for SaveSnapshotArgs {
+    fn apply_flag(&self) -> bool {
+        self.apply
+    }
 }
 
 pub(super) fn save_snapshot_meta() -> ToolPrototype {
@@ -87,7 +98,19 @@ fn parse_save_snapshot(
 #[derive(Debug, Clone, Builder, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LoadSnapshotArgs {
-    pub path: String,
+    #[builder(with = |v: String| -> crate::tools::llm::ToolInputResult<_> {
+        crate::tools::llm::require_string(v, LOAD_SNAPSHOT, "path")
+    })]
+    pub path:  String,
+    #[serde(default)]
+    #[builder(default = false)]
+    pub apply: bool,
+}
+
+impl MaybeApply for LoadSnapshotArgs {
+    fn apply_flag(&self) -> bool {
+        self.apply
+    }
 }
 
 pub(super) fn load_snapshot_meta() -> ToolPrototype {
@@ -136,12 +159,10 @@ fn parse_load_snapshot(
     raw: Value,
     state: &CallState,
 ) -> crate::tools::llm::ToolInputResult<Box<dyn crate::tools::llm::ToolInstance>> {
-    let mut args: LoadSnapshotArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    LOAD_SNAPSHOT,
-            message: err.to_string(),
-        })?;
-    args.path = require_string(args.path.clone(), LOAD_SNAPSHOT, "path")?;
+    let args = parse_args_with_builder(LOAD_SNAPSHOT, raw, |mut input: LoadSnapshotArgs| {
+        input.path = require_string(input.path, LOAD_SNAPSHOT, "path")?;
+        Ok(input)
+    })?;
     if !Path::new(&args.path).exists() {
         return Err(ToolInputError::InvalidPayload {
             tool:    LOAD_SNAPSHOT,

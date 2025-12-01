@@ -154,6 +154,11 @@ impl EdgeSpec for SupportsSpec {
                 op = "supports_validate"
             );
         }
+        if fade_elapsed_ms > 2_000.0 {
+            return Err(GraphError::Schema(
+                "fadeability validation timed out; try again with smaller change".to_string(),
+            ));
+        }
         let carries_prereq = issues
             .iter()
             .any(|issue| issue.support_edges.contains(&new_edge));

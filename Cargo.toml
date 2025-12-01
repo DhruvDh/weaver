@@ -13,6 +13,7 @@ bpaf = { version = "0.9.20", features = [
 ] }
 grep-regex = "0.1.14"
 grep-searcher = { version = "0.1.16", features = ["avx-accel", "simd-accel"] }
+ignore = "0.4"
 kameo = "0.19.2"
 kameo_actors = "0.4.0"
 pathdiff = "0.2.3"

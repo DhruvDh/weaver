@@ -5,12 +5,12 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::common::{map_send_err, paginate};
+use super::common::{map_send_err, paginate, parse_args_with_builder};
 use crate::{
     graph::{NodeKind, manager::EdgeKindFilter},
     tools::llm::{
-        CallState, ToolExecutionError, ToolInputError, ToolInputResult, ToolInstance, ToolOutput,
-        ToolPrototype, payload_size_bytes, require_string, schema_for_args,
+        CallState, ToolExecutionError, ToolInputResult, ToolInstance, ToolOutput, ToolPrototype,
+        payload_size_bytes, require_string, schema_for_args,
     },
 };
 
@@ -21,10 +21,10 @@ const GRAPH_NEIGHBORS: &str = "graph_neighbors";
 #[derive(Debug, Clone, Builder, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NeighborsArgs {
+    #[schemars(description = "Existing node slug whose neighborhood you want to inspect.")]
     #[builder(with = |value: String| -> crate::tools::llm::ToolInputResult<_> {
         require_string(value, GRAPH_NEIGHBORS, "slug")
     })]
-    #[schemars(description = "Existing node slug whose neighborhood you want to inspect.")]
     pub slug:      String,
     #[serde(default)]
     #[schemars(
@@ -36,13 +36,21 @@ pub struct NeighborsArgs {
     #[schemars(
         description = "Direction relative to the node: incoming | outgoing | both (default)."
     )]
-    pub direction: Option<String>, // outgoing, incoming, both
+    pub direction: Option<NeighborDirectionArg>,
     #[serde(default)]
     #[schemars(description = "Maximum neighbors to return (default 50, max 200).")]
     pub limit:     Option<usize>,
     #[serde(default)]
     #[schemars(description = "Offset into the neighbor list (default 0).")]
     pub offset:    Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum NeighborDirectionArg {
+    Incoming,
+    Outgoing,
+    Both,
 }
 
 pub(super) fn neighbors_meta() -> ToolPrototype {
@@ -57,20 +65,10 @@ pub(super) fn neighbors_meta() -> ToolPrototype {
 }
 
 fn parse_neighbors(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let mut args: NeighborsArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    GRAPH_NEIGHBORS,
-            message: err.to_string(),
-        })?;
-    if let Some(dir) = args.direction.as_deref()
-        && !matches!(dir, "incoming" | "outgoing" | "both")
-    {
-        return Err(ToolInputError::InvalidPayload {
-            tool:    GRAPH_NEIGHBORS,
-            message: "direction must be incoming|outgoing|both".into(),
-        });
-    }
-    args.slug = require_string(args.slug.clone(), GRAPH_NEIGHBORS, "slug")?;
+    let args = parse_args_with_builder(GRAPH_NEIGHBORS, raw, |mut input: NeighborsArgs| {
+        input.slug = require_string(input.slug, GRAPH_NEIGHBORS, "slug")?;
+        Ok(input)
+    })?;
     Ok(Box::new(NeighborsTool {
         args,
         graph: state.graph.clone(),
@@ -87,10 +85,10 @@ impl ToolInstance for NeighborsTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
         use crate::graph::manager::{NeighborDirection, Neighbors};
 
-        let direction = match self.args.direction.as_deref() {
-            Some("incoming") => Some(NeighborDirection::Incoming),
-            Some("outgoing") => Some(NeighborDirection::Outgoing),
-            _ => Some(NeighborDirection::Both),
+        let direction = match self.args.direction {
+            Some(NeighborDirectionArg::Incoming) => Some(NeighborDirection::Incoming),
+            Some(NeighborDirectionArg::Outgoing) => Some(NeighborDirection::Outgoing),
+            Some(NeighborDirectionArg::Both) | None => Some(NeighborDirection::Both),
         };
 
         let neighbors = self
@@ -117,20 +115,24 @@ impl ToolInstance for NeighborsTool {
             })
             .collect();
 
-        let payload = json!({
-            "type": "graph_view",
-            "tool": GRAPH_NEIGHBORS,
-            "slug": self.args.slug,
-            "offset": offset,
-            "limit": limit,
-            "has_more": has_more,
-            "neighbors": rendered,
-        });
+        let meta = super::common::graph_meta(&self.graph).await?;
 
-        Ok(ToolOutput::with_byte_hint(
-            payload.clone(),
-            crate::tools::llm::payload_size_bytes(&payload),
-        ))
+        let payload = super::common::attach_meta(
+            json!({
+                "type": "graph_view",
+                "tool": GRAPH_NEIGHBORS,
+                "slug": self.args.slug,
+                "offset": offset,
+                "limit": limit,
+                "has_more": has_more,
+                "neighbors": rendered,
+            }),
+            &meta,
+        );
+
+        let payload_size = crate::tools::llm::payload_size_bytes(&payload);
+
+        Ok(ToolOutput::with_byte_hint(payload, payload_size))
     }
 }
 
@@ -145,6 +147,9 @@ pub struct GetNodeArgs {
         description = "Existing node slug in the curriculum graph. Use graph_neighbors or prior \
                        tools to discover slugs."
     )]
+    #[builder(with = |value: String| -> crate::tools::llm::ToolInputResult<_> {
+        require_string(value, GET_NODE, "slug")
+    })]
     pub slug: String,
 }
 
@@ -160,12 +165,10 @@ pub(super) fn get_node_meta() -> ToolPrototype {
 }
 
 fn parse_get_node(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let mut args: GetNodeArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    GET_NODE,
-            message: err.to_string(),
-        })?;
-    args.slug = require_string(args.slug.clone(), GET_NODE, "slug")?;
+    let args = parse_args_with_builder(GET_NODE, raw, |mut input: GetNodeArgs| {
+        input.slug = require_string(input.slug, GET_NODE, "slug")?;
+        Ok(input)
+    })?;
     Ok(Box::new(GetNodeTool {
         args,
         graph: state.graph.clone(),
@@ -187,6 +190,7 @@ impl ToolInstance for GetNodeTool {
             })
             .await
             .map_err(|e| map_send_err(e, GET_NODE))?;
+        let meta = super::common::graph_meta(&self.graph).await?;
         let value = match &payload.kind {
             NodeKind::Knowledge(k) => json!({
                 "slug": payload.slug,
@@ -218,11 +222,14 @@ impl ToolInstance for GetNodeTool {
                 "tags": payload.tags,
             }),
         };
-        let payload = json!({
-            "type": "graph_view",
-            "tool": GET_NODE,
-            "node": value,
-        });
+        let payload = super::common::attach_meta(
+            json!({
+                "type": "graph_view",
+                "tool": GET_NODE,
+                "node": value,
+            }),
+            &meta,
+        );
         Ok(ToolOutput::with_byte_hint(payload.clone(), payload_size_bytes(&payload)))
     }
 }

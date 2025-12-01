@@ -94,3 +94,24 @@ async fn analysis_cache_deduplicates_concurrent_async_calls() {
 
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
+
+#[test]
+fn analysis_cache_bounds_versions_per_kind() {
+    let cache = AnalysisCache::new();
+    let kind = AnalysisKind::GapBundle;
+
+    for version in 0..10 {
+        let key = AnalysisCacheKey {
+            graph_version: version,
+            kind:          kind.clone(),
+        };
+        cache.get_or_insert_with(key, || json!({ "version": version }));
+    }
+
+    let versions = cache.versions_for_kind(&kind);
+    assert!(
+        versions.len() <= 2,
+        "expected at most two cached versions per kind, got {versions:?}"
+    );
+    assert_eq!(versions, vec![8, 9]);
+}

@@ -15,7 +15,7 @@ Purpose: identify and reduce accidental complexity and code bloat in the graph/a
 
 1. **Tool layer duplication** – `src/tools/llm/graph_tools/commands.rs` contains near-identical parsers and structs per edge type.
 2. **Analysis monolith** – `src/analysis/mod.rs` mixes structural, pedagogical, discourse, and centrality logic in one file.
-3. **Algorithm leakage** – `graph_tools/algorithms.rs` exposes petgraph terms (bridges, articulation, pagerank) to the LLM.
+3. **Algorithm footprint** – `graph_tools/algorithms.rs` still compiles pagerank/bridges/etc.; only `graph_requires_cycles` is curated, but the code adds build/maintenance weight.
 4. **Persistence split & duplication** – snapshot logic lives in both `graph/persist.rs` and bespoke code paths in `graph/manager.rs`.
 5. **Redundant validation paths** – multiple cycle checks and graph clones (supports fadeability) inflate cost and code size.
 6. **Inconsistent payload shapes** – tools emit varied JSON shapes, requiring per-tool parsing and maintenance.
@@ -24,7 +24,7 @@ Purpose: identify and reduce accidental complexity and code bloat in the graph/a
 
 **Goal:** shrink curated surface to semantic, budget-aware tools; hide or remove raw/duplicative ones.
 
-- Remove from `CURATED_TOOL_IDS`: raw algorithm tools (`graph_requires_bridges`, pagerank, articulation), and any primitive inspection tools superseded by semantic reports. Keep them behind `debug_allow_raw_algos` if needed for developers.
+- Review `CURATED_TOOL_IDS`: consider gating `graph_requires_cycles` behind a debug flag; raw algos are already uncurated but still compiled.
 - Deprecate CRUD tools (`graph_insert_knowledge`, `graph_add_requires`, etc.) once semantic macros are stable. Keep stubs emitting deprecation warnings plus a pointer to replacements.
 - Consolidate analysis tools into a **small intent-based set** (not a single mega-tool): e.g., `inspect_structure` (DAG/cycles/connectivity), `audit_pedagogy` (alignment/coverage/examples/practice/fadeability/purity), `check_integrity` (source refs, commit/schema/hash drift). All use the shared preview/pagination envelope.
 - Consolidate multiple analysis outputs into the intent-based trio (`inspect_structure`, `audit_pedagogy`, `check_integrity`) using the shared preview/pagination envelope; avoid one mega-tool that mixes too many flags.
@@ -95,7 +95,7 @@ Purpose: identify and reduce accidental complexity and code bloat in the graph/a
 
 ## 12) Execution sequence (low-risk to high)
 
-1. **De-curate surface**: remove raw algos from curated list; add deprecation warnings to CRUD tools; adjust prompt/docs.
+1. **De-curate surface**: gate `graph_requires_cycles` (and any future raw algos) behind a debug flag; add deprecation warnings to CRUD tools; adjust prompt/docs; consider a feature flag to skip compiling raw algos in normal builds.
 2. **Shared tool envelope**: implement generic parser + preview wrapper; refactor existing tools to use it.
 3. **Analysis split**: move functions to cohesive modules; re-export; fix imports; add focused tests.
 4. **Payload standardization**: update all tools to common envelope; adjust tests/docs accordingly.

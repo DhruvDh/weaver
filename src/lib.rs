@@ -1,4 +1,5 @@
 pub mod analysis;
+pub mod app;
 pub mod constants;
 pub mod file_reader;
 pub mod graph;

@@ -1,0 +1,798 @@
+use std::{
+    convert::Infallible,
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::Arc,
+    time::Duration,
+};
+
+use anyhow::{Context as _, Result, anyhow};
+use bpaf::{OptionParser, Parser, construct, long, positional};
+use futures::future::BoxFuture;
+use kameo::{error::SendError, prelude::*};
+use kameo_actors::scheduler::{Scheduler, SetInterval};
+use kameo_persistence::PersistentActor;
+use tracing::{debug, error, info, warn};
+use tracing_subscriber::EnvFilter;
+use url::Url;
+
+use crate::{
+    constants::PRETEXT_SUBDIR,
+    file_reader::{FileReader, FileReaderQuery},
+    graph::{
+        CurriculumGraph, GraphConfig,
+        manager::{
+            ApplyRuntimeConfig, AuditInvariants, GetCourseCommit, GraphManager, GraphManagerState,
+            PersistSnapshot, RedundantRequires, SaveSnapshot,
+        },
+        persist,
+    },
+    llm_gateway::{
+        GatewayMetrics, GetGatewayMetrics, LLMGateway, LLMGatewayState, PersistGatewaySnapshot,
+    },
+    rerun_sink::{RerunSink, RerunTarget},
+};
+
+fn log_scalar(rerun: &Option<ActorRef<RerunSink>>, path: impl Into<String>, value: f64) {
+    if let Some(sink) = rerun {
+        let msg = crate::rerun_sink::LogScalar {
+            path: path.into(),
+            value,
+            time_ns: None,
+        };
+        let sink = sink.clone();
+        tokio::spawn(async move {
+            let _ = sink.tell(msg).await;
+        });
+    }
+}
+
+#[derive(Clone)]
+struct AutosaveTick;
+
+#[derive(Clone)]
+struct PruneTick;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RerunMode {
+    Grpc,
+    File,
+    Both,
+    None,
+}
+
+#[derive(Clone)]
+struct AutosaveWorker {
+    graph:         ActorRef<GraphManager>,
+    gateway:       Option<ActorRef<LLMGateway>>,
+    rerun:         Option<ActorRef<RerunSink>>,
+    autosave_path: PathBuf,
+}
+
+impl Actor for AutosaveWorker {
+    type Args = AutosaveWorker;
+    type Error = Infallible;
+
+    async fn on_start(state: Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
+        Ok(state)
+    }
+}
+
+#[derive(Clone)]
+struct PruneWorker {
+    graph: ActorRef<GraphManager>,
+    rerun: Option<ActorRef<RerunSink>>,
+}
+
+impl Actor for PruneWorker {
+    type Args = PruneWorker;
+    type Error = Infallible;
+
+    async fn on_start(state: Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
+        Ok(state)
+    }
+}
+
+impl Message<AutosaveTick> for AutosaveWorker {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        _msg: AutosaveTick,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let audit_start = std::time::Instant::now();
+        let audit: Result<(), anyhow::Error> =
+            self.graph.ask(AuditInvariants).await.map_err(|e| match e {
+                SendError::HandlerError(err) => err,
+                other => anyhow!(other),
+            });
+
+        log_scalar(
+            &self.rerun,
+            "metrics/autosave/audit_duration_ms",
+            audit_start.elapsed().as_secs_f64() * 1000.0,
+        );
+        log_scalar(
+            &self.rerun,
+            "metrics/autosave/audit_success",
+            if audit.is_ok() { 1.0 } else { 0.0 },
+        );
+
+        if let Err(err) = audit {
+            error!(error = %err, "autosave aborted: graph audit failed");
+            return;
+        }
+
+        let start = std::time::Instant::now();
+        let persist: Result<(), anyhow::Error> =
+            self.graph.ask(PersistSnapshot).await.map_err(|e| match e {
+                SendError::HandlerError(err) => err,
+                other => anyhow!(other),
+            });
+        if let Err(err) = persist {
+            error!(error = %err, "autosave failed: graph persistence");
+            log_scalar(
+                &self.rerun,
+                "metrics/autosave/duration_ms",
+                start.elapsed().as_secs_f64() * 1000.0,
+            );
+            log_scalar(&self.rerun, "metrics/autosave/success", 0.0);
+            return;
+        }
+        let save_result: Result<(), anyhow::Error> = self
+            .graph
+            .ask(SaveSnapshot {
+                path: self.autosave_path.clone(),
+            })
+            .await
+            .map_err(|e| match e {
+                SendError::HandlerError(err) => err,
+                other => anyhow!(other),
+            });
+        if let Err(err) = save_result {
+            error!(error = %err, "autosave failed: legacy snapshot write");
+            log_scalar(
+                &self.rerun,
+                "metrics/autosave/duration_ms",
+                start.elapsed().as_secs_f64() * 1000.0,
+            );
+            log_scalar(&self.rerun, "metrics/autosave/success", 0.0);
+            return;
+        }
+        let gateway_persist: Result<(), anyhow::Error> = if let Some(gateway) = &self.gateway {
+            match gateway.ask(PersistGatewaySnapshot).await {
+                Ok(()) => Ok(()),
+                Err(SendError::HandlerError(e)) => Err(e),
+                Err(e) => Err(anyhow!(e)),
+            }
+        } else {
+            Ok(())
+        };
+        let ok = audit.is_ok() && persist.is_ok() && gateway_persist.is_ok() && save_result.is_ok();
+
+        if let Err(err) = gateway_persist {
+            error!(error = %err, "autosave failed: gateway persistence");
+            log_scalar(
+                &self.rerun,
+                "metrics/autosave/duration_ms",
+                start.elapsed().as_secs_f64() * 1000.0,
+            );
+            log_scalar(&self.rerun, "metrics/autosave/success", 0.0);
+            return;
+        }
+
+        if ok {
+            debug!("graph autosave completed");
+        } else {
+            error!(
+                audit_error = audit.as_ref().err().map(|e: &anyhow::Error| e.to_string()),
+                persist_error = persist
+                    .as_ref()
+                    .err()
+                    .map(|e: &anyhow::Error| e.to_string()),
+                save_error = save_result
+                    .as_ref()
+                    .err()
+                    .map(|e: &anyhow::Error| e.to_string()),
+                gateway_error = gateway_persist
+                    .as_ref()
+                    .err()
+                    .map(|e: &anyhow::Error| e.to_string()),
+                "graph autosave failed"
+            );
+        }
+        log_scalar(
+            &self.rerun,
+            "metrics/autosave/duration_ms",
+            start.elapsed().as_secs_f64() * 1000.0,
+        );
+        log_scalar(&self.rerun, "metrics/autosave/success", if ok { 1.0 } else { 0.0 });
+    }
+}
+
+impl Message<PruneTick> for PruneWorker {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        _msg: PruneTick,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let start = std::time::Instant::now();
+        match self.graph.ask(RedundantRequires { prune: true }).await {
+            Ok(edges) => {
+                debug!(pruned = edges.len(), "graph prune redundant requires");
+                log_scalar(&self.rerun, "metrics/prune_redundant/edges", edges.len() as f64);
+                log_scalar(
+                    &self.rerun,
+                    "metrics/prune_redundant/duration_ms",
+                    start.elapsed().as_secs_f64() * 1000.0,
+                );
+            }
+            Err(err) => {
+                error!(error = ?err, "graph prune redundant requires failed");
+                log_scalar(
+                    &self.rerun,
+                    "metrics/prune_redundant/duration_ms",
+                    start.elapsed().as_secs_f64() * 1000.0,
+                );
+                log_scalar(&self.rerun, "metrics/prune_redundant/edges", 0.0);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Cli {
+    pub rerun_mode:             RerunMode,
+    pub rerun_file:             PathBuf,
+    pub workspace:              PathBuf,
+    pub graph_snapshot_path:    PathBuf,
+    pub graph_autosave_secs:    u64,
+    pub graph_course_commit:    Option<String>,
+    pub graph_strict_quality:   bool,
+    pub graph_prune_requires_s: Option<u64>,
+    pub skip_demo:              bool,
+}
+
+#[derive(Clone)]
+pub struct RuntimeOptions {
+    pub gateway_mode:          GatewayMode,
+    pub min_autosave_secs:     u64,
+    pub trigger_initial_save:  bool,
+    pub trigger_shutdown_save: bool,
+    pub on_started:            Option<AppHook>,
+}
+
+impl Default for RuntimeOptions {
+    fn default() -> Self {
+        Self {
+            gateway_mode:          GatewayMode::Real,
+            min_autosave_secs:     5,
+            trigger_initial_save:  true,
+            trigger_shutdown_save: true,
+            on_started:            None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum GatewayMode {
+    Real,
+    Stub,
+}
+
+#[derive(Clone)]
+pub struct AppHandles {
+    pub graph:     ActorRef<GraphManager>,
+    pub gateway:   ActorRef<LLMGateway>,
+    pub rerun:     Option<ActorRef<RerunSink>>,
+    pub scheduler: ActorRef<Scheduler>,
+}
+
+pub type AppHook = Arc<dyn Fn(AppHandles) -> BoxFuture<'static, Result<()>> + Send + Sync>;
+
+fn git_head_hash() -> Option<String> {
+    Command::new("git")
+        .args(["rev-parse", "--short=12", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|out| {
+            if out.status.success() {
+                Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+            } else {
+                None
+            }
+        })
+}
+
+fn ensure_parent_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create directory {}", parent.display()))?;
+    }
+    Ok(())
+}
+
+pub fn cli() -> OptionParser<Cli> {
+    let workspace = positional::<PathBuf>("workspace")
+        .help("Workspace root to expose to the assistant")
+        .fallback(PathBuf::from(PRETEXT_SUBDIR));
+    let rerun_mode = long("rerun-mode")
+        .help("Rerun sink mode: grpc | file | both | none (default grpc)")
+        .argument::<String>("mode")
+        .parse(|s| match s.as_str() {
+            "grpc" => Ok(RerunMode::Grpc),
+            "file" => Ok(RerunMode::File),
+            "both" => Ok(RerunMode::Both),
+            "none" => Ok(RerunMode::None),
+            other => Err(format!("invalid rerun mode: {other}")),
+        })
+        .fallback(RerunMode::Grpc);
+    let rerun_file = long("rerun-file")
+        .help("Path to write Rerun .rrd when rerun-mode includes file (default weaver.rrd)")
+        .argument::<PathBuf>("path")
+        .fallback(PathBuf::from("weaver.rrd"));
+    let graph_snapshot_path = long("graph-snapshot-path")
+        .help("Path for the legacy JSON graph snapshot (default graph_snapshot.json)")
+        .argument::<PathBuf>("path")
+        .fallback(PathBuf::from("graph_snapshot.json"));
+    let graph_autosave_secs = long("graph-autosave-secs")
+        .help(
+            "Autosave interval in seconds (min 1; clamped to a safe floor at runtime, default 300)",
+        )
+        .argument::<u64>("secs")
+        .fallback(300);
+    let graph_course_commit = long("graph-course-commit")
+        .help(
+            "Course commit hash to embed in snapshots (defaults to snapshot commit when present; \
+             override only when you need to force a new revision)",
+        )
+        .argument::<String>("hash")
+        .optional();
+    let graph_strict_quality = long("graph-strict-quality")
+        .short('q')
+        .help(
+            "Enable strict graph quality checks (reachability, coverage/purity, practice, \
+             discourse) by promoting warnings to errors; recommended for CI",
+        )
+        .switch();
+    let graph_prune_requires_s = long("graph-prune-requires-secs")
+        .help("Optional interval (seconds) to prune redundant requires edges; omit to disable")
+        .argument::<u64>("secs")
+        .optional();
+    let skip_demo = long("skip-demo")
+        .help("Skip the startup FileReader demo (useful for tests or headless runs)")
+        .switch();
+
+    construct! {
+        Cli {
+            rerun_mode,
+            rerun_file,
+            workspace,
+            graph_snapshot_path,
+            graph_autosave_secs,
+            graph_course_commit,
+            graph_strict_quality,
+            graph_prune_requires_s,
+            skip_demo,
+        }
+    }
+    .to_options()
+}
+
+async fn persist_once(
+    graph: &ActorRef<GraphManager>,
+    gateway: &ActorRef<LLMGateway>,
+    rerun: &Option<ActorRef<RerunSink>>,
+    autosave_path: &Path,
+    label: &str,
+) -> Result<()> {
+    let audit_start = std::time::Instant::now();
+    let audit = graph.ask(AuditInvariants).await;
+    log_scalar(
+        rerun,
+        format!("metrics/{label}/audit_ms"),
+        audit_start.elapsed().as_secs_f64() * 1000.0,
+    );
+
+    let persist_start = std::time::Instant::now();
+    let persist_result = graph.ask(PersistSnapshot).await;
+    let save_result = graph
+        .ask(SaveSnapshot {
+            path: autosave_path.to_path_buf(),
+        })
+        .await;
+    let gateway_result = gateway.ask(PersistGatewaySnapshot).await;
+    log_scalar(
+        rerun,
+        format!("metrics/{label}/persist_ms"),
+        persist_start.elapsed().as_secs_f64() * 1000.0,
+    );
+
+    if let Err(err) = audit {
+        warn!(label = label, error = %err, "graph invariant audit failed during persistence");
+        return Err(err.into());
+    }
+    if let Err(err) = persist_result {
+        warn!(label = label, error = %err, "failed to persist graph state");
+        return Err(err.into());
+    }
+    if let Err(err) = save_result {
+        warn!(label = label, error = %err, "failed to write legacy snapshot");
+        return Err(err.into());
+    }
+    if let Err(err) = gateway_result {
+        warn!(label = label, error = %err, "failed to persist gateway state");
+        return Err(err.into());
+    }
+
+    info!(label = label, "persisted graph and gateway state");
+    Ok(())
+}
+
+async fn reconcile_course_commit(
+    graph_actor: &ActorRef<GraphManager>,
+    desired: Option<String>,
+    strict_quality: bool,
+) -> Result<String> {
+    let current_commit = graph_actor
+        .ask(GetCourseCommit)
+        .await
+        .unwrap_or_else(|_| String::new());
+    let target_commit = desired.clone().unwrap_or_else(|| current_commit.clone());
+
+    if let Some(ref cli_commit) = desired
+        && !current_commit.is_empty()
+        && *cli_commit != current_commit
+    {
+        warn!(
+            snapshot_course_commit = %current_commit,
+            cli_course_commit = %cli_commit,
+            "Snapshot course_commit differs; running with CLI override. \
+             Regenerate the snapshot or pass --graph-course-commit={} to align.",
+            current_commit
+        );
+    }
+
+    match graph_actor
+        .ask(ApplyRuntimeConfig {
+            course_commit: target_commit.clone(),
+            strict_quality,
+        })
+        .await
+    {
+        Ok(()) => Ok(target_commit),
+        Err(err) => {
+            if desired.is_some() && target_commit != current_commit {
+                warn!(
+                    error = %err,
+                    course_commit = %target_commit,
+                    fallback_course_commit = %current_commit,
+                    "course_commit override failed validation; falling back to snapshot commit"
+                );
+                graph_actor
+                    .ask(ApplyRuntimeConfig {
+                        course_commit: current_commit.clone(),
+                        strict_quality,
+                    })
+                    .await
+                    .map_err(|e| anyhow!(e))?;
+                Ok(current_commit)
+            } else {
+                Err(err.into())
+            }
+        }
+    }
+}
+
+async fn spawn_gateway(
+    state_url: Url,
+    mode: GatewayMode,
+) -> Result<(ActorRef<LLMGateway>, Arc<GatewayMetrics>)> {
+    match LLMGateway::respawn_persistent(state_url.clone()).await {
+        Ok(actor) => {
+            debug!(path = %state_url, "restored LLM gateway from persistent snapshot");
+            let metrics = actor.ask(GetGatewayMetrics).await.unwrap_or_else(|err| {
+                error!(error = ?err, "failed to fetch gateway metrics after restore");
+                Arc::new(GatewayMetrics::default())
+            });
+            Ok((actor, metrics))
+        }
+        Err(err) => {
+            debug!(error = %err, path = %state_url, "gateway state restore unavailable");
+            match mode {
+                GatewayMode::Real => {
+                    let instance = LLMGateway::from_env()?;
+                    let metrics = instance.metrics();
+                    let actor = LLMGateway::spawn_persistent(state_url.clone(), instance).await?;
+                    Ok((actor, metrics))
+                }
+                GatewayMode::Stub => {
+                    let instance = LLMGateway::from(LLMGatewayState::new(
+                        GatewayMetrics::default().to_state(),
+                    ));
+                    let metrics = instance.metrics();
+                    let actor = LLMGateway::spawn_persistent(state_url.clone(), instance).await?;
+                    Ok((actor, metrics))
+                }
+            }
+        }
+    }
+}
+
+pub async fn run_app(cli: Cli, runtime: RuntimeOptions) -> Result<()> {
+    if cli.graph_autosave_secs == 0 {
+        anyhow::bail!("--graph-autosave-secs must be at least 1 second");
+    }
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    if let Err(err) = tracing_subscriber::fmt()
+        .with_timer(tracing_subscriber::fmt::time::ChronoLocal::new("%Y-%m-%d %H:%M:%S%.3f".into()))
+        .with_env_filter(filter)
+        .try_init()
+    {
+        debug!(error = %err, "tracing subscriber already initialized; continuing");
+    }
+
+    let effective_autosave_secs = cli
+        .graph_autosave_secs
+        .max(runtime.min_autosave_secs.max(1));
+    info!(
+        requested = cli.graph_autosave_secs,
+        effective = effective_autosave_secs,
+        min = runtime.min_autosave_secs,
+        "configured autosave interval"
+    );
+
+    let mut graph_config = GraphConfig {
+        course_commit:  String::new(),
+        autosave_path:  cli.graph_snapshot_path.clone(),
+        autosave_secs:  effective_autosave_secs,
+        strict_quality: cli.graph_strict_quality,
+    };
+
+    let snapshot_path: PathBuf = graph_config.autosave_path.clone();
+    let state_root = if snapshot_path.extension().is_some() {
+        snapshot_path.with_extension("state")
+    } else {
+        snapshot_path.clone()
+    };
+    let graph_state_dir = state_root.join("graph_manager");
+    let gateway_state_dir = state_root.join("llm_gateway");
+    let persisted_graph_index = graph_state_dir.join("index.bin");
+
+    let cwd = std::env::current_dir()?;
+    let graph_state_url = Url::from_directory_path(cwd.join(&graph_state_dir))
+        .map_err(|_| anyhow!("invalid graph state path {}", graph_state_dir.display()))?;
+    let gateway_state_url = Url::from_directory_path(cwd.join(&gateway_state_dir))
+        .map_err(|_| anyhow!("invalid gateway state path {}", gateway_state_dir.display()))?;
+    ensure_parent_dir(&graph_config.autosave_path)?;
+    fs::create_dir_all(&graph_state_dir)
+        .with_context(|| format!("create graph state dir {}", graph_state_dir.display()))?;
+    fs::create_dir_all(&gateway_state_dir)
+        .with_context(|| format!("create gateway state dir {}", gateway_state_dir.display()))?;
+    ensure_parent_dir(&cli.rerun_file)?;
+
+    let git_head = git_head_hash();
+    let desired_course_commit = cli.graph_course_commit.clone();
+
+    let graph_actor = match GraphManager::respawn_persistent(graph_state_url.clone()).await {
+        Ok(actor) => {
+            debug!(path = %graph_state_dir.display(), "restored graph manager from persistent snapshot");
+            actor
+        }
+        Err(err) => {
+            if persisted_graph_index.exists() {
+                error!(
+                    error = %err,
+                    path = %persisted_graph_index.display(),
+                    "persisted graph state exists but failed to restore; exiting to avoid data loss"
+                );
+                std::process::exit(1);
+            }
+            debug!(
+                error = %err,
+                path = %graph_state_dir.display(),
+                "graph state restore unavailable; falling back to legacy snapshot or empty graph"
+            );
+            let state = if snapshot_path.exists() {
+                match persist::load_graph(&snapshot_path).await {
+                    Ok(snapshot) => {
+                        debug!(path = %snapshot_path.display(), "loaded legacy graph snapshot");
+                        graph_config.course_commit = snapshot.course_commit.clone();
+                        GraphManagerState::new(
+                            snapshot.graph,
+                            graph_config.course_commit.clone(),
+                            graph_config.strict_quality,
+                            snapshot.graph_version,
+                        )
+                    }
+                    Err(err) => {
+                        error!(
+                            error = %err,
+                            path = %snapshot_path.display(),
+                            "failed to load graph snapshot; starting with empty graph"
+                        );
+                        let fallback_commit = desired_course_commit
+                            .clone()
+                            .or_else(|| git_head.clone())
+                            .unwrap_or_default();
+                        graph_config.course_commit = fallback_commit.clone();
+                        GraphManagerState::new(
+                            CurriculumGraph::default(),
+                            fallback_commit,
+                            graph_config.strict_quality,
+                            0,
+                        )
+                    }
+                }
+            } else {
+                let fallback_commit = desired_course_commit
+                    .clone()
+                    .or_else(|| git_head.clone())
+                    .unwrap_or_default();
+                graph_config.course_commit = fallback_commit.clone();
+                GraphManagerState::new(
+                    CurriculumGraph::default(),
+                    fallback_commit,
+                    graph_config.strict_quality,
+                    0,
+                )
+            };
+            GraphManager::spawn_persistent(graph_state_url.clone(), state).await?
+        }
+    };
+    if let Err(err) = graph_actor.wait_for_startup_result().await {
+        error!(error = ?err, "graph manager failed during startup");
+        std::process::exit(1);
+    }
+
+    let (gateway, metrics) = spawn_gateway(gateway_state_url.clone(), runtime.gateway_mode).await?;
+
+    let scheduler = Scheduler::spawn(Scheduler::new());
+
+    let mut rerun_targets = Vec::new();
+    if matches!(cli.rerun_mode, RerunMode::Grpc | RerunMode::Both) {
+        rerun_targets.push(RerunTarget::Grpc {
+            name: "weaver".into(),
+        });
+    }
+    if matches!(cli.rerun_mode, RerunMode::File | RerunMode::Both) {
+        rerun_targets.push(RerunTarget::File {
+            name: "weaver".into(),
+            path: cli.rerun_file.clone(),
+        });
+    }
+    let rerun_actor = if rerun_targets.is_empty() {
+        None
+    } else {
+        Some(RerunSink::spawn(rerun_targets))
+    };
+
+    let autosave_worker = AutosaveWorker {
+        graph:         graph_actor.clone(),
+        gateway:       Some(gateway.clone()),
+        rerun:         rerun_actor.clone(),
+        autosave_path: graph_config.autosave_path.clone(),
+    };
+    let autosave_ref = AutosaveWorker::spawn(autosave_worker);
+    let autosave_interval = SetInterval::new(
+        autosave_ref.downgrade(),
+        Duration::from_secs(graph_config.autosave_secs),
+        AutosaveTick,
+    );
+    scheduler
+        .tell(autosave_interval)
+        .await
+        .expect("scheduler actor not running");
+
+    if let Some(prune_secs) = cli.graph_prune_requires_s.filter(|value| *value > 0) {
+        let prune_worker = PruneWorker {
+            graph: graph_actor.clone(),
+            rerun: rerun_actor.clone(),
+        };
+        let prune_ref = PruneWorker::spawn(prune_worker);
+        let prune_interval =
+            SetInterval::new(prune_ref.downgrade(), Duration::from_secs(prune_secs), PruneTick);
+        scheduler
+            .tell(prune_interval)
+            .await
+            .expect("scheduler actor not running");
+    }
+
+    let resolved_commit = reconcile_course_commit(
+        &graph_actor,
+        desired_course_commit.clone(),
+        cli.graph_strict_quality,
+    )
+    .await?;
+    debug!(course_commit = %resolved_commit, "runtime course_commit resolved");
+
+    if let Some(hook) = &runtime.on_started {
+        hook(AppHandles {
+            graph:     graph_actor.clone(),
+            gateway:   gateway.clone(),
+            rerun:     rerun_actor.clone(),
+            scheduler: scheduler.clone(),
+        })
+        .await?;
+    }
+
+    if runtime.trigger_initial_save {
+        persist_once(
+            &graph_actor,
+            &gateway,
+            &rerun_actor,
+            &graph_config.autosave_path,
+            "initial_autosave",
+        )
+        .await?;
+    }
+
+    if !cli.skip_demo {
+        let actor = match FileReader::from_env(
+            cli.workspace.clone(),
+            gateway.clone(),
+            Arc::clone(&metrics),
+            graph_actor.clone(),
+            rerun_actor.clone(),
+        ) {
+            Ok(actor) => actor,
+            Err(err) => {
+                error!(
+                    error = %err,
+                    "Failed to initialize FileReader; set OPENAI_MODEL to enable LLM tools"
+                );
+                return Err(err);
+            }
+        };
+
+        let tool_names = FileReader::tool_identifiers();
+
+        debug!(
+            workspace = %actor.workspace_root().display(),
+            tools = ?tool_names,
+            "Initialized FileReader with LLM tool bridge for the PreTeXt project"
+        );
+
+        let reader = FileReader::spawn(actor);
+
+        let prompt = "Summarize the key goals of the UNCC CS2 PreTeXt project. Highlight any \
+                      modules in the `source/` tree that look important. Please do make effective \
+                      use of the `delegate_tasks` tools for all tasks, in parallel if possible.";
+        debug!(prompt, "Dispatching FileReaderQuery with LLM tool access");
+
+        match reader
+            .ask(FileReaderQuery {
+                prompt: prompt.to_string(),
+            })
+            .await
+        {
+            Ok(content) => {
+                println!("{content}");
+            }
+            Err(err) => {
+                eprintln!("FileReader query failed: {err}");
+            }
+        }
+    } else {
+        info!("FileReader demo skipped by flag");
+    }
+
+    metrics.log_summary();
+
+    if runtime.trigger_shutdown_save {
+        persist_once(
+            &graph_actor,
+            &gateway,
+            &rerun_actor,
+            &graph_config.autosave_path,
+            "shutdown_persist",
+        )
+        .await?;
+    }
+
+    Ok(())
+}

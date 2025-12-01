@@ -40,12 +40,17 @@ const MASKED_PATH: &str = "<path-unavailable>";
 #[derive(Debug)]
 pub enum ToolExecutionError {
     Input(ToolInputError),
+    Execution(anyhow::Error),
     Internal(anyhow::Error),
 }
 
 impl ToolExecutionError {
     pub fn user(err: ToolInputError) -> Self {
         Self::Input(err)
+    }
+
+    pub fn execution(err: impl Into<anyhow::Error>) -> Self {
+        Self::Execution(err.into())
     }
 
     pub fn system(err: anyhow::Error) -> Self {

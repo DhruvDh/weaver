@@ -423,24 +423,7 @@ pub fn borrow_ahead(g: &CurriculumGraph, episode: &str) -> Vec<BorrowAhead> {
         }
     }
 
-    // helper: is there an introduce step reachable before `use_step`?
-    let precedes_reaches = |start: NodeId, goal: NodeId, adj: &HashMap<NodeId, Vec<NodeId>>| {
-        let mut seen = HashSet::new();
-        let mut queue = VecDeque::new();
-        queue.push_back(start);
-        while let Some(s) = queue.pop_front() {
-            if s == goal {
-                return true;
-            }
-            if !seen.insert(s) {
-                continue;
-            }
-            if let Some(neigh) = adj.get(&s) {
-                queue.extend(neigh.iter().copied());
-            }
-        }
-        false
-    };
+    let reachability = precedes_reachability(&steps_in_episode, &precedes_adj);
 
     let mut results = Vec::new();
     for &step in &steps_in_episode {
@@ -466,7 +449,11 @@ pub fn borrow_ahead(g: &CurriculumGraph, episode: &str) -> Vec<BorrowAhead> {
 
                 let mut has_prior_intro = false;
                 for intro in &intro_steps_in_episode {
-                    if precedes_reaches(*intro, step, &precedes_adj) {
+                    if reachability
+                        .get(intro)
+                        .map(|set| set.contains(&step))
+                        .unwrap_or(false)
+                    {
                         has_prior_intro = true;
                         break;
                     }
@@ -504,6 +491,40 @@ pub fn borrow_ahead(g: &CurriculumGraph, episode: &str) -> Vec<BorrowAhead> {
     }
 
     results
+}
+
+fn precedes_reachability(
+    steps: &[NodeId],
+    adj: &HashMap<NodeId, Vec<NodeId>>,
+) -> HashMap<NodeId, HashSet<NodeId>> {
+    let mut reach: HashMap<NodeId, HashSet<NodeId>> = HashMap::new();
+
+    for &start in steps {
+        let mut seen = HashSet::new();
+        let mut queue: VecDeque<NodeId> = VecDeque::new();
+
+        if let Some(children) = adj.get(&start) {
+            for &child in children {
+                if seen.insert(child) {
+                    queue.push_back(child);
+                }
+            }
+        }
+
+        while let Some(node) = queue.pop_front() {
+            if let Some(children) = adj.get(&node) {
+                for &child in children {
+                    if seen.insert(child) {
+                        queue.push_back(child);
+                    }
+                }
+            }
+        }
+
+        reach.insert(start, seen);
+    }
+
+    reach
 }
 
 /// Procedural practice: each procedural node should reach an assessment that

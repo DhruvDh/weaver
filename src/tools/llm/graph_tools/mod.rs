@@ -2,6 +2,7 @@
 pub mod algorithms;
 pub mod analysis;
 pub mod analysis_cache;
+pub mod cache_admin;
 pub mod commands;
 pub mod common;
 pub mod inspection;
@@ -40,7 +41,7 @@ const CURATED_TOOL_IDS: &[&str] = &[
     "graph_assessment_gaps",
     "graph_borrow_ahead",
     "graph_discourse_orphans",
-    "graph_requires_cycles",
+    "graph_analysis_cache_clear",
 ];
 
 pub fn graph_tool_prototypes() -> Vec<ToolPrototype> {
@@ -50,6 +51,7 @@ pub fn graph_tool_prototypes() -> Vec<ToolPrototype> {
     v.extend(analysis::tool_prototypes());
     v.extend(persist::tool_prototypes());
     v.extend(algorithms::tool_prototypes());
+    v.extend(cache_admin::tool_prototypes());
     v.extend(redundant_requires::tool_prototypes());
     let allowed: HashSet<&str> = CURATED_TOOL_IDS.iter().copied().collect();
     v.retain(|meta| allowed.contains(meta.id));

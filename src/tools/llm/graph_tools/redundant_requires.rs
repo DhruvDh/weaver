@@ -1,16 +1,17 @@
 use async_trait::async_trait;
 use bon::Builder;
+use kameo::prelude::ActorRef;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::info;
 
-use super::common::map_send_err;
+use super::common::{attach_meta, graph_meta, map_send_err, parse_args_with_builder};
 use crate::{
     graph::manager::RedundantRequires,
     tools::llm::{
-        CallState, ToolExecutionError, ToolInputError, ToolInputResult, ToolInstance,
-        ToolPrototype, schema_for_args,
+        CallState, ToolExecutionError, ToolInputResult, ToolInstance, ToolPrototype,
+        schema_for_args,
     },
 };
 
@@ -28,6 +29,13 @@ pub struct RedundantRequiresArgs {
     #[serde(default)]
     #[schemars(description = "Offset into the result set (default 0).")]
     pub offset: Option<usize>,
+    #[serde(default)]
+    #[builder(default = false)]
+    #[schemars(
+        description = "Set apply=true to actually prune when prune=true; default false previews \
+                       the list only."
+    )]
+    pub apply:  bool,
 }
 
 pub(super) fn tool_prototypes() -> Vec<ToolPrototype> {
@@ -44,30 +52,26 @@ fn parse_redundant_requires(
     raw: Value,
     state: &CallState,
 ) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let args: RedundantRequiresArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    REDUNDANT_REQUIRES,
-            message: err.to_string(),
-        })?;
+    let args =
+        parse_args_with_builder(REDUNDANT_REQUIRES, raw, |args: RedundantRequiresArgs| Ok(args))?;
     Ok(Box::new(RedundantRequiresTool {
         args,
-        state: state.clone(),
+        graph: state.graph.clone(),
     }))
 }
 
 struct RedundantRequiresTool {
     args:  RedundantRequiresArgs,
-    state: CallState,
+    graph: ActorRef<crate::graph::manager::GraphManager>,
 }
 
 #[async_trait]
 impl ToolInstance for RedundantRequiresTool {
     async fn execute(&self) -> Result<crate::tools::llm::ToolOutput, ToolExecutionError> {
         let edges: Vec<(String, String)> = self
-            .state
             .graph
             .ask(RedundantRequires {
-                prune: self.args.prune,
+                prune: self.args.prune && self.args.apply,
             })
             .await
             .map_err(|e| map_send_err(e, REDUNDANT_REQUIRES))?;
@@ -81,6 +85,25 @@ impl ToolInstance for RedundantRequiresTool {
             .map(|(u, v)| json!({"from": u, "to": v}))
             .collect::<Vec<_>>();
 
+        let meta = graph_meta(&self.graph).await?;
+        if self.args.prune && !self.args.apply {
+            let preview = attach_meta(
+                json!({
+                    "type": "graph_view",
+                    "tool": REDUNDANT_REQUIRES,
+                    "status": "preview",
+                    "pruned": false,
+                    "apply_hint": "Set apply=true to prune redundant requires edges.",
+                    "total": edges.len(),
+                    "offset": offset,
+                    "limit": limit,
+                    "edges": slice,
+                }),
+                &meta,
+            );
+            return Ok(crate::tools::llm::ToolOutput::new(preview));
+        }
+
         info!(
             tool = REDUNDANT_REQUIRES,
             prune = self.args.prune,
@@ -90,14 +113,19 @@ impl ToolInstance for RedundantRequiresTool {
             "graph redundant requires"
         );
 
-        Ok(crate::tools::llm::ToolOutput::new(json!({
-            "type": "graph_view",
-            "tool": REDUNDANT_REQUIRES,
-            "pruned": self.args.prune,
-            "total": edges.len(),
-            "offset": offset,
-            "limit": limit,
-            "edges": slice,
-        })))
+        let payload = attach_meta(
+            json!({
+                "type": "graph_view",
+                "tool": REDUNDANT_REQUIRES,
+                "pruned": self.args.prune && self.args.apply,
+                "total": edges.len(),
+                "offset": offset,
+                "limit": limit,
+                "edges": slice,
+            }),
+            &meta,
+        );
+
+        Ok(crate::tools::llm::ToolOutput::new(payload))
     }
 }

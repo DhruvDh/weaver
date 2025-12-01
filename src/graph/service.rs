@@ -2,15 +2,18 @@ use std::{
     collections::{HashMap, HashSet},
     hash::{Hash, Hasher},
     sync::{Arc, RwLock},
+    time::{Duration, Instant},
 };
 
 use petgraph::{Direction, visit::EdgeRef};
+use tokio::{task, time::timeout};
 use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
     analysis,
     graph::{
+        InvariantCode,
         model::*,
         specs::{AnchorsSpec, AssessesSpec, EdgeSpec, PrecedesSpec, RequiresSpec, SupportsSpec},
         traversal,
@@ -26,10 +29,28 @@ enum ValidationSeverity {
 
 #[derive(Clone, Debug)]
 struct ValidationIssue {
-    _rule:             &'static str,
+    code:              crate::graph::InvariantCode,
     severity:          ValidationSeverity,
     message:           String,
     promote_in_strict: bool,
+}
+
+#[derive(Clone, Debug)]
+enum ValidationScope {
+    Full,
+    Targeted {
+        coverage_los:      Vec<NodeId>,
+        skip_requires_dag: bool,
+        skip_fadeability:  bool,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct ValidationContext {
+    strict:                bool,
+    expected_revision:     Option<String>,
+    rubric_prev:           HashMap<String, u64>,
+    include_rubric_update: bool,
 }
 
 /// Core graph owner with slug lookup and optional strict quality mode.
@@ -173,7 +194,17 @@ impl GraphService {
         };
         let id = self.graph_mut().add_node(node);
         self.upsert_slug(slug.clone(), id);
-        self.validate_global_invariants_or_rollback_node(id, &slug)?;
+        let coverage_los = match &self.graph()[id].kind {
+            NodeKind::Knowledge(k) if k.knowledge_type == KnowledgeType::LearningOutcome => {
+                vec![id]
+            }
+            _ => Vec::new(),
+        };
+        if let Err(err) = self.validate_targeted_invariants(coverage_los, true, true) {
+            self.graph_mut().remove_node(id);
+            self.slug_to_node.remove(&slug);
+            return Err(err);
+        }
         self.refresh_rubric_hashes();
         self.bump_version();
         Ok(id)
@@ -220,7 +251,34 @@ impl GraphService {
         }
 
         self.graph_mut()[id].tags = tags;
-        if let Err(err) = self.validate_global_invariants() {
+        let mut coverage_los = Vec::new();
+        if let NodeKind::Knowledge(k) = &old_kind
+            && k.knowledge_type == KnowledgeType::LearningOutcome
+        {
+            coverage_los.push(id);
+        }
+        if let NodeKind::Knowledge(k) = &old_kind
+            && k.knowledge_type.is_assessment_item()
+        {
+            coverage_los.extend(self.los_assessed_by(id));
+        }
+        if let NodeKind::Knowledge(k) = &self.graph()[id].kind
+            && k.knowledge_type == KnowledgeType::LearningOutcome
+        {
+            coverage_los.push(id);
+        }
+        if let NodeKind::Knowledge(k) = &self.graph()[id].kind
+            && k.knowledge_type.is_assessment_item()
+        {
+            coverage_los.extend(self.los_assessed_by(id));
+        }
+        let coverage_los: Vec<NodeId> = coverage_los
+            .into_iter()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        if let Err(err) = self.validate_targeted_invariants(coverage_los, true, true) {
             // rollback
             self.graph_mut()[id].kind = old_kind;
             self.graph_mut()[id].tags = old_tags;
@@ -427,7 +485,11 @@ impl GraphService {
         };
         let id = self.graph_mut().add_node(node);
         self.upsert_slug(slug.clone(), id);
-        self.validate_global_invariants_or_rollback_node(id, &slug)?;
+        if let Err(err) = self.validate_targeted_invariants(Vec::new(), true, true) {
+            self.graph_mut().remove_node(id);
+            self.slug_to_node.remove(&slug);
+            return Err(err);
+        }
         self.refresh_rubric_hashes();
         self.bump_version();
         Ok(id)
@@ -467,7 +529,7 @@ impl GraphService {
             return Err(err);
         }
         self.graph_mut()[id].tags = tags;
-        if let Err(err) = self.validate_global_invariants() {
+        if let Err(err) = self.validate_targeted_invariants(Vec::new(), true, true) {
             self.graph_mut()[id].kind = old_kind;
             self.graph_mut()[id].tags = old_tags;
             return Err(err);
@@ -506,7 +568,25 @@ impl GraphService {
         let payload = S::make_payload(attrs, confidence);
         let edge_id = self.graph_mut().add_edge(from, to, payload);
 
-        if let Err(err) = self.validate_global_invariants() {
+        let coverage_los = match S::NAME {
+            "assesses" => vec![to],
+            "requires" => self.impacted_los_from_requires(from),
+            _ => Vec::new(),
+        };
+
+        let (skip_requires_dag, skip_fadeability) = match S::NAME {
+            // Requires edges can introduce cycles and affect fadeability via prerequisite
+            // structure.
+            "requires" => (false, false),
+            // Supports edges can affect fadeability but not the requires DAG.
+            "supports" => (true, false),
+            // Other edges do not impact requires/fadeability invariants.
+            _ => (true, true),
+        };
+
+        if let Err(err) =
+            self.validate_targeted_invariants(coverage_los, skip_requires_dag, skip_fadeability)
+        {
             // rollback
             self.graph_mut().remove_edge(edge_id);
             return Err(err);
@@ -629,92 +709,247 @@ impl GraphService {
 
     /// Run global audits and return violations as errors.
     pub fn validate_global_invariants(&self) -> Result<(), GraphError> {
-        let g = self.graph();
-        let slug_index: HashMap<String, NodeId> =
-            g.node_indices().map(|n| (g[n].slug.clone(), n)).collect();
-        let has_teaching_steps = g
-            .node_indices()
-            .any(|n| matches!(&g[n].kind, NodeKind::TeachingStep(_)));
-        let first_principles = analysis::first_principles(g);
-        let lo_nodes: Vec<NodeId> = g
-            .node_indices()
-            .filter(|&n| matches!(&g[n].kind, NodeKind::Knowledge(k) if k.knowledge_type == KnowledgeType::LearningOutcome))
-            .collect();
-        let rubric_prev = self
-            .rubric_hashes
-            .read()
-            .expect("rubric_hashes lock")
-            .clone();
-        let rubric_current = compute_rubric_hashes(g);
+        self.validate_invariants(ValidationScope::Full)
+    }
 
-        let mut issues = Vec::new();
-        issues.extend(check_statements(g));
-        issues.extend(check_provenance(g, self.expected_revision()));
-        issues.extend(check_requires_and_fadeability(g));
+    /// Run global audits on a snapshot in a blocking task with a timeout. This
+    /// keeps the actor mailbox responsive during heavy analyses.
+    pub async fn validate_global_invariants_off_thread(
+        &self,
+        timeout_ms: Duration,
+    ) -> Result<(), GraphError> {
+        let graph = self.graph.clone();
+        let ctx = ValidationContext {
+            strict:                self.strict_quality,
+            expected_revision:     self.expected_revision.clone(),
+            rubric_prev:           self
+                .rubric_hashes
+                .read()
+                .expect("rubric_hashes lock")
+                .clone(),
+            include_rubric_update: true,
+        };
+        let scope = ValidationScope::Full;
+        let handle = task::spawn_blocking(move || run_invariants_for_graph(&graph, scope, &ctx));
+        let rubric_current = timeout(timeout_ms, handle)
+            .await
+            .map_err(|_| GraphError::Schema("graph invariant validation timed out".to_string()))?
+            .map_err(|join_err| {
+                GraphError::Schema(format!("graph invariant validation task failed: {join_err}"))
+            })??;
+        if let Some(rubric) = rubric_current {
+            *self.rubric_hashes.write().expect("rubric_hashes lock") = rubric;
+        }
+        Ok(())
+    }
+
+    fn validate_invariants(&self, scope: ValidationScope) -> Result<(), GraphError> {
+        let ctx = ValidationContext {
+            strict:                self.strict_quality,
+            expected_revision:     self.expected_revision.clone(),
+            rubric_prev:           self
+                .rubric_hashes
+                .read()
+                .expect("rubric_hashes lock")
+                .clone(),
+            include_rubric_update: true,
+        };
+        let result = run_invariants_for_graph(self.graph(), scope, &ctx)?;
+        if let Some(rubric) = result {
+            *self.rubric_hashes.write().expect("rubric_hashes lock") = rubric;
+        }
+        Ok(())
+    }
+
+    fn validate_targeted_invariants(
+        &self,
+        coverage_los: Vec<NodeId>,
+        skip_requires_dag: bool,
+        skip_fadeability: bool,
+    ) -> Result<(), GraphError> {
+        self.validate_invariants(ValidationScope::Targeted {
+            coverage_los,
+            skip_requires_dag,
+            skip_fadeability,
+        })
+    }
+
+    fn los_assessed_by(&self, assessment: NodeId) -> Vec<NodeId> {
+        let mut los = Vec::new();
+        for edge in self
+            .graph()
+            .edges_directed(assessment, Direction::Outgoing)
+            .filter(|e| matches!(&e.weight().kind, EdgeKind::Assesses(_)))
+        {
+            if let EdgeKind::Assesses(attrs) = &edge.weight().kind
+                && attrs.evidence_link.scope == AssessmentScope::Target
+            {
+                los.push(edge.target());
+            }
+        }
+        los
+    }
+
+    fn impacted_los_from_requires(&self, start: NodeId) -> Vec<NodeId> {
+        let mut stack = vec![start];
+        let mut seen = HashSet::new();
+        let mut assessments = HashSet::new();
+
+        while let Some(node) = stack.pop() {
+            for edge in self
+                .graph()
+                .edges_directed(node, Direction::Outgoing)
+                .filter(|e| matches!(&e.weight().kind, EdgeKind::Requires(_)))
+            {
+                let next = edge.target();
+                if seen.insert(next) {
+                    stack.push(next);
+                }
+            }
+            if let NodeKind::Knowledge(k) = &self.graph()[node].kind
+                && k.knowledge_type.is_assessment_item()
+            {
+                assessments.insert(node);
+            }
+        }
+
+        let mut los: HashSet<NodeId> = HashSet::new();
+        for assessment in assessments {
+            for lo in self.los_assessed_by(assessment) {
+                los.insert(lo);
+            }
+        }
+        los.into_iter().collect()
+    }
+}
+
+fn run_invariants_for_graph(
+    g: &CurriculumGraph,
+    scope: ValidationScope,
+    ctx: &ValidationContext,
+) -> Result<Option<HashMap<String, u64>>, GraphError> {
+    let start = Instant::now();
+    let slug_index: HashMap<String, NodeId> =
+        g.node_indices().map(|n| (g[n].slug.clone(), n)).collect();
+    let has_teaching_steps = g
+        .node_indices()
+        .any(|n| matches!(&g[n].kind, NodeKind::TeachingStep(_)));
+
+    let (coverage_los, include_requires_dag, include_fadeability) = match &scope {
+        ValidationScope::Full => (
+            g.node_indices()
+                .filter(|&n| {
+                    matches!(
+                        &g[n].kind,
+                        NodeKind::Knowledge(k) if k.knowledge_type == KnowledgeType::LearningOutcome
+                    )
+                })
+                .collect(),
+            true,
+            true,
+        ),
+        ValidationScope::Targeted {
+            coverage_los,
+            skip_requires_dag,
+            skip_fadeability,
+        } => (coverage_los.clone(), !skip_requires_dag, !skip_fadeability),
+    };
+
+    let needs_coverage = !coverage_los.is_empty();
+
+    let rubric_current = compute_rubric_hashes(g);
+    let (first_principles, rubric_prev) =
+        if needs_coverage || matches!(scope, ValidationScope::Full) {
+            (analysis::first_principles(g), ctx.rubric_prev.clone())
+        } else {
+            (Vec::new(), HashMap::new())
+        };
+
+    let mut issues = Vec::new();
+    issues.extend(check_statements(g));
+    issues.extend(check_provenance(g, ctx.expected_revision.as_deref()));
+    if include_requires_dag || include_fadeability {
+        issues.extend(check_requires_and_fadeability(g, include_requires_dag, include_fadeability));
+    }
+    if needs_coverage {
         issues.extend(check_reachability_and_coverage(
             g,
             &first_principles,
-            &lo_nodes,
+            &coverage_los,
             &rubric_prev,
             &rubric_current,
         ));
-        issues.extend(check_supports_and_practice(g));
-        issues.extend(check_purity(g, &slug_index));
-        if has_teaching_steps {
-            issues.extend(check_discourse(g));
-            issues.extend(check_introductions(g));
-        }
+    }
+    issues.extend(check_supports_and_practice(g));
+    issues.extend(check_purity(g, &slug_index));
+    if has_teaching_steps {
+        issues.extend(check_discourse(g));
+        issues.extend(check_introductions(g));
+    }
 
-        let mut errors = Vec::new();
-        let mut warnings = Vec::new();
-        for mut issue in issues {
-            if self.strict_quality && issue.promote_in_strict {
-                issue.severity = ValidationSeverity::Error;
-            }
-            match issue.severity {
-                ValidationSeverity::Error => errors.push(issue.message),
-                ValidationSeverity::Warning => warnings.push(issue.message),
-            }
+    let mut errors: Vec<crate::graph::InvariantViolation> = Vec::new();
+    let mut warnings: Vec<crate::graph::InvariantViolation> = Vec::new();
+    for mut issue in issues {
+        if ctx.strict && issue.promote_in_strict {
+            issue.severity = ValidationSeverity::Error;
         }
-
-        if self.strict_quality {
-            errors.extend(warnings);
-        } else {
-            for w in warnings {
-                warn!(target: "weaver.graph.invariants", "{w}");
-            }
-        }
-
-        if errors.is_empty() {
-            *self.rubric_hashes.write().expect("rubric_hashes lock") = rubric_current;
-            Ok(())
-        } else {
-            Err(GraphError::InvariantViolation { violations: errors })
+        match issue.severity {
+            ValidationSeverity::Error => errors.push(crate::graph::InvariantViolation {
+                code:    issue.code,
+                message: issue.message,
+            }),
+            ValidationSeverity::Warning => warnings.push(crate::graph::InvariantViolation {
+                code:    issue.code,
+                message: issue.message,
+            }),
         }
     }
 
-    fn validate_global_invariants_or_rollback_node(
-        &mut self,
-        id: NodeId,
-        slug: &str,
-    ) -> Result<(), GraphError> {
-        if let Err(err) = self.validate_global_invariants() {
-            self.graph_mut().remove_node(id);
-            self.slug_to_node.remove(slug);
-            return Err(err);
+    if ctx.strict {
+        errors.extend(warnings);
+    } else {
+        for w in warnings {
+            warn!(
+                target: "weaver.graph.invariants",
+                code = %w.code.as_str(),
+                "{message}",
+                message = w.message
+            );
         }
-        Ok(())
+    }
+
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    tracing::debug!(
+        target: "weaver.graph.validation",
+        scope = %match scope {
+            ValidationScope::Full => "full",
+            ValidationScope::Targeted { .. } => "targeted",
+        },
+        coverage_los = coverage_los.len(),
+        include_requires_dag,
+        include_fadeability,
+        elapsed_ms
+    );
+
+    if errors.is_empty() {
+        if ctx.include_rubric_update {
+            Ok(Some(rubric_current))
+        } else {
+            Ok(None)
+        }
+    } else {
+        Err(GraphError::InvariantViolation { violations: errors })
     }
 }
 
 fn make_issue(
-    rule: &'static str,
+    code: crate::graph::InvariantCode,
     severity: ValidationSeverity,
     promote_in_strict: bool,
     message: String,
 ) -> ValidationIssue {
     ValidationIssue {
-        _rule: rule,
+        code,
         severity,
         message,
         promote_in_strict,
@@ -725,13 +960,13 @@ fn check_statements(g: &CurriculumGraph) -> Vec<ValidationIssue> {
     g.node_indices()
         .filter_map(|n| match &g[n].kind {
             NodeKind::Knowledge(k) if k.statement.trim().is_empty() => Some(make_issue(
-                "statement_nonempty",
+                InvariantCode::StatementEmpty,
                 ValidationSeverity::Error,
                 true,
                 format!("knowledge `{}` has empty statement", g[n].slug),
             )),
             NodeKind::TeachingStep(ts) if ts.statement.trim().is_empty() => Some(make_issue(
-                "statement_nonempty",
+                InvariantCode::StatementEmpty,
                 ValidationSeverity::Error,
                 true,
                 format!("teaching_step `{}` has empty statement", g[n].slug),
@@ -752,7 +987,7 @@ fn check_provenance(g: &CurriculumGraph, expected_revision: Option<&str>) -> Vec
                 for span in &k.source_refs {
                     if span.revision != expected {
                         out.push(make_issue(
-                            "provenance_revision",
+                            InvariantCode::ProvenanceRevision,
                             ValidationSeverity::Error,
                             true,
                             format!(
@@ -768,7 +1003,7 @@ fn check_provenance(g: &CurriculumGraph, expected_revision: Option<&str>) -> Vec
                 for span in &ts.source_refs {
                     if span.revision != expected {
                         out.push(make_issue(
-                            "provenance_revision",
+                            InvariantCode::ProvenanceRevision,
                             ValidationSeverity::Error,
                             true,
                             format!(
@@ -790,7 +1025,7 @@ fn check_provenance(g: &CurriculumGraph, expected_revision: Option<&str>) -> Vec
                     for span in &attrs.evidence_refs {
                         if span.revision != expected {
                             out.push(make_issue(
-                                "provenance_revision",
+                                InvariantCode::ProvenanceRevision,
                                 ValidationSeverity::Error,
                                 true,
                                 format!(
@@ -806,7 +1041,7 @@ fn check_provenance(g: &CurriculumGraph, expected_revision: Option<&str>) -> Vec
                     for span in &attrs.evidence_refs {
                         if span.revision != expected {
                             out.push(make_issue(
-                                "provenance_revision",
+                                InvariantCode::ProvenanceRevision,
                                 ValidationSeverity::Error,
                                 true,
                                 format!(
@@ -825,34 +1060,41 @@ fn check_provenance(g: &CurriculumGraph, expected_revision: Option<&str>) -> Vec
     out
 }
 
-fn check_requires_and_fadeability(g: &CurriculumGraph) -> Vec<ValidationIssue> {
+fn check_requires_and_fadeability(
+    g: &CurriculumGraph,
+    include_dag: bool,
+    include_fadeability: bool,
+) -> Vec<ValidationIssue> {
     let mut out = Vec::new();
-    if !analysis::requires_is_dag(g) {
+    if include_dag && !analysis::requires_is_dag(g) {
         out.push(make_issue(
-            "requires_dag",
+            InvariantCode::RequiresDag,
             ValidationSeverity::Error,
             true,
             "requires layer must remain acyclic".to_string(),
         ));
     }
-    for issue in analysis::fadeability_issues(g) {
-        let assessment_slug = g[issue.assessment].slug.clone();
-        let edges: Vec<String> = issue
-            .support_edges
-            .iter()
-            .filter_map(|e| g.edge_endpoints(*e))
-            .map(|(u, v)| format!("{} -> {}", g[u].slug, g[v].slug))
-            .collect();
-        out.push(make_issue(
-            "fadeability",
-            ValidationSeverity::Error,
-            true,
-            format!(
-                "assessment `{}` reachable only via supports that carry prerequisite load: [{}]",
-                assessment_slug,
-                edges.join("; ")
-            ),
-        ));
+    if include_fadeability {
+        for issue in analysis::fadeability_issues(g) {
+            let assessment_slug = g[issue.assessment].slug.clone();
+            let edges: Vec<String> = issue
+                .support_edges
+                .iter()
+                .filter_map(|e| g.edge_endpoints(*e))
+                .map(|(u, v)| format!("{} -> {}", g[u].slug, g[v].slug))
+                .collect();
+            out.push(make_issue(
+                InvariantCode::Fadeability,
+                ValidationSeverity::Error,
+                true,
+                format!(
+                    "assessment `{}` reachable only via supports that carry prerequisite load: \
+                     [{}]",
+                    assessment_slug,
+                    edges.join("; ")
+                ),
+            ));
+        }
     }
     out
 }
@@ -869,7 +1111,7 @@ fn check_reachability_and_coverage(
         let report = analysis::lo_reachability(g, lo_id, first_principles);
         if report.assessments.is_empty() {
             out.push(make_issue(
-                "lo_target_assessment",
+                InvariantCode::LoTargetAssessment,
                 ValidationSeverity::Warning,
                 true,
                 format!(
@@ -889,7 +1131,7 @@ fn check_reachability_and_coverage(
                 .collect::<Vec<_>>()
                 .join(", ");
             out.push(make_issue(
-                "lo_reachability",
+                InvariantCode::LoReachability,
                 ValidationSeverity::Warning,
                 true,
                 format!(
@@ -903,7 +1145,7 @@ fn check_reachability_and_coverage(
         let report = analysis::coverage_report(g, lo_id);
         if !report.missing_criteria.is_empty() {
             out.push(make_issue(
-                "rubric_coverage",
+                InvariantCode::RubricCoverage,
                 ValidationSeverity::Warning,
                 true,
                 format!(
@@ -915,7 +1157,7 @@ fn check_reachability_and_coverage(
         }
         if !report.unused_observation_features.is_empty() {
             out.push(make_issue(
-                "rubric_unused_observation_features",
+                InvariantCode::RubricUnusedObservationFeatures,
                 ValidationSeverity::Warning,
                 true,
                 format!(
@@ -930,7 +1172,7 @@ fn check_reachability_and_coverage(
             && cur != prev
         {
             out.push(make_issue(
-                "rubric_drift",
+                InvariantCode::RubricDrift,
                 ValidationSeverity::Warning,
                 true,
                 format!(
@@ -947,7 +1189,7 @@ fn check_supports_and_practice(g: &CurriculumGraph) -> Vec<ValidationIssue> {
     let mut out = Vec::new();
     for gap in analysis::example_gaps(g) {
         out.push(make_issue(
-            "example_minimums",
+            InvariantCode::ExampleMinimums,
             ValidationSeverity::Warning,
             true,
             format!("{}: {}", g[gap.node].slug, gap.description),
@@ -955,7 +1197,7 @@ fn check_supports_and_practice(g: &CurriculumGraph) -> Vec<ValidationIssue> {
     }
     for gap in analysis::procedural_practice_gaps(g) {
         out.push(make_issue(
-            "procedural_practice",
+            InvariantCode::ProceduralPractice,
             ValidationSeverity::Warning,
             true,
             format!(
@@ -977,7 +1219,7 @@ fn check_purity(g: &CurriculumGraph, slug_index: &HashMap<String, NodeId>) -> Ve
             let intended = analysis::intended_knowledge_from_anchors(g, lo);
             if intended.is_empty() {
                 out.push(make_issue(
-                    "purity_intended_missing",
+                    InvariantCode::PurityIntendedMissing,
                     ValidationSeverity::Warning,
                     true,
                     format!(
@@ -1002,7 +1244,7 @@ fn check_purity(g: &CurriculumGraph, slug_index: &HashMap<String, NodeId>) -> Ve
             if !extraneous.is_empty() {
                 let slugs: Vec<String> = extraneous.iter().map(|n| g[*n].slug.clone()).collect();
                 out.push(make_issue(
-                    "purity_extraneous",
+                    InvariantCode::PurityExtraneous,
                     ValidationSeverity::Error,
                     true,
                     format!(
@@ -1044,7 +1286,7 @@ fn check_discourse(g: &CurriculumGraph) -> Vec<ValidationIssue> {
             match result.severity {
                 analysis::BorrowSeverity::CrossEpisode | analysis::BorrowSeverity::NoIntro => {
                     out.push(make_issue(
-                        "borrow_ahead",
+                        InvariantCode::BorrowAhead,
                         ValidationSeverity::Error,
                         true,
                         format!(
@@ -1055,7 +1297,7 @@ fn check_discourse(g: &CurriculumGraph) -> Vec<ValidationIssue> {
                     ));
                 }
                 analysis::BorrowSeverity::InEpisode => out.push(make_issue(
-                    "borrow_ahead",
+                    InvariantCode::BorrowAhead,
                     ValidationSeverity::Warning,
                     true,
                     format!(
@@ -1071,7 +1313,7 @@ fn check_discourse(g: &CurriculumGraph) -> Vec<ValidationIssue> {
 
     for orphan in analysis::discourse_orphans(g, None) {
         out.push(make_issue(
-            "discourse_orphan",
+            InvariantCode::DiscourseOrphan,
             ValidationSeverity::Warning,
             true,
             format!(
@@ -1092,8 +1334,20 @@ fn check_discourse(g: &CurriculumGraph) -> Vec<ValidationIssue> {
                 .map(|r| !r.trim().is_empty())
                 .unwrap_or(false);
             if !has_anchor && !has_rationale {
+                if matches!(ts.purpose, TeachingPurpose::Use) {
+                    out.push(make_issue(
+                        InvariantCode::BorrowAhead,
+                        ValidationSeverity::Warning,
+                        true,
+                        format!(
+                            "teaching_step `{}` has purpose=use but no anchors; cannot verify \
+                             introduction order",
+                            g[n].slug
+                        ),
+                    ));
+                }
                 out.push(make_issue(
-                    "teaching_step_anchor_or_rationale",
+                    InvariantCode::TeachingStepAnchorOrRationale,
                     ValidationSeverity::Warning,
                     true,
                     format!(
@@ -1129,7 +1383,7 @@ fn check_introductions(g: &CurriculumGraph) -> Vec<ValidationIssue> {
             });
             if !has_intro {
                 out.push(make_issue(
-                    "introduce_anchor",
+                    InvariantCode::IntroduceAnchor,
                     ValidationSeverity::Warning,
                     true,
                     format!(

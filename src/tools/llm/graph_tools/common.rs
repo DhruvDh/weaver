@@ -1,9 +1,12 @@
 use anyhow::anyhow;
 use async_trait::async_trait;
-use kameo::{error::SendError, prelude::ActorRef};
+use kameo::{
+    error::{Infallible, SendError},
+    prelude::ActorRef,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::{
     graph::{CurriculumGraph, GraphError, NodeId, NodeKind},
@@ -38,9 +41,14 @@ pub(crate) fn map_graph_err(err: GraphError, tool: &'static str) -> ToolExecutio
             })
         }
         GraphError::InvariantViolation { violations } => {
+            let joined = violations
+                .iter()
+                .map(|v| format!("{}: {}", v.code.as_str(), v.message))
+                .collect::<Vec<_>>()
+                .join("; ");
             ToolExecutionError::Input(ToolInputError::InvalidPayload {
                 tool,
-                message: format!("graph invariants violated: {}", violations.join("; ")),
+                message: format!("graph invariants violated: {joined}"),
             })
         }
     }
@@ -56,9 +64,7 @@ pub(crate) fn map_send_err<M>(
     }
 }
 
-pub(crate) fn map_send_err_inf<M>(
-    err: SendError<M, std::convert::Infallible>,
-) -> ToolExecutionError {
+pub(crate) fn map_send_err_inf<M>(err: SendError<M, Infallible>) -> ToolExecutionError {
     ToolExecutionError::Internal(anyhow!("{:?}", err))
 }
 
@@ -103,6 +109,7 @@ where
     build:   fn(&Args) -> Msg,
     map_ok:  fn(&Args, <MsgReply<Msg> as kameo::Reply>::Ok) -> Value,
     map_err: fn(SendError<Msg, <MsgReply<Msg> as kameo::Reply>::Error>) -> ToolExecutionError,
+    tool:    &'static str,
 }
 
 impl<Args, Msg> GraphCommandTool<Args, Msg>
@@ -116,6 +123,7 @@ where
         build: fn(&Args) -> Msg,
         map_ok: fn(&Args, <MsgReply<Msg> as kameo::Reply>::Ok) -> Value,
         map_err: fn(SendError<Msg, <MsgReply<Msg> as kameo::Reply>::Error>) -> ToolExecutionError,
+        tool: &'static str,
     ) -> Self {
         Self {
             args,
@@ -123,6 +131,7 @@ where
             build,
             map_ok,
             map_err,
+            tool,
         }
     }
 }
@@ -130,16 +139,30 @@ where
 #[async_trait]
 impl<Args, Msg> ToolInstance for GraphCommandTool<Args, Msg>
 where
-    Args: Send + Sync + 'static,
+    Args: Send + Sync + MaybeApply + 'static,
     Msg: Send + 'static,
     crate::graph::manager::GraphManager: kameo::message::Message<Msg>,
 {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
+        let meta = graph_meta(&self.graph).await?;
+        if !self.args.apply_flag() {
+            let preview = attach_meta(
+                json!({
+                    "type": "graph_command",
+                    "tool": self.tool,
+                    "status": "preview",
+                    "apply": false,
+                    "hint": "Set apply=true to execute this mutation"
+                }),
+                &meta,
+            );
+            return Ok(ToolOutput::new(preview));
+        }
         let msg = (self.build)(&self.args);
         let reply: <MsgReply<Msg> as kameo::Reply>::Ok =
             self.graph.ask(msg).await.map_err(|e| (self.map_err)(e))?;
-
-        Ok(ToolOutput::new((self.map_ok)(&self.args, reply)))
+        let payload = attach_meta((self.map_ok)(&self.args, reply), &meta);
+        Ok(ToolOutput::new(payload))
     }
 }
 
@@ -152,7 +175,7 @@ pub(crate) fn parse_graph_command<Args, Msg>(
     map_err: fn(SendError<Msg, <MsgReply<Msg> as kameo::Reply>::Error>) -> ToolExecutionError,
 ) -> ToolInputResult<Box<dyn ToolInstance>>
 where
-    Args: for<'de> Deserialize<'de> + JsonSchema + Clone + Send + Sync + 'static,
+    Args: for<'de> Deserialize<'de> + JsonSchema + Clone + Send + Sync + MaybeApply + 'static,
     Msg: Send + 'static,
     crate::graph::manager::GraphManager: kameo::message::Message<Msg>,
 {
@@ -167,7 +190,27 @@ where
         build,
         map_ok,
         map_err,
+        tool,
     )))
+}
+
+/// Deserialize args, then apply a builder closure, mapping errors into
+/// InvalidPayload.
+pub(crate) fn parse_args_with_builder<Args, Build>(
+    tool: &'static str,
+    raw: Value,
+    build: Build,
+) -> ToolInputResult<Args>
+where
+    Args: for<'de> Deserialize<'de>,
+    Build: FnOnce(Args) -> ToolInputResult<Args>,
+{
+    let input: Args =
+        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
+            tool,
+            message: err.to_string(),
+        })?;
+    build(input)
 }
 
 pub(crate) fn default_confidence() -> f32 {
@@ -212,4 +255,32 @@ pub(crate) async fn resolve_slugs(
         .ask(crate::graph::manager::ResolveSlugs { slugs })
         .await
         .map_err(|e| map_send_err(e, tool))
+}
+
+pub(crate) trait MaybeApply {
+    fn apply_flag(&self) -> bool {
+        true
+    }
+}
+
+pub(crate) async fn graph_meta(
+    graph: &ActorRef<crate::graph::manager::GraphManager>,
+) -> Result<crate::graph::manager::GraphMeta, ToolExecutionError> {
+    graph
+        .ask(crate::graph::manager::GetGraphMeta)
+        .await
+        .map_err(map_send_err_inf)
+}
+
+pub(crate) fn attach_meta(
+    mut payload: serde_json::Value,
+    meta: &crate::graph::manager::GraphMeta,
+) -> serde_json::Value {
+    if let serde_json::Value::Object(ref mut obj) = payload {
+        obj.insert(
+            "meta".to_string(),
+            serde_json::to_value(meta).unwrap_or_else(|_| serde_json::Value::Null),
+        );
+    }
+    payload
 }

@@ -170,6 +170,58 @@ pub enum AnchorImpact {
     Target,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InvariantCode {
+    StatementEmpty,
+    ProvenanceRevision,
+    RequiresDag,
+    Fadeability,
+    LoTargetAssessment,
+    LoReachability,
+    RubricCoverage,
+    RubricUnusedObservationFeatures,
+    RubricDrift,
+    ExampleMinimums,
+    ProceduralPractice,
+    PurityIntendedMissing,
+    PurityExtraneous,
+    BorrowAhead,
+    DiscourseOrphan,
+    TeachingStepAnchorOrRationale,
+    IntroduceAnchor,
+}
+
+impl InvariantCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InvariantCode::StatementEmpty => "statement_empty",
+            InvariantCode::ProvenanceRevision => "provenance_revision",
+            InvariantCode::RequiresDag => "requires_dag",
+            InvariantCode::Fadeability => "fadeability",
+            InvariantCode::LoTargetAssessment => "lo_target_assessment",
+            InvariantCode::LoReachability => "lo_reachability",
+            InvariantCode::RubricCoverage => "rubric_coverage",
+            InvariantCode::RubricUnusedObservationFeatures => "rubric_unused_observation_features",
+            InvariantCode::RubricDrift => "rubric_drift",
+            InvariantCode::ExampleMinimums => "example_minimums",
+            InvariantCode::ProceduralPractice => "procedural_practice",
+            InvariantCode::PurityIntendedMissing => "purity_intended_missing",
+            InvariantCode::PurityExtraneous => "purity_extraneous",
+            InvariantCode::BorrowAhead => "borrow_ahead",
+            InvariantCode::DiscourseOrphan => "discourse_orphan",
+            InvariantCode::TeachingStepAnchorOrRationale => "teaching_step_anchor_or_rationale",
+            InvariantCode::IntroduceAnchor => "introduce_anchor",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InvariantViolation {
+    pub code:    InvariantCode,
+    pub message: String,
+}
+
 /// Errors returned by GraphService.
 #[derive(thiserror::Error, Debug)]
 pub enum GraphError {
@@ -186,7 +238,7 @@ pub enum GraphError {
     #[error("validator error: {0}")]
     Schema(String),
     #[error("graph invariant violation(s): {violations:?}")]
-    InvariantViolation { violations: Vec<String> },
+    InvariantViolation { violations: Vec<InvariantViolation> },
 }
 
 /// Lightweight snapshot of a node's kind used for error messages.

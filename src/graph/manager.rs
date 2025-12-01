@@ -1,16 +1,16 @@
 use std::{
-    convert::Infallible,
     path::PathBuf,
     sync::{Arc, LazyLock, RwLock},
-    time::Instant,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::Result;
-use kameo::prelude::*;
+use anyhow::{Context, Result};
+use kameo::{error::Infallible, message::Context as MsgContext, prelude::*};
 use kameo_persistence::{BiHashMap, PersistentActor};
 use petgraph::{Direction, visit::EdgeRef};
 use schemars::JsonSchema;
-use tracing::warn;
+use serde::Serialize;
+use tracing::error;
 use url::Url;
 
 use crate::graph::{
@@ -44,6 +44,16 @@ impl GraphManagerState {
     }
 }
 
+#[derive(Clone, Serialize)]
+struct QuarantinedSnapshot {
+    error:          String,
+    course_commit:  String,
+    strict_quality: bool,
+    graph_version:  u64,
+    saved_at_sec:   u64,
+    graph:          CurriculumGraph,
+}
+
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct Neighbor {
     pub neighbor_slug: String,
@@ -74,6 +84,13 @@ pub struct GraphManager {
     course_commit: String,
 }
 
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct GraphMeta {
+    pub graph_version:  u64,
+    pub course_commit:  String,
+    pub strict_quality: bool,
+}
+
 impl GraphManager {
     pub fn new(service: GraphService, config: GraphConfig) -> Self {
         Self {
@@ -85,6 +102,42 @@ impl GraphManager {
     fn log_write_latency(op: &str, start: Instant) {
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         tracing::debug!(target: "weaver.graph.write_latency", op, elapsed_ms);
+    }
+
+    async fn quarantine_rejected_snapshot(
+        state: &GraphManagerState,
+        actor_ref: &ActorRef<Self>,
+        err: &GraphError,
+    ) -> anyhow::Result<Option<PathBuf>> {
+        let Some(key) = GraphManager::persistence_key(actor_ref) else {
+            return Ok(None);
+        };
+
+        let mut dir = key
+            .to_file_path()
+            .map_err(|_| anyhow::anyhow!("invalid persistence key path"))?;
+
+        let saved_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let filename = format!("quarantine-{}-{}.json", state.graph_version, saved_at);
+        dir.push(filename);
+
+        let envelope = QuarantinedSnapshot {
+            error:          err.to_string(),
+            course_commit:  state.course_commit.clone(),
+            strict_quality: state.strict_quality,
+            graph_version:  state.graph_version,
+            saved_at_sec:   saved_at,
+            graph:          state.graph.clone(),
+        };
+
+        let payload = serde_json::to_vec_pretty(&envelope)?;
+        tokio::fs::write(&dir, payload)
+            .await
+            .with_context(|| format!("write quarantine snapshot {}", dir.display()))?;
+        Ok(Some(dir))
     }
 }
 
@@ -101,9 +154,9 @@ impl From<&GraphManager> for GraphManagerState {
 
 impl Actor for GraphManager {
     type Args = GraphManagerState;
-    type Error = Infallible;
+    type Error = Arc<anyhow::Error>;
 
-    async fn on_start(state: Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
+    async fn on_start(state: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         let strict = state.strict_quality;
         let expected_revision = if state.course_commit.is_empty() {
             None
@@ -111,15 +164,24 @@ impl Actor for GraphManager {
             Some(state.course_commit.clone())
         };
         let service = match GraphService::from_parts(
-            state.graph,
+            state.graph.clone(),
             strict,
             state.graph_version,
             expected_revision,
         ) {
             Ok(svc) => svc,
             Err(err) => {
-                warn!(error = %err, "invalid persisted graph; starting with empty graph");
-                GraphService::new().with_strict(strict)
+                let quarantine_path =
+                    GraphManager::quarantine_rejected_snapshot(&state, &actor_ref, &err).await?;
+                error!(
+                    target: "weaver.graph.restore_failed",
+                    error = %err,
+                    graph_version = state.graph_version,
+                    course_commit = %state.course_commit,
+                    quarantine_path = %quarantine_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "<none>".into()),
+                    "refusing to start with invalid persisted graph"
+                );
+                return Err(Arc::new(anyhow::anyhow!(err)));
             }
         };
 
@@ -201,7 +263,7 @@ impl Message<InsertKnowledge> for GraphManager {
             payload,
             tags,
         }: InsertKnowledge,
-        _ctx: &mut Context<Self, Self::Reply>,
+        _ctx: &mut MsgContext<Self, Self::Reply>,
     ) -> Self::Reply {
         let start = Instant::now();
         let res = self.service.add_knowledge_node(slug, payload, tags);
@@ -222,7 +284,7 @@ impl Message<UpdateKnowledge> for GraphManager {
             payload,
             tags,
         }: UpdateKnowledge,
-        _ctx: &mut Context<Self, Self::Reply>,
+        _ctx: &mut MsgContext<Self, Self::Reply>,
     ) -> Self::Reply {
         let start = Instant::now();
         let res = self.service.update_knowledge_node(&slug, payload, tags);
@@ -255,7 +317,7 @@ impl Message<InsertTeachingStep> for GraphManager {
             payload,
             tags,
         }: InsertTeachingStep,
-        _ctx: &mut Context<Self, Self::Reply>,
+        _ctx: &mut MsgContext<Self, Self::Reply>,
     ) -> Self::Reply {
         let start = Instant::now();
         let res = self.service.add_teaching_step(slug, payload, tags);
@@ -276,7 +338,7 @@ impl Message<UpdateTeachingStep> for GraphManager {
             payload,
             tags,
         }: UpdateTeachingStep,
-        _ctx: &mut Context<Self, Self::Reply>,
+        _ctx: &mut MsgContext<Self, Self::Reply>,
     ) -> Self::Reply {
         let start = Instant::now();
         let res = self.service.update_teaching_step(&slug, payload, tags);
@@ -305,7 +367,7 @@ impl Message<AddRequires> for GraphManager {
             attrs,
             confidence,
         }: AddRequires,
-        _ctx: &mut Context<Self, Self::Reply>,
+        _ctx: &mut MsgContext<Self, Self::Reply>,
     ) -> Self::Reply {
         let start = Instant::now();
         let from_id = self.service.node_by_slug(&from)?;
@@ -338,7 +400,7 @@ impl Message<AddSupports> for GraphManager {
             attrs,
             confidence,
         }: AddSupports,
-        _ctx: &mut Context<Self, Self::Reply>,
+        _ctx: &mut MsgContext<Self, Self::Reply>,
     ) -> Self::Reply {
         let start = Instant::now();
         let from_id = self.service.node_by_slug(&from)?;
@@ -371,7 +433,7 @@ impl Message<AddAssesses> for GraphManager {
             attrs,
             confidence,
         }: AddAssesses,
-        _ctx: &mut Context<Self, Self::Reply>,
+        _ctx: &mut MsgContext<Self, Self::Reply>,
     ) -> Self::Reply {
         let start = Instant::now();
         let from_id = self.service.node_by_slug(&from)?;
@@ -404,7 +466,7 @@ impl Message<AddPrecedes> for GraphManager {
             episode,
             confidence,
         }: AddPrecedes,
-        _ctx: &mut Context<Self, Self::Reply>,
+        _ctx: &mut MsgContext<Self, Self::Reply>,
     ) -> Self::Reply {
         let start = Instant::now();
         let from_id = self.service.node_by_slug(&from)?;
@@ -440,7 +502,7 @@ impl Message<AddAnchors> for GraphManager {
             impact,
             confidence,
         }: AddAnchors,
-        _ctx: &mut Context<Self, Self::Reply>,
+        _ctx: &mut MsgContext<Self, Self::Reply>,
     ) -> Self::Reply {
         let start = Instant::now();
         let from_id = self.service.node_by_slug(&from)?;
@@ -468,7 +530,7 @@ impl Message<GetNode> for GraphManager {
     async fn handle(
         &mut self,
         GetNode { slug }: GetNode,
-        _ctx: &mut Context<Self, Self::Reply>,
+        _ctx: &mut MsgContext<Self, Self::Reply>,
     ) -> Self::Reply {
         let id = self.service.node_by_slug(&slug)?;
         Ok(self.service.graph()[id].clone())
@@ -483,7 +545,7 @@ impl Message<GetGraph> for GraphManager {
     async fn handle(
         &mut self,
         _msg: GetGraph,
-        _ctx: &mut Context<Self, Self::Reply>,
+        _ctx: &mut MsgContext<Self, Self::Reply>,
     ) -> Self::Reply {
         Ok(self.service.shared_graph())
     }
@@ -497,7 +559,7 @@ impl Message<GetGraphWithVersion> for GraphManager {
     async fn handle(
         &mut self,
         _msg: GetGraphWithVersion,
-        _ctx: &mut Context<Self, Self::Reply>,
+        _ctx: &mut MsgContext<Self, Self::Reply>,
     ) -> Self::Reply {
         Ok((self.service.shared_graph(), self.service.graph_version()))
     }
@@ -511,7 +573,7 @@ impl Message<GetGraphVersion> for GraphManager {
     async fn handle(
         &mut self,
         _msg: GetGraphVersion,
-        _ctx: &mut Context<Self, Self::Reply>,
+        _ctx: &mut MsgContext<Self, Self::Reply>,
     ) -> Self::Reply {
         Ok(self.service.graph_version())
     }
@@ -527,7 +589,7 @@ impl Message<Neighbors> for GraphManager {
             edge_kind,
             direction,
         }: Neighbors,
-        _ctx: &mut Context<Self, Self::Reply>,
+        _ctx: &mut MsgContext<Self, Self::Reply>,
     ) -> Self::Reply {
         let node = self.service.node_by_slug(&slug)?;
 
@@ -575,7 +637,7 @@ impl Message<ResolveSlug> for GraphManager {
     async fn handle(
         &mut self,
         ResolveSlug { slug }: ResolveSlug,
-        _ctx: &mut Context<Self, Self::Reply>,
+        _ctx: &mut MsgContext<Self, Self::Reply>,
     ) -> Self::Reply {
         self.service.node_by_slug(&slug)
     }
@@ -587,7 +649,7 @@ impl Message<ResolveSlugs> for GraphManager {
     async fn handle(
         &mut self,
         ResolveSlugs { slugs }: ResolveSlugs,
-        _ctx: &mut Context<Self, Self::Reply>,
+        _ctx: &mut MsgContext<Self, Self::Reply>,
     ) -> Self::Reply {
         let mut ids = Vec::with_capacity(slugs.len());
         for slug in slugs {
@@ -603,7 +665,7 @@ impl Message<RenameNode> for GraphManager {
     async fn handle(
         &mut self,
         RenameNode { old_slug, new_slug }: RenameNode,
-        _ctx: &mut Context<Self, Self::Reply>,
+        _ctx: &mut MsgContext<Self, Self::Reply>,
     ) -> Self::Reply {
         let start = Instant::now();
         let res = self.service.rename_node(&old_slug, new_slug);
@@ -620,7 +682,7 @@ impl Message<RemoveNode> for GraphManager {
     async fn handle(
         &mut self,
         RemoveNode { slug }: RemoveNode,
-        _ctx: &mut Context<Self, Self::Reply>,
+        _ctx: &mut MsgContext<Self, Self::Reply>,
     ) -> Self::Reply {
         let start = Instant::now();
         let res = self.service.remove_node(&slug);
@@ -636,6 +698,8 @@ pub struct SaveSnapshot {
 }
 
 pub struct PersistSnapshot;
+
+pub struct AuditInvariants;
 
 pub struct Neighbors {
     pub slug:      String,
@@ -664,6 +728,38 @@ pub struct RedundantRequires {
     pub prune: bool,
 }
 
+pub struct GetCourseCommit;
+
+impl Message<GetCourseCommit> for GraphManager {
+    type Reply = String;
+
+    async fn handle(
+        &mut self,
+        _msg: GetCourseCommit,
+        _ctx: &mut MsgContext<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.course_commit.clone()
+    }
+}
+
+pub struct GetGraphMeta;
+
+impl Message<GetGraphMeta> for GraphManager {
+    type Reply = Result<GraphMeta, Infallible>;
+
+    async fn handle(
+        &mut self,
+        _msg: GetGraphMeta,
+        _ctx: &mut MsgContext<Self, Self::Reply>,
+    ) -> Self::Reply {
+        Ok(GraphMeta {
+            graph_version:  self.service.graph_version(),
+            course_commit:  self.course_commit.clone(),
+            strict_quality: self.service.strict_quality(),
+        })
+    }
+}
+
 pub struct ApplyRuntimeConfig {
     pub course_commit:  String,
     pub strict_quality: bool,
@@ -675,7 +771,7 @@ impl Message<SaveSnapshot> for GraphManager {
     async fn handle(
         &mut self,
         SaveSnapshot { path }: SaveSnapshot,
-        _ctx: &mut Context<Self, Self::Reply>,
+        _ctx: &mut MsgContext<Self, Self::Reply>,
     ) -> Self::Reply {
         let graph = self.service.shared_graph();
         persist::save_graph(graph.as_ref(), path, &self.course_commit, self.service.graph_version())
@@ -689,9 +785,32 @@ impl Message<PersistSnapshot> for GraphManager {
     async fn handle(
         &mut self,
         _msg: PersistSnapshot,
-        ctx: &mut Context<Self, Self::Reply>,
+        ctx: &mut MsgContext<Self, Self::Reply>,
     ) -> Self::Reply {
         self.save_snapshot(ctx.actor_ref()).await
+    }
+}
+
+impl Message<AuditInvariants> for GraphManager {
+    type Reply = Result<()>;
+
+    async fn handle(
+        &mut self,
+        _msg: AuditInvariants,
+        _ctx: &mut MsgContext<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let start = Instant::now();
+        let res = self
+            .service
+            .validate_global_invariants_off_thread(Duration::from_secs(2))
+            .await;
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        tracing::info!(
+            target: "weaver.graph.validation.audit",
+            elapsed_ms,
+            success = res.is_ok()
+        );
+        res.map_err(Into::into)
     }
 }
 
@@ -701,7 +820,7 @@ impl Message<RedundantRequires> for GraphManager {
     async fn handle(
         &mut self,
         RedundantRequires { prune }: RedundantRequires,
-        _ctx: &mut Context<Self, Self::Reply>,
+        _ctx: &mut MsgContext<Self, Self::Reply>,
     ) -> Self::Reply {
         let start = Instant::now();
         let edges: Vec<(String, String)> = self
@@ -732,7 +851,7 @@ impl Message<LoadSnapshot> for GraphManager {
     async fn handle(
         &mut self,
         LoadSnapshot { path }: LoadSnapshot,
-        _ctx: &mut Context<Self, Self::Reply>,
+        _ctx: &mut MsgContext<Self, Self::Reply>,
     ) -> Self::Reply {
         let start = Instant::now();
         let snapshot = persist::load_graph(&path).await?;
@@ -784,7 +903,7 @@ impl Message<ApplyRuntimeConfig> for GraphManager {
             course_commit,
             strict_quality,
         }: ApplyRuntimeConfig,
-        _ctx: &mut Context<Self, Self::Reply>,
+        _ctx: &mut MsgContext<Self, Self::Reply>,
     ) -> Self::Reply {
         let prev_strict = self.service.strict_quality();
 
@@ -795,6 +914,7 @@ impl Message<ApplyRuntimeConfig> for GraphManager {
         }
 
         let prev_commit = self.course_commit.clone();
+        let prev_strict_mode = self.service.strict_quality();
         let expected = if course_commit.is_empty() {
             None
         } else {
@@ -804,6 +924,9 @@ impl Message<ApplyRuntimeConfig> for GraphManager {
         self.course_commit = course_commit;
 
         if let Err(err) = self.service.validate_global_invariants() {
+            if strict_quality != prev_strict_mode {
+                let _ = self.service.set_strict_quality(prev_strict_mode);
+            }
             self.course_commit = prev_commit.clone();
             let prev_expected = if prev_commit.is_empty() {
                 None

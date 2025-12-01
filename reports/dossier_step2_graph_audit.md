@@ -13,9 +13,11 @@ This document applies the Step 1 quality bar to the “vibe-coded” graph sta
 1. **Typed ontology** – Node/edge payloads use enums (`KnowledgeType`, `SupportKind`, `AnchorImpact`, `AssessmentScope`, `GrainLevel`, `IntrinsicLoad`) and structured attrs (`RequiresAttrs`, `SupportsAttrs`, `AssessesAttrs`). This keeps pedagogy encoded in types, not strings.
 2. **EdgeSpec gatekeeping** – Each edge kind validates endpoints/attrs centrally; requires cycles rejected; supports self-loops blocked; assesses claim must equal target slug. Good separation of concerns.
 3. **Fadeability guard** – Supports validation simulates insertion and rejects scaffolds that carry prerequisite load—directly enforces the white paper’s fadeability rule.
-4. **Existing audits** – `analysis::example_gaps`, `procedural_practice_gaps`, `coverage_report`, `fadeability_issues` already encode example minimums, procedural practice, coverage, and fadeability; they run in `validate_global_invariants`.
-5. **Rollback discipline** – Slug index rebuilt on load; duplicate slugs rejected; node/edge inserts roll back on invariant failure; renames keep assesses.claim aligned.
-6. **Snapshot hygiene** – Save uses temp+fsync+rename; load checks snapshot version.
+4. **Existing audits** – `analysis::example_gaps`, `procedural_practice_gaps`, `coverage_report`, `fadeability_issues`, `lo_reachability`, `borrow_ahead`, and provenance checks (source_ref revision must match course commit) run inside `validate_global_invariants`.
+5. **Preview/pagination + cache on analysis tools** – Graph analysis tools default to preview with `fetch_body=false`, byte hints, and pagination; results are memoized per `(graph_version, AnalysisKind)` via `AnalysisCache` and an admin clear tool.
+6. **Rollback discipline** – Slug index rebuilt on load; duplicate slugs rejected; node/edge inserts roll back on invariant failure; renames keep assesses.claim aligned.
+7. **Snapshot hygiene** – Save uses temp+fsync+rename; load checks snapshot version.
+8. **Background observability (partial)** – Autosave/prune in `main.rs` log rerun scalars for duration/success; foreground graph ops still lack metrics.
 
 These foundations should be preserved and instrumented, not rewritten.
 
@@ -24,30 +26,27 @@ These foundations should be preserved and instrumented, not rewritten.
 ### 2.1 Observability & ergonomics
 
 - **No metrics/rerun**: Graph mutations/validations log only at `debug`; no Rerun scalars, no counters for invariant failures, no latency histograms. Impact: invisible regressions; can’t correlate graph ops with LLM usage.
-- **No preview/budgeting**: Graph tools stream full payloads; no `fetch_body` defaults, no byte/token hints, no remaining-budget compute, no pagination in responses. Impact: token blowups and context overruns; violates preview-first ergonomics of file tools.
+- **Partial preview/budgeting**: Analysis tools now default to preview with `fetch_body=false`, byte hints, and pagination, but mutating tools still return full bodies with no previews and none of the responses include graph metadata or remaining-budget info. Impact: token waste on writes and no context about graph version/course_commit.
 - **Flat errors**: Tool errors are strings (`InvalidPayload`); no structured codes or remediation hints. Impact: LLM can’t self-correct effectively.
 
 ### 2.2 Missing or partial invariants
 
-- **Alignment reachability**: White-paper predicate (first-principle → … → assessment → LO with scope=target) not enforced; only warns when LO lacks any target assesses edge.
-- **Purity/extraneous knowledge**: `extraneous_report` exists but unused; construct-irrelevant demands never compared; assessments can import stray prerequisites silently.
 - **Orphan/unreachable assessments**: Functions exist but invariants ignore them; assessments may be unreachable from first principles or lack assesses edges.
-- **Borrow-ahead/discourse DAG**: `borrow_ahead` and `discourse_orphans` implemented but not wired; per-episode precedes acyclicity only checked at edge insert, not globally.
-- **Keystone/granularity**: No keystone/centrality alerts; no over-bundle/fragment or grain-level audits; intrinsic_load heuristics applied only partially.
-- **Source-ref rigor**: Validates formatting but not revision vs course_commit; minimal evidence-count checks (supports/requires need evidence_refs, assesses only observation features).
+- **Keystone/granularity**: No keystone/centrality alerts; no over-bundle/fragment or grain-level audits; intrinsic_load heuristics not enforced.
+- **Full discourse DAG recheck**: Precedes acyclicity is only checked per insert; no global revalidation after other mutations.
 - **Strict-quality flag is narrow**: It only promotes warnings to errors; it does not expand the set of checks. Critical omissions stay unchecked in strict mode.
 
 ### 2.3 Safety, boundary hygiene, reproducibility
 
 - **Snapshot paths unsandboxed**: Graph snapshot tools accept arbitrary paths, no workspace confinement. Risk: writing outside workspace.
-- **Unbounded outputs**: Neighbors/gap/analysis tools have no limits; pagination helper unused.
+- **SourceRef path escapes unguarded**: Revision is enforced, but paths are not checked against the workspace root.
 - **Blocking validations**: `validate_global_invariants` and supports fadeability simulation run synchronously in actor handlers; fadeability clones entire graph; rayon runs inside actor. Risk: mailbox stalls on large graphs.
 - **Thin versioning**: Only `SNAPSHOT_VERSION`; no schema versioning, checksum, or commit verification on load.
 
 ### 2.4 Cognitive economy & surface design
 
 - **CRUD-centric tools**: LLM must chain many calls (insert node, add requires, add supports, add assesses) to do one pedagogical action. No semantic macros (e.g., upsert concept with supports & assessments, align LO).
-- **Algorithm leakage**: Raw petgraph algorithms (articulation, bridges, pagerank) exposed as tools; forces LLM to learn graph theory terms unrelated to pedagogy.
+- **Algorithm leakage (reduced but present)**: Raw petgraph algorithms remain compiled; only `graph_requires_cycles` is curated but others still exist behind the scenes.
 - **Analysis monolith**: `analysis/mod.rs` (~500+ lines) mixes structural, pedagogical, discourse logic; hard to reason/test; raises cognitive overhead.
 
 ### 2.5 Error handling & messaging
@@ -56,27 +55,27 @@ These foundations should be preserved and instrumented, not rewritten.
 
 ### 2.6 Human-facing affordances
 
-- Tool descriptions are terse; no “preview-first” guidance; outputs lack metadata (`graph_version`, `course_commit`, `strict_quality`).
+- Tool descriptions improved in `docs/graph_tools.md`, but outputs still lack metadata (`graph_version`, `course_commit`, `strict_quality`) and mutating tools do not provide previews or hints.
 
 ## 3) Evidence pointers (where issues live)
 
-- Invariants run: `src/graph/service.rs:520-594`.
+- Invariants run: `src/graph/service.rs:520-594` plus provenance check and purity/borrow-ahead/coverage/reachability/example/practice validations.
 - Fadeability sim: `src/graph/specs.rs:63-118`.
-- Unused analyses: `analysis::lo_reachability`, `extraneous_report`, `orphan_assessments`, `unreachable_assessments`, `borrow_ahead`.
+- Orphan/unreachable assessments functions exist but are not called: `analysis::orphan_assessments`, `analysis::unreachable_assessments`.
 - Snapshot path gap: `src/tools/llm/graph_tools/persist.rs`.
-- Algorithm leakage: `src/tools/llm/graph_tools/algorithms.rs`.
+- Algorithm leakage: `src/tools/llm/graph_tools/algorithms.rs` (only cycles curated, others still compiled).
 - Monolith: `src/analysis/mod.rs`.
 - Blocking validations: mutation handlers call `validate_global_invariants` synchronously in `src/graph/manager.rs` and supports clone in `specs.rs`.
 
 ## 4) Impact and risk assessment (ordered)
 
-1. **Observability/preview gap** – High user/token cost, blind to performance/regressions.
-2. **Invariant coverage gap** – Core contract unenforced (alignment, purity, orphans, borrow-ahead, keystone/grain); strict mode misleads.
+1. **Observability gap** – No metrics/rerun for mutate/validate; responses lack graph metadata.
+2. **Invariant coverage gap** – Orphan/unreachable assessments, keystone/granularity, and full precedes DAG checks are missing; strict mode misleads by only promoting warnings.
 3. **Blocking actor handlers** – Latency spikes, potential mailbox starvation on real graphs.
-4. **Safety gaps** – Path sandboxing absent; unpaginated outputs; unstructured errors.
+4. **Safety gaps** – Path sandboxing absent; SourceRef path escape unchecked; unstructured errors.
 5. **Low-level tool semantics** – Cognitive burden on LLM; more tokens/round-trips; higher failure rate.
 6. **Schema/version rigor** – Drift risk; snapshots may mismatch course commit silently.
-7. **Affordance/documentation thinness** – Increases misuse; hides strict/commit context.
+7. **Affordance/documentation thinness** – Outputs lack metadata/hints; mutating tools lack previews.
 
 ## 5) What to keep stable (do not regress)
 
@@ -87,24 +86,14 @@ These foundations should be preserved and instrumented, not rewritten.
 
 ## 6) Recommended remediation themes (preview to Step 3)
 
-- **Telemetry & preview**: add rerun metrics, byte/token estimates, pagination; default fetch_body=false.
-- **Executable invariants**: wire alignment, purity, orphan/unreachable, borrow-ahead, keystone/grain; expand strict mode.
+- **Telemetry & preview**: add rerun metrics and metadata; extend previews/byte hints to mutating tools.
+- **Executable invariants**: wire orphan/unreachable assessments, keystone/grain, full precedes DAG; expand strict mode.
 - **Async hygiene**: offload heavy validations, bound rayon; avoid graph clones in hot paths.
 - **Semantic tools**: introduce upsert/align/fix-coverage/add-examples macros; de-curate raw algos; DRY parsing.
-- **Safety & versioning**: sandbox snapshot paths; enforce source_ref revision vs course_commit; add schema_version/hash.
+- **Safety & versioning**: sandbox snapshot paths; enforce workspace-contained SourceRef paths; add schema_version/hash and clearer commit drift handling.
 - **UX**: structured error codes with IDs; outputs include graph metadata; richer descriptions.
 
 ## 7) Expanded gap details (for implementers)
-
-### Alignment reachability
-
-- Missing: check that each LO has ≥1 assessment with scope=target reachable from a first principle via requires*; if absent, report path deficiency and offending LO/assessment slugs.
-- Fix: add `alignment_gaps()`; integrate into invariants as error (strict and default).
-
-### Purity/extraneous
-
-- Missing: compare requires-ancestors of assessment against intended knowledge union LO rubric/construct_irrelevant_demands; report extraneous nodes.
-- Fix: call `extraneous_report` per (assessment, LO) pair; error in strict, warn otherwise.
 
 ### Orphans/unreachable assessments
 

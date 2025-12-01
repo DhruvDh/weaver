@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use anyhow::{Result as AnyResult, anyhow};
 use async_trait::async_trait;
 use bon::Builder;
 use kameo::prelude::ActorRef;
@@ -14,23 +15,84 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::info;
 
+use super::common::{attach_meta, graph_meta, parse_args_with_builder};
 use crate::{
     graph::{CurriculumGraph, EdgeKind, traversal},
     tools::llm::{
         CallState, ToolExecutionError, ToolInputError, ToolInputResult, ToolInstance, ToolOutput,
-        ToolPrototype,
+        ToolPayloadMode, ToolPrototype,
         analysis_cache::{AnalysisCacheKey, AnalysisKind},
-        schema_for_args,
+        apply_preview_cost, build_cost_preview, estimate_tokens_from_characters,
+        payload_size_bytes, prepare_payload_estimates, schema_for_args,
     },
 };
 
 async fn load_graph_with_version(
     graph: &ActorRef<crate::graph::manager::GraphManager>,
+    cache: &crate::tools::llm::graph_tools::analysis_cache::AnalysisCache,
 ) -> Result<(Arc<CurriculumGraph>, u64), ToolExecutionError> {
-    graph
+    let (g, version): (Arc<CurriculumGraph>, u64) = graph
         .ask(crate::graph::manager::GetGraphWithVersion)
         .await
-        .map_err(super::common::map_send_err_inf)
+        .map_err(super::common::map_send_err_inf)?;
+    cache.prune_for_version(version);
+    Ok((g, version))
+}
+
+async fn join_blocking_json(
+    handle: tokio::task::JoinHandle<AnyResult<Value>>,
+    tool: &'static str,
+) -> Result<Value, ToolExecutionError> {
+    match handle.await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(err)) => Err(ToolExecutionError::Internal(err)),
+        Err(join_err) => Err(ToolExecutionError::execution(anyhow!(
+            "blocking analysis `{tool}` panicked or was cancelled: {join_err}"
+        ))),
+    }
+}
+
+async fn respond_with_envelope(
+    tool: &'static str,
+    payload: Value,
+    fetch_body: bool,
+    state: &CallState,
+) -> Result<ToolOutput, ToolExecutionError> {
+    let meta = graph_meta(&state.graph).await?;
+    let approx_bytes = payload_size_bytes(&payload);
+    let estimates = prepare_payload_estimates(&state.metrics, state.model.as_str(), approx_bytes);
+    let mode = ToolPayloadMode::from_fetch_flag(fetch_body);
+    match mode {
+        ToolPayloadMode::Preview => {
+            let mut preview = build_cost_preview(
+                tool,
+                approx_bytes,
+                estimates.safe_tokens,
+                vec![
+                    "Set fetch_body=true to stream results.".to_string(),
+                    "Use limit to bound output volume.".to_string(),
+                ],
+            );
+            let preview_bytes = payload_size_bytes(&preview);
+            let preview_tokens = estimate_tokens_from_characters(preview_bytes as usize);
+            apply_preview_cost(
+                &mut preview,
+                &state.metrics,
+                state.model.as_str(),
+                state.conversation_id.as_str(),
+                preview_tokens,
+                estimates.safe_tokens,
+            );
+            let with_meta = attach_meta(preview, &meta);
+            let hint_bytes = payload_size_bytes(&with_meta);
+            Ok(ToolOutput::with_byte_hint(with_meta, hint_bytes))
+        }
+        ToolPayloadMode::Body => {
+            let with_meta = attach_meta(payload, &meta);
+            let size = payload_size_bytes(&with_meta);
+            Ok(ToolOutput::with_byte_hint(with_meta, size))
+        }
+    }
 }
 
 const REQUIRES_CYCLES: &str = "graph_requires_cycles";
@@ -45,7 +107,13 @@ const REQUIRES_SHORTEST_PATH: &str = "graph_requires_shortest_path";
 pub struct CyclesArgs {
     #[serde(default)]
     #[schemars(description = "Maximum components to return (default 200, max 500).")]
-    pub limit: Option<usize>,
+    pub limit:      Option<usize>,
+    #[serde(default)]
+    #[schemars(
+        description = "When true, return the full body; otherwise respond with a preview/cost \
+                       envelope."
+    )]
+    pub fetch_body: bool,
 }
 
 #[derive(Debug, Clone, Builder, Deserialize, JsonSchema)]
@@ -60,6 +128,12 @@ pub struct PageRankArgs {
     #[serde(default)]
     #[schemars(description = "Maximum nodes to return, default 50, max 500.")]
     pub limit:      Option<usize>,
+    #[serde(default)]
+    #[schemars(
+        description = "When true, return the full body; otherwise respond with a preview/cost \
+                       envelope."
+    )]
+    pub fetch_body: bool,
 }
 
 const fn default_damping() -> f64 {
@@ -111,11 +185,7 @@ pub(super) fn tool_prototypes() -> Vec<ToolPrototype> {
 }
 
 fn parse_cycles(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let args: CyclesArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    REQUIRES_CYCLES,
-            message: err.to_string(),
-        })?;
+    let args = parse_args_with_builder(REQUIRES_CYCLES, raw, |args: CyclesArgs| Ok(args))?;
     Ok(Box::new(CyclesTool {
         args,
         state: state.clone(),
@@ -123,11 +193,7 @@ fn parse_cycles(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolIn
 }
 
 fn parse_pagerank(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let mut args: PageRankArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    REQUIRES_PAGERANK,
-            message: err.to_string(),
-        })?;
+    let mut args = parse_args_with_builder(REQUIRES_PAGERANK, raw, |args: PageRankArgs| Ok(args))?;
     if !(0.0..=1.0).contains(&args.damping) {
         return Err(ToolInputError::InvalidPayload {
             tool:    REQUIRES_PAGERANK,
@@ -144,11 +210,7 @@ fn parse_pagerank(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn Tool
 }
 
 fn parse_bridges(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let args: CyclesArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    REQUIRES_BRIDGES,
-            message: err.to_string(),
-        })?;
+    let args = parse_args_with_builder(REQUIRES_BRIDGES, raw, |args: CyclesArgs| Ok(args))?;
     Ok(Box::new(BridgesTool {
         args,
         state: state.clone(),
@@ -156,11 +218,7 @@ fn parse_bridges(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolI
 }
 
 fn parse_articulation(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let args: CyclesArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    REQUIRES_ARTICULATION,
-            message: err.to_string(),
-        })?;
+    let args = parse_args_with_builder(REQUIRES_ARTICULATION, raw, |args: CyclesArgs| Ok(args))?;
     Ok(Box::new(ArticulationTool {
         args,
         state: state.clone(),
@@ -168,11 +226,7 @@ fn parse_articulation(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn 
 }
 
 fn parse_feedback(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let args: CyclesArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    REQUIRES_FEEDBACK,
-            message: err.to_string(),
-        })?;
+    let args = parse_args_with_builder(REQUIRES_FEEDBACK, raw, |args: CyclesArgs| Ok(args))?;
     Ok(Box::new(FeedbackTool {
         args,
         state: state.clone(),
@@ -182,16 +236,19 @@ fn parse_feedback(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn Tool
 #[derive(Debug, Clone, Builder, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ShortestPathArgs {
-    pub from_slug: String,
-    pub to_slug:   String,
+    pub from_slug:  String,
+    pub to_slug:    String,
+    #[serde(default)]
+    #[schemars(
+        description = "When true, return the path immediately; otherwise respond with a \
+                       preview/cost envelope."
+    )]
+    pub fetch_body: bool,
 }
 
 fn parse_shortest_path(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let args: ShortestPathArgs =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    REQUIRES_SHORTEST_PATH,
-            message: err.to_string(),
-        })?;
+    let args =
+        parse_args_with_builder(REQUIRES_SHORTEST_PATH, raw, |args: ShortestPathArgs| Ok(args))?;
     Ok(Box::new(ShortestPathTool {
         args,
         state: state.clone(),
@@ -206,7 +263,8 @@ struct CyclesTool {
 #[async_trait]
 impl ToolInstance for CyclesTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let (graph, graph_version) = load_graph_with_version(&self.state.graph).await?;
+        let (graph, graph_version) =
+            load_graph_with_version(&self.state.graph, &self.state.analysis_cache).await?;
         let cache_key = AnalysisCacheKey {
             graph_version,
             kind: AnalysisKind::RequiresCycles,
@@ -215,10 +273,10 @@ impl ToolInstance for CyclesTool {
         let cached = self
             .state
             .analysis_cache
-            .get_or_insert_with_async(cache_key, || {
+            .get_or_try_insert_with_async(cache_key, || {
                 let graph = Arc::clone(&graph);
                 async move {
-                    tokio::task::spawn_blocking(move || {
+                    let handle = tokio::task::spawn_blocking(move || -> AnyResult<Value> {
                         let view = traversal::requires_view(&graph);
                         let mut sccs: Vec<Vec<_>> = tarjan_scc(&view)
                             .into_iter()
@@ -235,15 +293,14 @@ impl ToolInstance for CyclesTool {
                                 })
                             })
                             .collect();
-                        json!({
+                        Ok(json!({
                             "components": items,
-                        })
-                    })
-                    .await
-                    .unwrap()
+                        }))
+                    });
+                    join_blocking_json(handle, REQUIRES_CYCLES).await
                 }
             })
-            .await;
+            .await?;
 
         let mut payload = cached.payload.clone();
         let limit = self.args.limit.unwrap_or(200).min(500);
@@ -264,11 +321,17 @@ impl ToolInstance for CyclesTool {
             "graph requires cycles"
         );
 
-        Ok(ToolOutput::new(json!({
-            "type": "graph_analysis",
-            "tool": REQUIRES_CYCLES,
-            "components": payload["components"].clone(),
-        })))
+        respond_with_envelope(
+            REQUIRES_CYCLES,
+            json!({
+                "type": "graph_analysis",
+                "tool": REQUIRES_CYCLES,
+                "components": payload["components"].clone(),
+            }),
+            self.args.fetch_body,
+            &self.state,
+        )
+        .await
     }
 }
 
@@ -280,7 +343,8 @@ struct PageRankTool {
 #[async_trait]
 impl ToolInstance for PageRankTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let (graph, graph_version) = load_graph_with_version(&self.state.graph).await?;
+        let (graph, graph_version) =
+            load_graph_with_version(&self.state.graph, &self.state.analysis_cache).await?;
 
         let cache_key = AnalysisCacheKey {
             graph_version,
@@ -293,12 +357,12 @@ impl ToolInstance for PageRankTool {
         let cached = self
             .state
             .analysis_cache
-            .get_or_insert_with_async(cache_key, || {
+            .get_or_try_insert_with_async(cache_key, || {
                 let graph = Arc::clone(&graph);
                 let damping = self.args.damping;
                 let iterations = self.args.iterations;
                 async move {
-                    tokio::task::spawn_blocking(move || {
+                    let handle = tokio::task::spawn_blocking(move || -> AnyResult<Value> {
                         let view = traversal::requires_view(&graph);
                         let scores = page_rank(&view, damping, iterations);
                         let mut items: Vec<_> = scores
@@ -316,13 +380,12 @@ impl ToolInstance for PageRankTool {
                             .take(500)
                             .map(|(slug, score)| json!({ "slug": slug, "score": score }))
                             .collect::<Vec<_>>();
-                        json!({ "items": top })
-                    })
-                    .await
-                    .unwrap()
+                        Ok(json!({ "items": top }))
+                    });
+                    join_blocking_json(handle, REQUIRES_PAGERANK).await
                 }
             })
-            .await;
+            .await?;
 
         let mut items = cached
             .payload
@@ -342,11 +405,17 @@ impl ToolInstance for PageRankTool {
             "graph requires pagerank"
         );
 
-        Ok(ToolOutput::new(json!({
-            "type": "graph_analysis",
-            "tool": REQUIRES_PAGERANK,
-            "items": items,
-        })))
+        respond_with_envelope(
+            REQUIRES_PAGERANK,
+            json!({
+                "type": "graph_analysis",
+                "tool": REQUIRES_PAGERANK,
+                "items": items,
+            }),
+            self.args.fetch_body,
+            &self.state,
+        )
+        .await
     }
 }
 
@@ -358,7 +427,8 @@ struct BridgesTool {
 #[async_trait]
 impl ToolInstance for BridgesTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let (graph, graph_version) = load_graph_with_version(&self.state.graph).await?;
+        let (graph, graph_version) =
+            load_graph_with_version(&self.state.graph, &self.state.analysis_cache).await?;
         let cache_key = AnalysisCacheKey {
             graph_version,
             kind: AnalysisKind::RequiresBridges,
@@ -367,10 +437,10 @@ impl ToolInstance for BridgesTool {
         let cached = self
             .state
             .analysis_cache
-            .get_or_insert_with_async(cache_key, || {
+            .get_or_try_insert_with_async(cache_key, || {
                 let graph = Arc::clone(&graph);
                 async move {
-                    tokio::task::spawn_blocking(move || {
+                    let handle = tokio::task::spawn_blocking(move || -> AnyResult<Value> {
                         let mut temp =
                             petgraph::graph::Graph::<(), (), petgraph::Directed>::with_capacity(
                                 graph.node_count(),
@@ -405,13 +475,12 @@ impl ToolInstance for BridgesTool {
                                 json!({"from": from_slug, "to": to_slug})
                             })
                             .collect();
-                        json!({"edges": list})
-                    })
-                    .await
-                    .unwrap()
+                        Ok(json!({"edges": list}))
+                    });
+                    join_blocking_json(handle, REQUIRES_BRIDGES).await
                 }
             })
-            .await;
+            .await?;
 
         let limit = self.args.limit.unwrap_or(200).min(500);
         let mut edges = cached
@@ -423,9 +492,13 @@ impl ToolInstance for BridgesTool {
             edges.truncate(limit);
         }
         info!(tool = REQUIRES_BRIDGES, count = edges.len(), "graph requires bridges");
-        Ok(ToolOutput::new(
+        respond_with_envelope(
+            REQUIRES_BRIDGES,
             json!({"type": "graph_analysis","tool": REQUIRES_BRIDGES,"edges": edges}),
-        ))
+            self.args.fetch_body,
+            &self.state,
+        )
+        .await
     }
 }
 
@@ -437,7 +510,8 @@ struct ArticulationTool {
 #[async_trait]
 impl ToolInstance for ArticulationTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let (graph, graph_version) = load_graph_with_version(&self.state.graph).await?;
+        let (graph, graph_version) =
+            load_graph_with_version(&self.state.graph, &self.state.analysis_cache).await?;
         let cache_key = AnalysisCacheKey {
             graph_version,
             kind: AnalysisKind::RequiresArticulation,
@@ -446,10 +520,10 @@ impl ToolInstance for ArticulationTool {
         let cached = self
             .state
             .analysis_cache
-            .get_or_insert_with_async(cache_key, || {
+            .get_or_try_insert_with_async(cache_key, || {
                 let graph = Arc::clone(&graph);
                 async move {
-                    tokio::task::spawn_blocking(move || {
+                    let handle = tokio::task::spawn_blocking(move || -> AnyResult<Value> {
                         let mut temp =
                             petgraph::graph::Graph::<(), (), petgraph::Directed>::with_capacity(
                                 graph.node_count(),
@@ -477,13 +551,12 @@ impl ToolInstance for ArticulationTool {
                                 graph[orig].slug.clone()
                             })
                             .collect();
-                        json!({"nodes": nodes})
-                    })
-                    .await
-                    .unwrap()
+                        Ok(json!({"nodes": nodes}))
+                    });
+                    join_blocking_json(handle, REQUIRES_ARTICULATION).await
                 }
             })
-            .await;
+            .await?;
 
         let limit = self.args.limit.unwrap_or(200).min(500);
         let mut nodes = cached
@@ -495,9 +568,13 @@ impl ToolInstance for ArticulationTool {
             nodes.truncate(limit);
         }
         info!(tool = REQUIRES_ARTICULATION, count = nodes.len(), "graph requires articulation");
-        Ok(ToolOutput::new(
+        respond_with_envelope(
+            REQUIRES_ARTICULATION,
             json!({"type": "graph_analysis","tool": REQUIRES_ARTICULATION,"nodes": nodes}),
-        ))
+            self.args.fetch_body,
+            &self.state,
+        )
+        .await
     }
 }
 
@@ -509,7 +586,8 @@ struct FeedbackTool {
 #[async_trait]
 impl ToolInstance for FeedbackTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let (graph, graph_version) = load_graph_with_version(&self.state.graph).await?;
+        let (graph, graph_version) =
+            load_graph_with_version(&self.state.graph, &self.state.analysis_cache).await?;
         let cache_key = AnalysisCacheKey {
             graph_version,
             kind: AnalysisKind::RequiresFeedback,
@@ -518,10 +596,10 @@ impl ToolInstance for FeedbackTool {
         let cached = self
             .state
             .analysis_cache
-            .get_or_insert_with_async(cache_key, || {
+            .get_or_try_insert_with_async(cache_key, || {
                 let graph = Arc::clone(&graph);
                 async move {
-                    tokio::task::spawn_blocking(move || {
+                    let handle = tokio::task::spawn_blocking(move || -> AnyResult<Value> {
                         let view = traversal::requires_view(&graph);
                         let set = greedy_feedback_arc_set(&view);
                         let edges: Vec<_> = set
@@ -531,13 +609,12 @@ impl ToolInstance for FeedbackTool {
                                 json!({"from": graph[u].slug.clone(), "to": graph[v].slug.clone()})
                             })
                             .collect();
-                        json!({"edges": edges})
-                    })
-                    .await
-                    .unwrap()
+                        Ok(json!({"edges": edges}))
+                    });
+                    join_blocking_json(handle, REQUIRES_FEEDBACK).await
                 }
             })
-            .await;
+            .await?;
 
         let limit = self.args.limit.unwrap_or(200).min(500);
         let mut edges = cached
@@ -549,9 +626,13 @@ impl ToolInstance for FeedbackTool {
             edges.truncate(limit);
         }
         info!(tool = REQUIRES_FEEDBACK, count = edges.len(), "graph requires feedback arcs");
-        Ok(ToolOutput::new(
+        respond_with_envelope(
+            REQUIRES_FEEDBACK,
             json!({"type": "graph_analysis","tool": REQUIRES_FEEDBACK,"edges": edges}),
-        ))
+            self.args.fetch_body,
+            &self.state,
+        )
+        .await
     }
 }
 
@@ -563,7 +644,8 @@ struct ShortestPathTool {
 #[async_trait]
 impl ToolInstance for ShortestPathTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let (graph_ref, graph_version) = load_graph_with_version(&self.state.graph).await?;
+        let (graph_ref, graph_version) =
+            load_graph_with_version(&self.state.graph, &self.state.analysis_cache).await?;
 
         // resolve slugs
         let from = graph_ref
@@ -596,10 +678,10 @@ impl ToolInstance for ShortestPathTool {
         let cached = self
             .state
             .analysis_cache
-            .get_or_insert_with_async(cache_key, || {
+            .get_or_try_insert_with_async(cache_key, || {
                 let graph_ref = Arc::clone(&graph_ref);
                 async move {
-                    tokio::task::spawn_blocking(move || {
+                    let handle = tokio::task::spawn_blocking(move || -> AnyResult<Value> {
                         let view = traversal::requires_view(&graph_ref);
                         let dist = dijkstra(&view, from, Some(to), |_| 1usize);
                         let cost = dist.get(&to).copied();
@@ -609,13 +691,12 @@ impl ToolInstance for ShortestPathTool {
                             .into_iter()
                             .map(|n| graph_ref[n].slug.clone())
                             .collect::<Vec<_>>();
-                        json!({ "cost": cost, "path": path })
-                    })
-                    .await
-                    .unwrap()
+                        Ok(json!({ "cost": cost, "path": path }))
+                    });
+                    join_blocking_json(handle, REQUIRES_SHORTEST_PATH).await
                 }
             })
-            .await;
+            .await?;
 
         let cost = cached
             .payload
@@ -635,11 +716,32 @@ impl ToolInstance for ShortestPathTool {
             "graph requires shortest path"
         );
 
-        Ok(ToolOutput::new(json!({
-            "type": "graph_analysis",
-            "tool": REQUIRES_SHORTEST_PATH,
-            "cost": cost,
-            "path": path,
-        })))
+        respond_with_envelope(
+            REQUIRES_SHORTEST_PATH,
+            json!({
+                "type": "graph_analysis",
+                "tool": REQUIRES_SHORTEST_PATH,
+                "cost": cost,
+                "path": path,
+            }),
+            self.args.fetch_body,
+            &self.state,
+        )
+        .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn join_blocking_panics_return_execution_error() {
+        let handle = tokio::task::spawn_blocking(|| -> AnyResult<Value> {
+            panic!("boom");
+        });
+
+        let err = join_blocking_json(handle, "test_tool").await.unwrap_err();
+        assert!(matches!(err, ToolExecutionError::Execution(_)));
     }
 }
