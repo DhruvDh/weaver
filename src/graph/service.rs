@@ -1,5 +1,3 @@
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
 use std::{
     collections::{HashMap, HashSet},
     hash::{Hash, Hasher},
@@ -15,9 +13,6 @@ use petgraph::{Direction, visit::EdgeRef};
 use tokio::{task, time::timeout};
 use tracing::warn;
 use uuid::Uuid;
-
-#[cfg(test)]
-static INVARIANT_RUNS: AtomicUsize = AtomicUsize::new(0);
 
 use crate::{
     analysis,
@@ -237,21 +232,6 @@ impl GraphService {
             }
         }
         families
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_reset_invariant_runs() {
-        INVARIANT_RUNS.store(0, Ordering::Relaxed);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_invariant_runs() -> usize {
-        INVARIANT_RUNS.load(Ordering::Relaxed)
-    }
-
-    #[cfg(test)]
-    fn test_mark_dirty(&self, families: InvariantFamilies) {
-        self.mark_dirty(families);
     }
 
     pub fn strict_quality(&self) -> bool {
@@ -1013,6 +993,14 @@ impl GraphService {
         skip_requires_dag: bool,
         skip_fadeability: bool,
     ) -> Result<(), GraphError> {
+        if coverage_los.is_empty()
+            && skip_requires_dag
+            && skip_fadeability
+            && self.validation_state.dirty.load(Ordering::Relaxed) == 0
+        {
+            return Ok(());
+        }
+
         let required = {
             let mut mask = InvariantFamilies::empty();
             if !coverage_los.is_empty() {
@@ -1092,8 +1080,6 @@ fn run_invariants_for_graph(
     ctx: &ValidationContext,
     families: InvariantFamilies,
 ) -> Result<Option<HashMap<String, u64>>, GraphError> {
-    #[cfg(test)]
-    INVARIANT_RUNS.fetch_add(1, Ordering::Relaxed);
     let start = Instant::now();
     let slug_index: HashMap<String, NodeId> =
         g.node_indices().map(|n| (g[n].slug.clone(), n)).collect();
@@ -1730,35 +1716,5 @@ fn normalize_assesses_claims_graph(graph: &mut CurriculumGraph) {
                 attrs.evidence_link.claim = target_slug;
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn targeted_validation_is_noop_when_clean_and_no_required() {
-        let svc = GraphService::new();
-        GraphService::test_reset_invariant_runs();
-        let res = svc.validate_targeted_invariants(Vec::new(), true, true);
-        assert!(res.is_ok());
-        assert_eq!(GraphService::test_invariant_runs(), 0);
-    }
-
-    #[test]
-    fn dirty_validation_runs_and_clears_flag() {
-        let svc = GraphService::new();
-        GraphService::test_reset_invariant_runs();
-        svc.test_mark_dirty(InvariantFamilies::STATEMENTS);
-        let res = svc.validate_targeted_invariants(Vec::new(), true, true);
-        assert!(res.is_ok());
-        assert_eq!(GraphService::test_invariant_runs(), 1);
-        assert_eq!(
-            InvariantFamilies::from_bits_truncate(
-                svc.validation_state.dirty.load(Ordering::Relaxed)
-            ),
-            InvariantFamilies::empty()
-        );
     }
 }

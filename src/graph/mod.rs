@@ -1,3 +1,4 @@
+pub mod commands;
 pub mod manager;
 pub mod model;
 pub mod persist;

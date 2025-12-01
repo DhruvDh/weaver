@@ -9,10 +9,10 @@ use super::common::{
 };
 use crate::{
     graph::{
-        AnchorImpact, AssessesAttrs, CaseTag, IntroductionScope, KnowledgeNode, RequiresAttrs,
-        SupportsAttrs, TeachingPurpose, TeachingStepNode,
-        manager::{
-            AddAnchors, AddAssesses, AddPrecedes, AddRequires, AddSupports, RenameNode,
+        AnchorImpact, AnchorsAttrs, AssessesAttrs, CaseTag, IntroductionScope, KnowledgeNode,
+        PrecedesAttrs, RequiresAttrs, SupportsAttrs, TeachingPurpose, TeachingStepNode,
+        commands::{
+            AddAnchors, AddAssesses, AddPrecedes, AddRequires, AddSupports, RemoveNode, RenameNode,
             UpdateKnowledge, UpdateTeachingStep,
         },
     },
@@ -136,8 +136,8 @@ pub(super) fn insert_knowledge_meta() -> ToolPrototype {
     }
 }
 
-fn build_insert_knowledge(args: &InsertKnowledgeArgs) -> crate::graph::manager::InsertKnowledge {
-    crate::graph::manager::InsertKnowledge {
+fn build_insert_knowledge(args: &InsertKnowledgeArgs) -> crate::graph::commands::InsertKnowledge {
+    crate::graph::commands::InsertKnowledge {
         slug:    args.slug.clone(),
         payload: KnowledgeNode {
             title: args.title.clone(),
@@ -173,7 +173,7 @@ fn parse_insert_knowledge(raw: Value, state: &CallState) -> ToolInputResult<Box<
         },
     )?;
 
-    parse_graph_command::<InsertKnowledgeArgs, crate::graph::manager::InsertKnowledge>(
+    parse_graph_command::<InsertKnowledgeArgs, crate::graph::commands::InsertKnowledge>(
         INSERT_KNOWLEDGE,
         serde_json::to_value(&args).expect("serialize args"),
         state,
@@ -303,8 +303,8 @@ pub(super) fn insert_teaching_meta() -> ToolPrototype {
     }
 }
 
-fn build_insert_teaching(args: &InsertTeachingArgs) -> crate::graph::manager::InsertTeachingStep {
-    crate::graph::manager::InsertTeachingStep {
+fn build_insert_teaching(args: &InsertTeachingArgs) -> crate::graph::commands::InsertTeachingStep {
+    crate::graph::commands::InsertTeachingStep {
         slug:    args.slug.clone(),
         payload: TeachingStepNode {
             title:       args.title.clone(),
@@ -332,7 +332,7 @@ fn parse_insert_teaching(raw: Value, state: &CallState) -> ToolInputResult<Box<d
         },
     )?;
 
-    parse_graph_command::<InsertTeachingArgs, crate::graph::manager::InsertTeachingStep>(
+    parse_graph_command::<InsertTeachingArgs, crate::graph::commands::InsertTeachingStep>(
         INSERT_TEACHING,
         serde_json::to_value(&args).expect("serialize args"),
         state,
@@ -705,7 +705,9 @@ fn parse_add_precedes(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn 
         |args| AddPrecedes {
             from:       args.from_slug.clone(),
             to:         args.to_slug.clone(),
-            episode:    args.episode.clone(),
+            attrs:      PrecedesAttrs {
+                episode: args.episode.clone(),
+            },
             confidence: args.confidence,
         },
         |args, _| {
@@ -778,7 +780,9 @@ fn parse_add_anchors(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn T
         |args| AddAnchors {
             from:       args.from_slug.clone(),
             to:         args.to_slug.clone(),
-            impact:     args.impact,
+            attrs:      AnchorsAttrs {
+                impact: args.impact,
+            },
             confidence: args.confidence,
         },
         |args, _| {
@@ -889,7 +893,7 @@ fn parse_remove_node(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn T
         args,
         state.graph.clone(),
         state.clone(),
-        |args| crate::graph::manager::RemoveNode {
+        |args| RemoveNode {
             slug: args.slug.clone(),
         },
         |args, _| {

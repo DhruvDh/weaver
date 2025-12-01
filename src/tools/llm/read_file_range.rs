@@ -9,10 +9,10 @@ use serde_json::{Value, json};
 use tracing::info;
 
 use super::{
-    CallState, ToolExecutionError, ToolInputError, ToolInputResult, ToolInstance, ToolOutput,
-    ToolPayloadMode, ToolPrototype, apply_preview_cost, build_cost_preview, ensure_ordering,
-    estimate_tokens_from_characters, payload_size_bytes, prepare_payload_estimates,
-    render_relative_path, resolve_workspace_path, schema_for_args,
+    CallState, RenderPayloadConfig, ToolExecutionError, ToolInputError, ToolInputResult,
+    ToolInstance, ToolOutput, ToolPayloadMode, ToolPrototype, ensure_ordering,
+    prepare_payload_estimates, render_payload, render_relative_path, resolve_workspace_path,
+    schema_for_args,
 };
 use crate::{llm_gateway::GatewayMetrics, tools::filesystem};
 
@@ -124,46 +124,26 @@ impl ToolInstance for ReadFileRangeTool {
             prepare_payload_estimates(&self.metrics, self.model.as_str(), range_bytes);
         let safe_tokens = token_estimates.safe_tokens;
         let mode = ToolPayloadMode::from_fetch_flag(self.args.fetch_body);
+        let hints = vec![
+            format!("Path: {}", render_relative_path(self.workspace_root.as_ref(), &resolved)),
+            format!("Span covers {} lines ({}-{}).", line_count, range.start_line, range.end_line),
+            "Re-run read_file_range with fetch_body=true to retrieve this span.".to_string(),
+            "Narrow the start/end lines to stay within budget.".to_string(),
+        ];
 
-        match mode {
-            ToolPayloadMode::Preview => {
-                let hints = vec![
-                    format!(
-                        "Path: {}",
-                        render_relative_path(self.workspace_root.as_ref(), &resolved)
-                    ),
-                    format!(
-                        "Span covers {} lines ({}-{}).",
-                        line_count, range.start_line, range.end_line
-                    ),
-                    "Re-run read_file_range with fetch_body=true to retrieve this span."
-                        .to_string(),
-                    "Narrow the start/end lines to stay within budget.".to_string(),
-                ];
-                let mut value = build_cost_preview(IDENTIFIER, range_bytes, safe_tokens, hints);
-                let payload_bytes = payload_size_bytes(&value);
-                let preview_tokens = estimate_tokens_from_characters(payload_bytes as usize);
-                apply_preview_cost(
-                    &mut value,
-                    &self.metrics,
-                    self.model.as_str(),
-                    self.conversation_id.as_str(),
-                    preview_tokens,
-                    safe_tokens,
-                );
-                info!(
-                    mode = %mode.as_str(),
-                    depth = self.depth,
-                    preview_bytes = payload_bytes,
-                    range_bytes,
-                    start_line = range.start_line,
-                    end_line = range.end_line,
-                    "tool_call read_file_range preview",
-                );
-                Ok(ToolOutput::with_byte_hint(value, payload_bytes))
-            }
-            ToolPayloadMode::Body => {
-                let value = json!({
+        let rendered = render_payload(
+            RenderPayloadConfig {
+                mode,
+                tool: IDENTIFIER,
+                approx_bytes: range_bytes,
+                safe_tokens,
+                preview_hints: hints,
+                metrics: &self.metrics,
+                model: self.model.as_str(),
+                conversation_id: self.conversation_id.as_str(),
+            },
+            || {
+                json!({
                     "type": "data",
                     "mode": "body",
                     "path": render_relative_path(self.workspace_root.as_ref(), &range.path),
@@ -173,19 +153,35 @@ impl ToolInstance for ReadFileRangeTool {
                     "line_count": line_count,
                     "bytes": range_bytes,
                     "approx_tokens": safe_tokens,
-                });
-                let payload_bytes = payload_size_bytes(&value);
+                })
+            },
+        );
+
+        match mode {
+            ToolPayloadMode::Preview => {
                 info!(
                     mode = %mode.as_str(),
                     depth = self.depth,
-                    payload_bytes,
+                    preview_bytes = rendered.payload_bytes,
+                    range_bytes,
+                    start_line = range.start_line,
+                    end_line = range.end_line,
+                    "tool_call read_file_range preview",
+                );
+            }
+            ToolPayloadMode::Body => {
+                info!(
+                    mode = %mode.as_str(),
+                    depth = self.depth,
+                    payload_bytes = rendered.payload_bytes,
                     range_bytes,
                     start_line = range.start_line,
                     end_line = range.end_line,
                     "tool_call read_file_range body",
                 );
-                Ok(ToolOutput::with_byte_hint(value, payload_bytes))
             }
         }
+
+        Ok(rendered.output)
     }
 }

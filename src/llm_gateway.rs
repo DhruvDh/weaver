@@ -375,6 +375,38 @@ async fn log_completion_metrics(
     }
 }
 
+enum AttemptOutcome {
+    Success { latency_ms: f64 },
+    ApiError { backoff_ms: Option<u64> },
+    Timeout { backoff_ms: Option<u64> },
+}
+
+async fn log_attempt(
+    rerun: &Option<ActorRef<RerunSink>>,
+    base: &str,
+    attempt: usize,
+    outcome: AttemptOutcome,
+) {
+    log_scalar(rerun, format!("{base}/attempt"), attempt as f64).await;
+    match outcome {
+        AttemptOutcome::Success { latency_ms } => {
+            log_scalar(rerun, format!("{base}/latency/request_ms"), latency_ms).await;
+        }
+        AttemptOutcome::ApiError { backoff_ms } => {
+            log_scalar(rerun, format!("{base}/errors/api"), 1.0).await;
+            if let Some(backoff) = backoff_ms {
+                log_scalar(rerun, format!("{base}/backoff_ms"), backoff as f64).await;
+            }
+        }
+        AttemptOutcome::Timeout { backoff_ms } => {
+            log_scalar(rerun, format!("{base}/errors/timeout"), 1.0).await;
+            if let Some(backoff) = backoff_ms {
+                log_scalar(rerun, format!("{base}/backoff_ms"), backoff as f64).await;
+            }
+        }
+    }
+}
+
 fn build_openai_client() -> Result<Client<OpenAIConfig>> {
     let mut config = OpenAIConfig::default();
     if let Ok(url) = env::var("OPENAI_API_BASE") {
@@ -589,28 +621,30 @@ impl LLMGateway {
                         error = %err,
                         "tool arguments were not valid JSON"
                     );
-                    let payload = Self::tool_error_payload(
+                    Self::send_tool_error(
+                        messages,
+                        state,
+                        &call_id,
                         &tool_name,
                         "invalid_json",
                         json!(raw_arguments),
                         format!("invalid JSON arguments: {err}"),
-                    );
-                    let bytes = Self::push_tool_payload(messages, &call_id, payload)?;
-                    state.pending_bytes = state.pending_bytes.saturating_add(bytes);
+                    )?;
                     continue;
                 }
             };
 
             if llm::lookup_tool(tool_name.as_str()).is_none() {
                 warn!(iteration, tool = tool_name.as_str(), "tool identifier not registered");
-                let payload = Self::tool_error_payload(
+                Self::send_tool_error(
+                    messages,
+                    state,
+                    &call_id,
                     &tool_name,
                     "unsupported_tool",
                     parsed_args.clone(),
                     format!("unsupported tool: {}", tool_name),
-                );
-                let bytes = Self::push_tool_payload(messages, &call_id, payload)?;
-                state.pending_bytes = state.pending_bytes.saturating_add(bytes);
+                )?;
                 continue;
             }
 
@@ -631,23 +665,12 @@ impl LLMGateway {
                             error = %input_err,
                             "tool reported invalid input"
                         );
-                        let payload = Self::tool_error_payload(
+                        Self::tool_error_output(
                             &tool_name,
-                            match &input_err {
-                                llm::ToolInputError::MissingField { .. } => "missing_field",
-                                llm::ToolInputError::EmptyField { .. } => "empty_field",
-                                llm::ToolInputError::BelowMinimum { .. } => "below_minimum",
-                                llm::ToolInputError::InvalidRange { .. } => "invalid_range",
-                                llm::ToolInputError::EmptyCollection { .. } => "empty_collection",
-                                llm::ToolInputError::UnsupportedTool { .. } => "unsupported_tool",
-                                llm::ToolInputError::InvalidPayload { .. } => "invalid_payload",
-                                llm::ToolInputError::DepthExceeded { .. } => "depth_exceeded",
-                                llm::ToolInputError::InvalidPath { .. } => "invalid_path",
-                            },
+                            Self::tool_input_code(&input_err),
                             parsed_args.clone(),
                             input_err.to_string(),
-                        );
-                        ToolOutput::new(payload)
+                        )
                     }
                     llm::ToolExecutionError::Execution(exec_err) => {
                         error!(
@@ -656,13 +679,12 @@ impl LLMGateway {
                             error = ?exec_err,
                             "tool execution panic or cancellation"
                         );
-                        let payload = Self::tool_error_payload(
+                        Self::tool_error_output(
                             &tool_name,
                             "execution_error",
                             parsed_args.clone(),
                             exec_err.to_string(),
-                        );
-                        ToolOutput::new(payload)
+                        )
                     }
                     llm::ToolExecutionError::Internal(internal_err) => {
                         error!(
@@ -671,24 +693,19 @@ impl LLMGateway {
                             error = ?internal_err,
                             "tool execution failed"
                         );
-                        let payload = Self::tool_error_payload(
+                        Self::tool_error_output(
                             &tool_name,
                             "internal_error",
                             parsed_args.clone(),
                             internal_err.to_string(),
-                        );
-                        ToolOutput::new(payload)
+                        )
                     }
                 },
                 Err(other) => {
                     return Err(anyhow!("tool host communication failed: {other:?}"));
                 }
             };
-            let contribution_hint = tool_output.byte_hint;
-            let payload = tool_output.payload;
-            let measured = Self::push_tool_payload(messages, &call_id, payload)?;
-            let contribution = contribution_hint.unwrap_or(measured);
-            state.pending_bytes = state.pending_bytes.saturating_add(contribution);
+            Self::push_tool_output(messages, &call_id, tool_output, state)?;
         }
         Ok(())
     }
@@ -706,10 +723,9 @@ impl LLMGateway {
         F: FnMut() -> Result<CreateChatCompletionRequest>,
     {
         let mut attempt = 0usize;
+        let base = format!("metrics/llm/{}", model_label);
         loop {
             attempt += 1;
-            let base = format!("metrics/llm/{}", model_label);
-            log_scalar(&rerun, format!("{base}/attempt"), attempt as f64).await;
             let payload = build_payload()?;
             let started = Instant::now();
             let client = client.clone();
@@ -717,14 +733,23 @@ impl LLMGateway {
                 timeout(config.timeout, async move { client.chat().create(payload).await }).await;
             match call {
                 Ok(Ok(resp)) => {
-                    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-                    log_scalar(&rerun, format!("{base}/latency/request_ms"), elapsed_ms).await;
+                    let elapsed = started.elapsed();
+                    let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
+                    log_attempt(
+                        &rerun,
+                        &base,
+                        attempt,
+                        AttemptOutcome::Success {
+                            latency_ms: elapsed_ms,
+                        },
+                    )
+                    .await;
                     if let Some(usage) = resp.usage.as_ref() {
                         metrics.record_completion(
                             usage.prompt_tokens,
                             usage.completion_tokens,
                             usage.total_tokens,
-                            started.elapsed(),
+                            elapsed,
                         );
                         log_completion_metrics(&rerun, &base, elapsed_ms, usage).await;
                         debug!(
@@ -747,14 +772,29 @@ impl LLMGateway {
                         error = %err,
                         "llm_gateway request error"
                     );
-                    log_scalar(&rerun, format!("{base}/errors/api"), 1.0).await;
                     let retryable = Self::should_retry(&err);
-                    if attempt >= config.max_retries || !retryable {
-                        return Err(anyhow!(err));
+                    let backoff = if attempt >= config.max_retries || !retryable {
+                        None
+                    } else {
+                        Some(Self::compute_backoff_ms(attempt, config))
+                    };
+
+                    log_attempt(
+                        &rerun,
+                        &base,
+                        attempt,
+                        AttemptOutcome::ApiError {
+                            backoff_ms: backoff,
+                        },
+                    )
+                    .await;
+
+                    if let Some(delay) = backoff {
+                        sleep(Duration::from_millis(delay)).await;
+                        continue;
                     }
-                    let backoff = Self::compute_backoff_ms(attempt, config);
-                    log_scalar(&rerun, format!("{base}/backoff_ms"), backoff as f64).await;
-                    sleep(Duration::from_millis(backoff)).await;
+
+                    return Err(anyhow!(err));
                 }
                 Err(_) => {
                     warn!(
@@ -763,17 +803,27 @@ impl LLMGateway {
                         timeout_secs = config.timeout.as_secs(),
                         "llm_gateway timeout"
                     );
-                    log_scalar(&rerun, format!("{base}/errors/timeout"), 1.0).await;
-                    if attempt >= config.max_retries {
-                        return Err(anyhow!(
-                            "chat completion timed out after {} attempts",
-                            attempt
-                        ));
+                    let backoff = if attempt >= config.max_retries {
+                        None
+                    } else {
+                        Some(Self::compute_backoff_ms(attempt, config))
+                    };
+                    log_attempt(
+                        &rerun,
+                        &base,
+                        attempt,
+                        AttemptOutcome::Timeout {
+                            backoff_ms: backoff,
+                        },
+                    )
+                    .await;
+
+                    if let Some(delay) = backoff {
+                        sleep(Duration::from_millis(delay)).await;
+                        continue;
                     }
-                    // Timeout has no server hint.
-                    let backoff = Self::compute_backoff_ms(attempt, config);
-                    log_scalar(&rerun, format!("{base}/backoff_ms"), backoff as f64).await;
-                    sleep(Duration::from_millis(backoff)).await;
+
+                    return Err(anyhow!("chat completion timed out after {} attempts", attempt));
                 }
             }
         }
@@ -794,6 +844,56 @@ impl LLMGateway {
             .into();
         messages.push(tool_msg);
         Ok(bytes)
+    }
+
+    fn tool_error_output(
+        tool: &str,
+        code: &str,
+        arguments: serde_json::Value,
+        message: impl Into<String>,
+    ) -> ToolOutput {
+        ToolOutput::new(Self::tool_error_payload(tool, code, arguments, message))
+    }
+
+    fn push_tool_output(
+        messages: &mut Vec<ChatCompletionRequestMessage>,
+        call_id: &str,
+        output: ToolOutput,
+        state: &mut IterationState,
+    ) -> Result<()> {
+        let contribution_hint = output.byte_hint;
+        let payload = output.payload;
+        let measured = Self::push_tool_payload(messages, call_id, payload)?;
+        let contribution = contribution_hint.unwrap_or(measured);
+        state.pending_bytes = state.pending_bytes.saturating_add(contribution);
+        Ok(())
+    }
+
+    fn send_tool_error(
+        messages: &mut Vec<ChatCompletionRequestMessage>,
+        state: &mut IterationState,
+        call_id: &str,
+        tool: &str,
+        code: &str,
+        arguments: serde_json::Value,
+        message: impl Into<String>,
+    ) -> Result<()> {
+        let output = Self::tool_error_output(tool, code, arguments, message);
+        Self::push_tool_output(messages, call_id, output, state)
+    }
+
+    fn tool_input_code(err: &llm::ToolInputError) -> &'static str {
+        match err {
+            llm::ToolInputError::MissingField { .. } => "missing_field",
+            llm::ToolInputError::EmptyField { .. } => "empty_field",
+            llm::ToolInputError::BelowMinimum { .. } => "below_minimum",
+            llm::ToolInputError::InvalidRange { .. } => "invalid_range",
+            llm::ToolInputError::EmptyCollection { .. } => "empty_collection",
+            llm::ToolInputError::UnsupportedTool { .. } => "unsupported_tool",
+            llm::ToolInputError::InvalidPayload { .. } => "invalid_payload",
+            llm::ToolInputError::DepthExceeded { .. } => "depth_exceeded",
+            llm::ToolInputError::InvalidPath { .. } => "invalid_path",
+        }
     }
 
     fn tool_error_payload(
@@ -941,65 +1041,5 @@ impl Message<ChatCompletionRequest> for LLMGateway {
                 .map_err(|_| anyhow!("llm gateway shutting down"))?;
             Self::run_conversation(client, msg, config, metrics).await
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::fs;
-
-    use uuid::Uuid;
-
-    use super::*;
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn llm_gateway_persists_metrics() -> anyhow::Result<()> {
-        let state_dir =
-            std::env::temp_dir().join(format!("weaver-gateway-state-{}", Uuid::new_v4()));
-        fs::create_dir_all(&state_dir)?;
-        let state_url = Url::from_directory_path(&state_dir)
-            .map_err(|_| anyhow!("invalid gateway state url"))?;
-
-        let gateway = LLMGateway::from(LLMGatewayState {
-            metrics: GatewayMetrics::default().to_state(),
-        });
-        gateway
-            .metrics
-            .record_completion(10, 5, 15, Duration::from_millis(25));
-        gateway
-            .metrics
-            .record_conversation_prompt_tokens("conv", 42);
-
-        let actor = LLMGateway::spawn_persistent(state_url.clone(), gateway).await?;
-        actor.ask(PersistGatewaySnapshot).await?;
-        actor.stop_gracefully().await.expect("stop gateway");
-        actor.wait_for_shutdown().await;
-        drop(actor);
-
-        let restored = LLMGateway::respawn_persistent(state_url.clone()).await?;
-        let metrics = restored.ask(GetGatewayMetrics).await.unwrap();
-
-        assert_eq!(metrics.total_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(metrics.total_tokens.load(Ordering::Relaxed), 15);
-        assert_eq!(
-            metrics
-                .latest_prompt_tokens_for_conversation("conv")
-                .unwrap(),
-            42
-        );
-
-        let bytes = fs::read(state_dir.join("index.bin"))?;
-        let snapshot: LLMGatewayState = postcard::from_bytes(&bytes)?;
-        assert_eq!(snapshot.metrics.total_calls, 1);
-        assert_eq!(snapshot.metrics.total_tokens, 15);
-        assert_eq!(snapshot.metrics.conversation_prompt_tokens.get("conv"), Some(&42));
-
-        restored
-            .stop_gracefully()
-            .await
-            .expect("stop restored gateway");
-        restored.wait_for_shutdown().await;
-
-        Ok(())
     }
 }

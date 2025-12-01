@@ -48,6 +48,179 @@ fn log_scalar(rerun: &Option<ActorRef<RerunSink>>, path: impl Into<String>, valu
     }
 }
 
+#[derive(Debug)]
+struct PersistenceReport {
+    audit_error:   Option<anyhow::Error>,
+    persist_error: Option<anyhow::Error>,
+    save_error:    Option<anyhow::Error>,
+    gateway_error: Option<anyhow::Error>,
+    audit_ms:      f64,
+    persist_ms:    f64,
+    total_ms:      f64,
+}
+
+impl PersistenceReport {
+    fn success(&self) -> bool {
+        self.audit_error.is_none()
+            && self.persist_error.is_none()
+            && self.save_error.is_none()
+            && self.gateway_error.is_none()
+    }
+
+    fn first_error(&self) -> Option<PersistStage<'_>> {
+        if let Some(err) = self.audit_error.as_ref() {
+            return Some(PersistStage::Audit(err));
+        }
+        if let Some(err) = self.persist_error.as_ref() {
+            return Some(PersistStage::Persist(err));
+        }
+        if let Some(err) = self.save_error.as_ref() {
+            return Some(PersistStage::Save(err));
+        }
+        if let Some(err) = self.gateway_error.as_ref() {
+            return Some(PersistStage::Gateway(err));
+        }
+        None
+    }
+
+    fn log_autosave_metrics(&self, rerun: &Option<ActorRef<RerunSink>>) {
+        log_scalar(rerun, "metrics/autosave/audit_duration_ms", self.audit_ms);
+        log_scalar(
+            rerun,
+            "metrics/autosave/audit_success",
+            if self.audit_error.is_none() { 1.0 } else { 0.0 },
+        );
+        log_scalar(rerun, "metrics/autosave/duration_ms", self.total_ms);
+        log_scalar(rerun, "metrics/autosave/success", if self.success() { 1.0 } else { 0.0 });
+    }
+
+    fn log_labeled_metrics(&self, rerun: &Option<ActorRef<RerunSink>>, label: &str) {
+        log_scalar(rerun, format!("metrics/{label}/audit_ms"), self.audit_ms);
+        log_scalar(rerun, format!("metrics/{label}/persist_ms"), self.persist_ms);
+    }
+}
+
+enum PersistStage<'a> {
+    Audit(&'a anyhow::Error),
+    Persist(&'a anyhow::Error),
+    Save(&'a anyhow::Error),
+    Gateway(&'a anyhow::Error),
+}
+
+trait IntoAnyhow {
+    fn into_anyhow(self) -> anyhow::Error;
+}
+
+impl IntoAnyhow for Arc<anyhow::Error> {
+    fn into_anyhow(self) -> anyhow::Error {
+        Arc::try_unwrap(self).unwrap_or_else(|arc| anyhow::Error::msg(arc.to_string()))
+    }
+}
+
+impl IntoAnyhow for anyhow::Error {
+    fn into_anyhow(self) -> anyhow::Error {
+        self
+    }
+}
+
+fn flatten_send_error<A, E>(err: SendError<A, E>) -> anyhow::Error
+where
+    E: IntoAnyhow + std::fmt::Debug,
+{
+    match err {
+        SendError::HandlerError(e) => e.into_anyhow(),
+        other => anyhow!(format!("{other:?}")),
+    }
+}
+
+async fn run_persistence_flow(
+    graph: &ActorRef<GraphManager>,
+    gateway: Option<&ActorRef<LLMGateway>>,
+    autosave_path: &Path,
+) -> PersistenceReport {
+    let started = std::time::Instant::now();
+
+    let audit_started = std::time::Instant::now();
+    let audit_res = graph.ask(AuditInvariants).await.map_err(flatten_send_error);
+    let audit_ms = audit_started.elapsed().as_secs_f64() * 1000.0;
+    if let Err(err) = audit_res {
+        return PersistenceReport {
+            audit_error: Some(err),
+            persist_error: None,
+            save_error: None,
+            gateway_error: None,
+            audit_ms,
+            persist_ms: 0.0,
+            total_ms: started.elapsed().as_secs_f64() * 1000.0,
+        };
+    }
+
+    let persist_started = std::time::Instant::now();
+    let persist_res = graph.ask(PersistSnapshot).await.map_err(flatten_send_error);
+    if let Err(err) = persist_res {
+        let elapsed_ms = persist_started.elapsed().as_secs_f64() * 1000.0;
+        return PersistenceReport {
+            audit_error: None,
+            persist_error: Some(err),
+            save_error: None,
+            gateway_error: None,
+            audit_ms,
+            persist_ms: elapsed_ms,
+            total_ms: started.elapsed().as_secs_f64() * 1000.0,
+        };
+    }
+
+    let save_res = graph
+        .ask(SaveSnapshot {
+            path: autosave_path.to_path_buf(),
+        })
+        .await
+        .map_err(flatten_send_error);
+    if let Err(err) = save_res {
+        let elapsed_ms = persist_started.elapsed().as_secs_f64() * 1000.0;
+        return PersistenceReport {
+            audit_error: None,
+            persist_error: None,
+            save_error: Some(err),
+            gateway_error: None,
+            audit_ms,
+            persist_ms: elapsed_ms,
+            total_ms: started.elapsed().as_secs_f64() * 1000.0,
+        };
+    }
+
+    let gateway_res = if let Some(gateway) = gateway {
+        gateway
+            .ask(PersistGatewaySnapshot)
+            .await
+            .map_err(flatten_send_error)
+    } else {
+        Ok(())
+    };
+
+    let persist_ms = persist_started.elapsed().as_secs_f64() * 1000.0;
+    match gateway_res {
+        Ok(()) => PersistenceReport {
+            audit_error: None,
+            persist_error: None,
+            save_error: None,
+            gateway_error: None,
+            audit_ms,
+            persist_ms,
+            total_ms: started.elapsed().as_secs_f64() * 1000.0,
+        },
+        Err(err) => PersistenceReport {
+            audit_error: None,
+            persist_error: None,
+            save_error: None,
+            gateway_error: Some(err),
+            audit_ms,
+            persist_ms,
+            total_ms: started.elapsed().as_secs_f64() * 1000.0,
+        },
+    }
+}
+
 #[derive(Clone)]
 struct AutosaveTick;
 
@@ -102,113 +275,28 @@ impl Message<AutosaveTick> for AutosaveWorker {
         _msg: AutosaveTick,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let audit_start = std::time::Instant::now();
-        let audit: Result<(), anyhow::Error> =
-            self.graph.ask(AuditInvariants).await.map_err(|e| match e {
-                SendError::HandlerError(err) => err,
-                other => anyhow!(other),
-            });
+        let report =
+            run_persistence_flow(&self.graph, self.gateway.as_ref(), &self.autosave_path).await;
 
-        log_scalar(
-            &self.rerun,
-            "metrics/autosave/audit_duration_ms",
-            audit_start.elapsed().as_secs_f64() * 1000.0,
-        );
-        log_scalar(
-            &self.rerun,
-            "metrics/autosave/audit_success",
-            if audit.is_ok() { 1.0 } else { 0.0 },
-        );
+        report.log_autosave_metrics(&self.rerun);
 
-        if let Err(err) = audit {
-            error!(error = %err, "autosave aborted: graph audit failed");
-            return;
-        }
-
-        let start = std::time::Instant::now();
-        let persist: Result<(), anyhow::Error> =
-            self.graph.ask(PersistSnapshot).await.map_err(|e| match e {
-                SendError::HandlerError(err) => err,
-                other => anyhow!(other),
-            });
-        if let Err(err) = persist {
-            error!(error = %err, "autosave failed: graph persistence");
-            log_scalar(
-                &self.rerun,
-                "metrics/autosave/duration_ms",
-                start.elapsed().as_secs_f64() * 1000.0,
-            );
-            log_scalar(&self.rerun, "metrics/autosave/success", 0.0);
-            return;
-        }
-        let save_result: Result<(), anyhow::Error> = self
-            .graph
-            .ask(SaveSnapshot {
-                path: self.autosave_path.clone(),
-            })
-            .await
-            .map_err(|e| match e {
-                SendError::HandlerError(err) => err,
-                other => anyhow!(other),
-            });
-        if let Err(err) = save_result {
-            error!(error = %err, "autosave failed: legacy snapshot write");
-            log_scalar(
-                &self.rerun,
-                "metrics/autosave/duration_ms",
-                start.elapsed().as_secs_f64() * 1000.0,
-            );
-            log_scalar(&self.rerun, "metrics/autosave/success", 0.0);
-            return;
-        }
-        let gateway_persist: Result<(), anyhow::Error> = if let Some(gateway) = &self.gateway {
-            match gateway.ask(PersistGatewaySnapshot).await {
-                Ok(()) => Ok(()),
-                Err(SendError::HandlerError(e)) => Err(e),
-                Err(e) => Err(anyhow!(e)),
+        match report.first_error() {
+            Some(PersistStage::Audit(err)) => {
+                error!(error = %err, "autosave aborted: graph audit failed");
             }
-        } else {
-            Ok(())
-        };
-        let ok = audit.is_ok() && persist.is_ok() && gateway_persist.is_ok() && save_result.is_ok();
-
-        if let Err(err) = gateway_persist {
-            error!(error = %err, "autosave failed: gateway persistence");
-            log_scalar(
-                &self.rerun,
-                "metrics/autosave/duration_ms",
-                start.elapsed().as_secs_f64() * 1000.0,
-            );
-            log_scalar(&self.rerun, "metrics/autosave/success", 0.0);
-            return;
+            Some(PersistStage::Persist(err)) => {
+                error!(error = %err, "autosave failed: graph persistence");
+            }
+            Some(PersistStage::Save(err)) => {
+                error!(error = %err, "autosave failed: legacy snapshot write");
+            }
+            Some(PersistStage::Gateway(err)) => {
+                error!(error = %err, "autosave failed: gateway persistence");
+            }
+            None => {
+                debug!("graph autosave completed");
+            }
         }
-
-        if ok {
-            debug!("graph autosave completed");
-        } else {
-            error!(
-                audit_error = audit.as_ref().err().map(|e: &anyhow::Error| e.to_string()),
-                persist_error = persist
-                    .as_ref()
-                    .err()
-                    .map(|e: &anyhow::Error| e.to_string()),
-                save_error = save_result
-                    .as_ref()
-                    .err()
-                    .map(|e: &anyhow::Error| e.to_string()),
-                gateway_error = gateway_persist
-                    .as_ref()
-                    .err()
-                    .map(|e: &anyhow::Error| e.to_string()),
-                "graph autosave failed"
-            );
-        }
-        log_scalar(
-            &self.rerun,
-            "metrics/autosave/duration_ms",
-            start.elapsed().as_secs_f64() * 1000.0,
-        );
-        log_scalar(&self.rerun, "metrics/autosave/success", if ok { 1.0 } else { 0.0 });
     }
 }
 
@@ -396,43 +484,25 @@ async fn persist_once(
     autosave_path: &Path,
     label: &str,
 ) -> Result<()> {
-    let audit_start = std::time::Instant::now();
-    let audit = graph.ask(AuditInvariants).await;
-    log_scalar(
-        rerun,
-        format!("metrics/{label}/audit_ms"),
-        audit_start.elapsed().as_secs_f64() * 1000.0,
-    );
+    let report = run_persistence_flow(graph, Some(gateway), autosave_path).await;
 
-    let persist_start = std::time::Instant::now();
-    let persist_result = graph.ask(PersistSnapshot).await;
-    let save_result = graph
-        .ask(SaveSnapshot {
-            path: autosave_path.to_path_buf(),
-        })
-        .await;
-    let gateway_result = gateway.ask(PersistGatewaySnapshot).await;
-    log_scalar(
-        rerun,
-        format!("metrics/{label}/persist_ms"),
-        persist_start.elapsed().as_secs_f64() * 1000.0,
-    );
+    report.log_labeled_metrics(rerun, label);
 
-    if let Err(err) = audit {
+    if let Some(err) = report.audit_error {
         warn!(label = label, error = %err, "graph invariant audit failed during persistence");
-        return Err(err.into());
+        return Err(err);
     }
-    if let Err(err) = persist_result {
+    if let Some(err) = report.persist_error {
         warn!(label = label, error = %err, "failed to persist graph state");
-        return Err(err.into());
+        return Err(err);
     }
-    if let Err(err) = save_result {
+    if let Some(err) = report.save_error {
         warn!(label = label, error = %err, "failed to write legacy snapshot");
-        return Err(err.into());
+        return Err(err);
     }
-    if let Err(err) = gateway_result {
+    if let Some(err) = report.gateway_error {
         warn!(label = label, error = %err, "failed to persist gateway state");
-        return Err(err.into());
+        return Err(err);
     }
 
     info!(label = label, "persisted graph and gateway state");
@@ -443,6 +513,7 @@ async fn reconcile_course_commit(
     graph_actor: &ActorRef<GraphManager>,
     desired: Option<String>,
     strict_quality: bool,
+    validation_timeout_ms: u64,
 ) -> Result<String> {
     let current_commit = graph_actor
         .ask(GetCourseCommit)
@@ -467,6 +538,7 @@ async fn reconcile_course_commit(
         .ask(ApplyRuntimeConfig {
             course_commit: target_commit.clone(),
             strict_quality,
+            validation_timeout_ms,
         })
         .await
     {
@@ -483,6 +555,7 @@ async fn reconcile_course_commit(
                     .ask(ApplyRuntimeConfig {
                         course_commit: current_commit.clone(),
                         strict_quality,
+                        validation_timeout_ms,
                     })
                     .await
                     .map_err(|e| anyhow!(e))?;
@@ -716,6 +789,7 @@ pub async fn run_app(cli: Cli, runtime: RuntimeOptions) -> Result<()> {
         &graph_actor,
         desired_course_commit.clone(),
         cli.graph_strict_quality,
+        graph_config.validation_timeout_ms,
     )
     .await?;
     debug!(course_commit = %resolved_commit, "runtime course_commit resolved");

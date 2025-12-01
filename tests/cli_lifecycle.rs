@@ -8,7 +8,7 @@ use futures::FutureExt;
 use uuid::Uuid;
 use weaver::{
     app::{Cli, GatewayMode, RerunMode, RuntimeOptions, run_app},
-    graph::{IntroductionScope, manager::InsertKnowledge, model::KnowledgeNode, persist},
+    graph::{IntroductionScope, commands::InsertKnowledge, model::KnowledgeNode, persist},
     schema::types::{KnowledgeType, SourceRef},
 };
 

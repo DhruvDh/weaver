@@ -222,6 +222,26 @@ where
     build(input)
 }
 
+/// Parse args and build a ToolInstance in one step, using a preparatory
+/// transform/validation on Args.
+pub(crate) fn parse_with<Args, Prep, Build, Inst>(
+    tool: &'static str,
+    raw: Value,
+    state: &CallState,
+    prep: Prep,
+    build: Build,
+) -> ToolInputResult<Box<dyn ToolInstance>>
+where
+    Args: for<'de> Deserialize<'de>,
+    Prep: FnOnce(Args) -> ToolInputResult<Args>,
+    Build: FnOnce(Args, &CallState) -> ToolInputResult<Inst>,
+    Inst: ToolInstance + 'static,
+{
+    let args = parse_args_with_builder(tool, raw, prep)?;
+    let instance = build(args, state)?;
+    Ok(Box::new(instance))
+}
+
 pub(crate) fn default_confidence() -> f32 {
     1.0
 }
@@ -249,7 +269,7 @@ pub(crate) async fn resolve_slug(
     tool: &'static str,
 ) -> Result<crate::graph::NodeId, ToolExecutionError> {
     graph
-        .ask(crate::graph::manager::ResolveSlug { slug })
+        .ask(crate::graph::commands::ResolveSlug { slug })
         .await
         .map_err(|e| map_send_err(e, tool))
 }
@@ -261,7 +281,7 @@ pub(crate) async fn resolve_slugs(
     tool: &'static str,
 ) -> Result<Vec<crate::graph::NodeId>, ToolExecutionError> {
     graph
-        .ask(crate::graph::manager::ResolveSlugs { slugs })
+        .ask(crate::graph::commands::ResolveSlugs { slugs })
         .await
         .map_err(|e| map_send_err(e, tool))
 }

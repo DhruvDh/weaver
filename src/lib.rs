@@ -7,4 +7,4 @@ pub mod llm_gateway;
 pub mod rerun_sink;
 pub mod schema;
 pub mod tools;
-pub use graph::{manager, manager::Neighbor};
+pub use graph::{commands::Neighbor, manager};

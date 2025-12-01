@@ -9,10 +9,9 @@ use serde_json::{Value, json};
 use tracing::info;
 
 use super::{
-    CallState, ToolExecutionError, ToolInputError, ToolInputResult, ToolInstance, ToolOutput,
-    ToolPayloadMode, ToolPrototype, apply_preview_cost, build_cost_preview,
-    estimate_tokens_from_characters, payload_size_bytes, prepare_payload_estimates,
-    render_relative_path, resolve_workspace_path, schema_for_args, trim_optional,
+    CallState, RenderPayloadConfig, ToolExecutionError, ToolInputError, ToolInputResult,
+    ToolInstance, ToolOutput, ToolPayloadMode, ToolPrototype, prepare_payload_estimates,
+    render_payload, render_relative_path, resolve_workspace_path, schema_for_args, trim_optional,
 };
 use crate::{
     llm_gateway::GatewayMetrics,
@@ -157,57 +156,38 @@ impl ToolInstance for SearchTextTool {
         let safe_tokens = token_estimates.safe_tokens;
         let truncated = result.truncated;
 
-        match mode {
-            ToolPayloadMode::Preview => {
-                let mut hints = vec![
-                    format!(
-                        "{match_count} matches across roughly {approx_bytes} bytes of context."
-                    ),
-                    if truncated {
-                        format!(
-                            "Preview truncated at {} matches or {} bytes; set fetch_body=true to \
-                             stream more or narrow the pattern.",
-                            max_matches, max_bytes
-                        )
-                    } else {
-                        "Set fetch_body=true to retrieve all matches.".to_string()
-                    },
-                    format!("Pattern: `{}`", self.args.pattern),
-                    format!(
-                        "Scope: {}",
-                        render_relative_path(self.workspace_root.as_ref(), &scope)
-                    ),
-                    "Refine the regex or narrow the path to reduce match volume.".to_string(),
-                ];
-                if !self.args.allow.is_empty() {
-                    hints.push(format!("Allowing directories: {}", self.args.allow.join(", ")));
-                }
-                let mut value = build_cost_preview(IDENTIFIER, approx_bytes, safe_tokens, hints);
-                let payload_bytes = payload_size_bytes(&value);
-                let preview_tokens = estimate_tokens_from_characters(payload_bytes as usize);
-                apply_preview_cost(
-                    &mut value,
-                    &self.metrics,
-                    self.model.as_str(),
-                    self.conversation_id.as_str(),
-                    preview_tokens,
-                    safe_tokens,
-                );
-                info!(
-                    mode = %mode.as_str(),
-                    depth = self.depth,
-                    preview_bytes = payload_bytes,
-                    approx_bytes,
-                    scope = %scope.display(),
-                    pattern = %self.args.pattern,
-                    match_count,
-                    truncated,
-                    "tool_call search_text preview",
-                );
-                Ok(ToolOutput::with_byte_hint(value, payload_bytes))
-            }
-            ToolPayloadMode::Body => {
-                let rendered = result
+        let mut hints = vec![
+            format!("{match_count} matches across roughly {approx_bytes} bytes of context."),
+            if truncated {
+                format!(
+                    "Preview truncated at {} matches or {} bytes; set fetch_body=true to stream \
+                     more or narrow the pattern.",
+                    max_matches, max_bytes
+                )
+            } else {
+                "Set fetch_body=true to retrieve all matches.".to_string()
+            },
+            format!("Pattern: `{}`", self.args.pattern),
+            format!("Scope: {}", render_relative_path(self.workspace_root.as_ref(), &scope)),
+            "Refine the regex or narrow the path to reduce match volume.".to_string(),
+        ];
+        if !self.args.allow.is_empty() {
+            hints.push(format!("Allowing directories: {}", self.args.allow.join(", ")));
+        }
+
+        let rendered = render_payload(
+            RenderPayloadConfig {
+                mode,
+                tool: IDENTIFIER,
+                approx_bytes,
+                safe_tokens,
+                preview_hints: hints,
+                metrics: &self.metrics,
+                model: self.model.as_str(),
+                conversation_id: self.conversation_id.as_str(),
+            },
+            || {
+                let matches = result
                     .matches
                     .into_iter()
                     .map(|m| {
@@ -219,7 +199,7 @@ impl ToolInstance for SearchTextTool {
                     })
                     .collect::<Vec<_>>();
 
-                let payload = json!({
+                json!({
                     "type": "data",
                     "mode": "body",
                     "pattern": &self.args.pattern,
@@ -227,15 +207,32 @@ impl ToolInstance for SearchTextTool {
                     "match_count": match_count,
                     "truncated": truncated,
                     "caps": { "max_matches": max_matches, "max_bytes": max_bytes },
-                    "matches": rendered,
+                    "matches": matches,
                     "bytes": approx_bytes,
                     "approx_tokens": safe_tokens,
-                });
-                let payload_bytes = payload_size_bytes(&payload);
+                })
+            },
+        );
+
+        match mode {
+            ToolPayloadMode::Preview => {
                 info!(
                     mode = %mode.as_str(),
                     depth = self.depth,
-                    payload_bytes,
+                    preview_bytes = rendered.payload_bytes,
+                    approx_bytes,
+                    scope = %scope.display(),
+                    pattern = %self.args.pattern,
+                    match_count,
+                    truncated,
+                    "tool_call search_text preview",
+                );
+            }
+            ToolPayloadMode::Body => {
+                info!(
+                    mode = %mode.as_str(),
+                    depth = self.depth,
+                    payload_bytes = rendered.payload_bytes,
                     approx_bytes,
                     scope = %scope.display(),
                     pattern = %self.args.pattern,
@@ -243,8 +240,9 @@ impl ToolInstance for SearchTextTool {
                     truncated,
                     "tool_call search_text body",
                 );
-                Ok(ToolOutput::with_byte_hint(payload, payload_bytes))
             }
         }
+
+        Ok(rendered.output)
     }
 }

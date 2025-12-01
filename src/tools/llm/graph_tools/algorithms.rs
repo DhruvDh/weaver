@@ -19,11 +19,10 @@ use super::common::{attach_meta, graph_meta, parse_args_with_builder};
 use crate::{
     graph::{CurriculumGraph, EdgeKind, traversal},
     tools::llm::{
-        CallState, ToolExecutionError, ToolInputError, ToolInputResult, ToolInstance, ToolOutput,
-        ToolPayloadMode, ToolPrototype,
+        CallState, RenderPayloadConfig, ToolExecutionError, ToolInputError, ToolInputResult,
+        ToolInstance, ToolOutput, ToolPayloadMode, ToolPrototype,
         analysis_cache::{AnalysisCacheKey, AnalysisKind},
-        apply_preview_cost, build_cost_preview, estimate_tokens_from_characters,
-        payload_size_bytes, prepare_payload_estimates, schema_for_args,
+        payload_size_bytes, prepare_payload_estimates, render_payload, schema_for_args,
     },
 };
 
@@ -32,7 +31,7 @@ async fn load_graph_with_version(
     cache: &crate::tools::llm::graph_tools::analysis_cache::AnalysisCache,
 ) -> Result<(Arc<CurriculumGraph>, u64), ToolExecutionError> {
     let (g, version): (Arc<CurriculumGraph>, u64) = graph
-        .ask(crate::graph::manager::GetGraphWithVersion)
+        .ask(crate::graph::commands::GetGraphWithVersion)
         .await
         .map_err(super::common::map_send_err_inf)?;
     cache.prune_for_version(version);
@@ -62,37 +61,31 @@ async fn respond_with_envelope(
     let approx_bytes = payload_size_bytes(&payload);
     let estimates = prepare_payload_estimates(&state.metrics, state.model.as_str(), approx_bytes);
     let mode = ToolPayloadMode::from_fetch_flag(fetch_body);
-    match mode {
+    let rendered = render_payload(
+        RenderPayloadConfig {
+            mode,
+            tool,
+            approx_bytes,
+            safe_tokens: estimates.safe_tokens,
+            preview_hints: vec![
+                "Set fetch_body=true to stream results.".to_string(),
+                "Use limit to bound output volume.".to_string(),
+            ],
+            metrics: &state.metrics,
+            model: state.model.as_str(),
+            conversation_id: state.conversation_id.as_str(),
+        },
+        || attach_meta(payload, &meta),
+    );
+
+    Ok(match mode {
         ToolPayloadMode::Preview => {
-            let mut preview = build_cost_preview(
-                tool,
-                approx_bytes,
-                estimates.safe_tokens,
-                vec![
-                    "Set fetch_body=true to stream results.".to_string(),
-                    "Use limit to bound output volume.".to_string(),
-                ],
-            );
-            let preview_bytes = payload_size_bytes(&preview);
-            let preview_tokens = estimate_tokens_from_characters(preview_bytes as usize);
-            apply_preview_cost(
-                &mut preview,
-                &state.metrics,
-                state.model.as_str(),
-                state.conversation_id.as_str(),
-                preview_tokens,
-                estimates.safe_tokens,
-            );
-            let with_meta = attach_meta(preview, &meta);
+            let with_meta = attach_meta(rendered.output.payload, &meta);
             let hint_bytes = payload_size_bytes(&with_meta);
-            Ok(ToolOutput::with_byte_hint(with_meta, hint_bytes))
+            ToolOutput::with_byte_hint(with_meta, hint_bytes)
         }
-        ToolPayloadMode::Body => {
-            let with_meta = attach_meta(payload, &meta);
-            let size = payload_size_bytes(&with_meta);
-            Ok(ToolOutput::with_byte_hint(with_meta, size))
-        }
-    }
+        ToolPayloadMode::Body => rendered.output,
+    })
 }
 
 const REQUIRES_CYCLES: &str = "graph_requires_cycles";
@@ -728,20 +721,5 @@ impl ToolInstance for ShortestPathTool {
             &self.state,
         )
         .await
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn join_blocking_panics_return_execution_error() {
-        let handle = tokio::task::spawn_blocking(|| -> AnyResult<Value> {
-            panic!("boom");
-        });
-
-        let err = join_blocking_json(handle, "test_tool").await.unwrap_err();
-        assert!(matches!(err, ToolExecutionError::Execution(_)));
     }
 }

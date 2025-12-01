@@ -6,14 +6,14 @@
 
 - `src/main.rs` wires CLI, scheduler, graph manager, LLM gateway, autosave, rerun.
 - Modules: `graph/`, `analysis/`, `schema/`, `tools/llm/`, `constants.rs`, `llm_gateway.rs`.
-- Tests: `tests/analysis_unit.rs`, `tests/analysis_props.rs`. References: `docs/graph_tools.md`, `white_paper.md`, `graph_snapshot.json`, `uncc_cs2-pretext-project/`.
+- Tests: `tests/analysis_unit.rs`, `tests/analysis_props.rs` (all tests and test harnesses live under `tests/`). References: `docs/graph_tools.md`, `white_paper.md`, `graph_snapshot.json`, `uncc_cs2-pretext-project/`.
 - Target toolchain: nightly (see `rust-toolchain.toml`).
 
 ## Build, Test, and Development Commands
 
-- `cargo fmt` — format per `rustfmt.toml`.
-- `cargo clippy --all-targets` — lint; fail on warnings.
-- `cargo test` — unit + property tests; `PROPTEST_CASES=128` for sweeps.
+- `cargo fmt` — format per `rustfmt.toml` (run every time).
+- `cargo clippy --all-targets` — lint; fail on warnings (run every time).
+- `cargo test` — unit + property tests; `PROPTEST_CASES=128` for sweeps (run every time).
 - `cargo test --all --locked` — includes the CLI lifecycle integration (`cli_lifecycle`) that covers autosave clamping and `--skip-demo`.
 - `cargo run -- <workspace-root>` — launch FileReader + graph pipeline (default `uncc_cs2-pretext-project/`).
 - Config is CLI-only (no GRAPH_* env fallback). Key flags:

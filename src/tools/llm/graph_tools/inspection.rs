@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 use super::common::{map_send_err, paginate, parse_args_with_builder};
 use crate::{
-    graph::{NodeKind, manager::EdgeKindFilter},
+    graph::{NodeKind, commands::EdgeKindFilter},
     tools::llm::{
         CallState, ToolExecutionError, ToolInputResult, ToolInstance, ToolOutput, ToolPrototype,
         payload_size_bytes, require_string, schema_for_args,
@@ -83,7 +83,7 @@ struct NeighborsTool {
 #[async_trait]
 impl ToolInstance for NeighborsTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        use crate::graph::manager::{NeighborDirection, Neighbors};
+        use crate::graph::commands::{NeighborDirection, Neighbors};
 
         let direction = match self.args.direction {
             Some(NeighborDirectionArg::Incoming) => Some(NeighborDirection::Incoming),
@@ -185,7 +185,7 @@ impl ToolInstance for GetNodeTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
         let payload = self
             .graph
-            .ask(crate::graph::manager::GetNode {
+            .ask(crate::graph::commands::GetNode {
                 slug: self.args.slug.clone(),
             })
             .await

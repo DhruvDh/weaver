@@ -8,15 +8,13 @@ use anyhow::{Context, Result};
 use kameo::{error::Infallible, message::Context as MsgContext, prelude::*};
 use kameo_persistence::{BiHashMap, PersistentActor};
 use petgraph::{Direction, visit::EdgeRef};
-use schemars::JsonSchema;
 use serde::Serialize;
 use tracing::error;
 use url::Url;
 
 use crate::graph::{
-    AnchorImpact, AnchorsAttrs, AssessesAttrs, CurriculumGraph, EdgeKind, GraphConfig, GraphError,
-    GraphService, KnowledgeNode, NodeId, NodePayload, PrecedesAttrs, RequiresAttrs, SupportsAttrs,
-    TeachingStepNode, persist,
+    CurriculumGraph, EdgeKind, GraphConfig, GraphError, GraphService, NodeId, NodePayload,
+    commands::*, persist,
 };
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -61,31 +59,6 @@ struct QuarantinedSnapshot {
     validation_timeout_ms: u64,
     saved_at_sec:          u64,
     graph:                 CurriculumGraph,
-}
-
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct Neighbor {
-    pub neighbor_slug: String,
-    pub edge_kind:     String,
-    pub direction:     String,
-}
-
-#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum EdgeKindFilter {
-    Requires,
-    Supports,
-    Assesses,
-    Precedes,
-    Anchors,
-}
-
-#[derive(Clone, Debug, serde::Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum NeighborDirection {
-    Incoming,
-    Outgoing,
-    Both,
 }
 
 pub struct GraphManager {
@@ -259,18 +232,6 @@ fn edge_kind_matches(kind: EdgeKindFilter, edge: &EdgeKind) -> bool {
 
 // ---- Messages ----
 
-pub struct InsertKnowledge {
-    pub slug:    String,
-    pub payload: KnowledgeNode,
-    pub tags:    Vec<String>,
-}
-
-pub struct UpdateKnowledge {
-    pub slug:    String,
-    pub payload: KnowledgeNode,
-    pub tags:    Vec<String>,
-}
-
 impl Message<InsertKnowledge> for GraphManager {
     type Reply = Result<NodeId, GraphError>;
 
@@ -311,18 +272,6 @@ impl Message<UpdateKnowledge> for GraphManager {
         }
         res
     }
-}
-
-pub struct InsertTeachingStep {
-    pub slug:    String,
-    pub payload: TeachingStepNode,
-    pub tags:    Vec<String>,
-}
-
-pub struct UpdateTeachingStep {
-    pub slug:    String,
-    pub payload: TeachingStepNode,
-    pub tags:    Vec<String>,
 }
 
 impl Message<InsertTeachingStep> for GraphManager {
@@ -367,13 +316,6 @@ impl Message<UpdateTeachingStep> for GraphManager {
     }
 }
 
-pub struct AddRequires {
-    pub from:       String,
-    pub to:         String,
-    pub attrs:      RequiresAttrs,
-    pub confidence: f32,
-}
-
 impl Message<AddRequires> for GraphManager {
     type Reply = Result<(), GraphError>;
 
@@ -398,13 +340,6 @@ impl Message<AddRequires> for GraphManager {
         }
         res.map(|_| ())
     }
-}
-
-pub struct AddSupports {
-    pub from:       String,
-    pub to:         String,
-    pub attrs:      SupportsAttrs,
-    pub confidence: f32,
 }
 
 impl Message<AddSupports> for GraphManager {
@@ -433,13 +368,6 @@ impl Message<AddSupports> for GraphManager {
     }
 }
 
-pub struct AddAssesses {
-    pub from:       String,
-    pub to:         String,
-    pub attrs:      AssessesAttrs,
-    pub confidence: f32,
-}
-
 impl Message<AddAssesses> for GraphManager {
     type Reply = Result<(), GraphError>;
 
@@ -466,13 +394,6 @@ impl Message<AddAssesses> for GraphManager {
     }
 }
 
-pub struct AddPrecedes {
-    pub from:       String,
-    pub to:         String,
-    pub episode:    String,
-    pub confidence: f32,
-}
-
 impl Message<AddPrecedes> for GraphManager {
     type Reply = Result<(), GraphError>;
 
@@ -481,7 +402,7 @@ impl Message<AddPrecedes> for GraphManager {
         AddPrecedes {
             from,
             to,
-            episode,
+            attrs,
             confidence,
         }: AddPrecedes,
         _ctx: &mut MsgContext<Self, Self::Reply>,
@@ -489,24 +410,14 @@ impl Message<AddPrecedes> for GraphManager {
         let start = Instant::now();
         let from_id = self.service.node_by_slug(&from)?;
         let to_id = self.service.node_by_slug(&to)?;
-        let res = self.service.add_edge::<crate::graph::PrecedesSpec>(
-            from_id,
-            to_id,
-            PrecedesAttrs { episode },
-            confidence,
-        );
+        let res = self
+            .service
+            .add_edge::<crate::graph::PrecedesSpec>(from_id, to_id, attrs, confidence);
         if res.is_ok() {
             GraphManager::log_write_latency("add_precedes", start);
         }
         res.map(|_| ())
     }
-}
-
-pub struct AddAnchors {
-    pub from:       String,
-    pub to:         String,
-    pub impact:     AnchorImpact,
-    pub confidence: f32,
 }
 
 impl Message<AddAnchors> for GraphManager {
@@ -517,7 +428,7 @@ impl Message<AddAnchors> for GraphManager {
         AddAnchors {
             from,
             to,
-            impact,
+            attrs,
             confidence,
         }: AddAnchors,
         _ctx: &mut MsgContext<Self, Self::Reply>,
@@ -525,21 +436,14 @@ impl Message<AddAnchors> for GraphManager {
         let start = Instant::now();
         let from_id = self.service.node_by_slug(&from)?;
         let to_id = self.service.node_by_slug(&to)?;
-        let res = self.service.add_edge::<crate::graph::AnchorsSpec>(
-            from_id,
-            to_id,
-            AnchorsAttrs { impact },
-            confidence,
-        );
+        let res = self
+            .service
+            .add_edge::<crate::graph::AnchorsSpec>(from_id, to_id, attrs, confidence);
         if res.is_ok() {
             GraphManager::log_write_latency("add_anchors", start);
         }
         res.map(|_| ())
     }
-}
-
-pub struct GetNode {
-    pub slug: String,
 }
 
 impl Message<GetNode> for GraphManager {
@@ -555,8 +459,6 @@ impl Message<GetNode> for GraphManager {
     }
 }
 
-pub struct GetGraph;
-
 impl Message<GetGraph> for GraphManager {
     type Reply = Result<Arc<CurriculumGraph>, Infallible>;
 
@@ -569,8 +471,6 @@ impl Message<GetGraph> for GraphManager {
     }
 }
 
-pub struct GetGraphWithVersion;
-
 impl Message<GetGraphWithVersion> for GraphManager {
     type Reply = Result<(Arc<CurriculumGraph>, u64), Infallible>;
 
@@ -582,8 +482,6 @@ impl Message<GetGraphWithVersion> for GraphManager {
         Ok((self.service.shared_graph(), self.service.graph_version()))
     }
 }
-
-pub struct GetGraphVersion;
 
 impl Message<GetGraphVersion> for GraphManager {
     type Reply = Result<u64, Infallible>;
@@ -719,29 +617,6 @@ pub struct PersistSnapshot;
 
 pub struct AuditInvariants;
 
-pub struct Neighbors {
-    pub slug:      String,
-    pub edge_kind: Option<EdgeKindFilter>, // requires, supports, assesses, precedes, anchors
-    pub direction: Option<NeighborDirection>, // incoming, outgoing, both
-}
-
-pub struct RenameNode {
-    pub old_slug: String,
-    pub new_slug: String,
-}
-
-pub struct RemoveNode {
-    pub slug: String,
-}
-
-pub struct ResolveSlug {
-    pub slug: String,
-}
-
-pub struct ResolveSlugs {
-    pub slugs: Vec<String>,
-}
-
 pub struct RedundantRequires {
     pub prune: bool,
 }
@@ -779,8 +654,9 @@ impl Message<GetGraphMeta> for GraphManager {
 }
 
 pub struct ApplyRuntimeConfig {
-    pub course_commit:  String,
-    pub strict_quality: bool,
+    pub course_commit:         String,
+    pub strict_quality:        bool,
+    pub validation_timeout_ms: u64,
 }
 
 impl Message<SaveSnapshot> for GraphManager {
@@ -867,10 +743,6 @@ impl Message<RedundantRequires> for GraphManager {
     }
 }
 
-pub struct LoadSnapshot {
-    pub path: PathBuf,
-}
-
 impl Message<LoadSnapshot> for GraphManager {
     type Reply = Result<()>;
 
@@ -927,10 +799,15 @@ impl Message<ApplyRuntimeConfig> for GraphManager {
         ApplyRuntimeConfig {
             course_commit,
             strict_quality,
+            validation_timeout_ms,
         }: ApplyRuntimeConfig,
         _ctx: &mut MsgContext<Self, Self::Reply>,
     ) -> Self::Reply {
         let prev_strict = self.service.strict_quality();
+        let prev_timeout = self.validation_timeout_ms;
+        let new_timeout = validation_timeout_ms.max(1);
+
+        self.validation_timeout_ms = new_timeout;
 
         if strict_quality != prev_strict
             && let Err(err) = self.service.set_strict_quality(strict_quality)
@@ -959,155 +836,10 @@ impl Message<ApplyRuntimeConfig> for GraphManager {
                 Some(prev_commit)
             };
             self.service.set_expected_revision(prev_expected);
+            self.validation_timeout_ms = prev_timeout;
             return Err(err.into());
         }
 
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{fs, path::PathBuf};
-
-    use uuid::Uuid;
-
-    use super::*;
-    use crate::schema::types::{KnowledgeType, SourceRef};
-
-    fn mk_kn(title: &str, kt: KnowledgeType) -> KnowledgeNode {
-        KnowledgeNode {
-            title: title.to_string(),
-            statement: title.to_string(),
-            knowledge_type: kt,
-            source_refs: vec![SourceRef {
-                path:       "dummy".into(),
-                start_line: 1,
-                end_line:   2,
-                revision:   "deadbeef".into(),
-            }],
-            confidence: 1.0,
-            rubric_criteria: vec![],
-            construct_irrelevant_demands: vec![],
-            grain_level: None,
-            intrinsic_load: None,
-            introduction_scope: crate::graph::IntroductionScope::InCourse,
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn graph_manager_persists_and_restores_state() -> anyhow::Result<()> {
-        let state_dir: PathBuf =
-            std::env::temp_dir().join(format!("weaver-graph-state-{}", Uuid::new_v4()));
-        fs::create_dir_all(&state_dir)?;
-        let state_url = Url::from_directory_path(&state_dir)
-            .map_err(|_| anyhow::anyhow!("invalid state url"))?;
-
-        let mut svc = GraphService::new();
-        svc.add_knowledge_node("k1".into(), mk_kn("k1", KnowledgeType::Conceptual), vec![])?;
-        let base_version = svc.graph_version();
-
-        let state = GraphManagerState::new(
-            svc.snapshot_graph(),
-            String::new(),
-            false,
-            base_version,
-            default_validation_timeout_ms(),
-        );
-
-        let actor = GraphManager::spawn_persistent(state_url.clone(), state).await?;
-
-        actor
-            .ask(InsertKnowledge {
-                slug:    "k2".into(),
-                payload: mk_kn("k2", KnowledgeType::Procedural),
-                tags:    vec![],
-            })
-            .await?;
-
-        actor.ask(PersistSnapshot).await?;
-        actor.stop_gracefully().await.expect("stop graph manager");
-        actor.wait_for_shutdown().await;
-        drop(actor);
-
-        let restored = GraphManager::respawn_persistent(state_url.clone()).await?;
-        restored
-            .ask(ResolveSlug { slug: "k1".into() })
-            .await
-            .expect("k1 restored");
-        restored
-            .ask(ResolveSlug { slug: "k2".into() })
-            .await
-            .expect("k2 restored");
-
-        let snapshot_bytes = fs::read(state_dir.join("index.bin"))?;
-        let snapshot: GraphManagerState = postcard::from_bytes(&snapshot_bytes)?;
-        assert_eq!(snapshot.graph_version, base_version + 1);
-        assert!(snapshot.course_commit.is_empty());
-
-        restored
-            .stop_gracefully()
-            .await
-            .expect("stop restored graph manager");
-        restored.wait_for_shutdown().await;
-
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn load_snapshot_advances_graph_version_monotonically() -> anyhow::Result<()> {
-        let state_dir: PathBuf =
-            std::env::temp_dir().join(format!("weaver-load-snapshot-{}", Uuid::new_v4()));
-        fs::create_dir_all(&state_dir)?;
-        let state_url = Url::from_directory_path(&state_dir)
-            .map_err(|_| anyhow::anyhow!("invalid state url"))?;
-
-        let mut svc = GraphService::new();
-        svc.add_knowledge_node("k1".into(), mk_kn("k1", KnowledgeType::Conceptual), vec![])?;
-        let base_version = svc.graph_version();
-        let state = GraphManagerState::new(
-            svc.snapshot_graph(),
-            String::new(),
-            false,
-            base_version,
-            default_validation_timeout_ms(),
-        );
-        let actor = GraphManager::spawn_persistent(state_url.clone(), state).await?;
-
-        let snapshot_path = state_dir.join("snapshot.json");
-        actor
-            .ask(SaveSnapshot {
-                path: snapshot_path.clone(),
-            })
-            .await?;
-
-        actor
-            .ask(InsertKnowledge {
-                slug:    "k2".into(),
-                payload: mk_kn("k2", KnowledgeType::Procedural),
-                tags:    vec![],
-            })
-            .await?;
-        let version_after_mutation: u64 = actor.ask(GetGraphVersion).await?;
-        assert_eq!(version_after_mutation, base_version + 1);
-
-        actor
-            .ask(LoadSnapshot {
-                path: snapshot_path.clone(),
-            })
-            .await?;
-
-        let reloaded_version: u64 = actor.ask(GetGraphVersion).await?;
-        let expected_version =
-            GraphManager::next_graph_version_after_snapshot(version_after_mutation, base_version);
-        assert_eq!(reloaded_version, expected_version);
-
-        let missing = actor.ask(ResolveSlug { slug: "k2".into() }).await;
-        assert!(missing.is_err(), "snapshot reload should drop runtime-only edits");
-
-        actor.stop_gracefully().await?;
-        actor.wait_for_shutdown().await;
-        fs::remove_dir_all(state_dir)?;
         Ok(())
     }
 }

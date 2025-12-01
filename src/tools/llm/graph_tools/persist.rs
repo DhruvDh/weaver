@@ -14,7 +14,7 @@ use super::common::{
     MaybeApply, map_send_err_anyhow, parse_args_with_builder, parse_graph_command,
 };
 use crate::{
-    graph::manager::{LoadSnapshot, SaveSnapshot},
+    graph::{commands::LoadSnapshot, manager::SaveSnapshot},
     tools::llm::{
         CallState, ToolExecutionError, ToolInputError, ToolPrototype, require_string,
         schema_for_args,
