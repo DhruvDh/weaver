@@ -1,12 +1,12 @@
+use std::{pin::Pin, sync::Arc};
+
 use bon::Builder;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::json;
 use tracing::info;
 
-use super::common::{
-    GraphCommandTool, MaybeApply, default_confidence, map_send_err, parse_graph_command,
-};
+use super::common::{MaybeApply, default_confidence, map_send_err};
 use crate::{
     graph::{
         AnchorImpact, AnchorsAttrs, AssessesAttrs, CaseTag, IntroductionScope, KnowledgeNode,
@@ -21,7 +21,11 @@ use crate::{
         SupportKind,
     },
     tools::llm::{
-        CallState, ToolInputResult, ToolInstance, ToolPrototype, require_string, schema_for_args,
+        CallState, ToolInputResult, ToolPrototype,
+        common::{
+            AnyKnowledge, AssessmentItem, LearningOutcome, Slug, TeachingStep, resolve_typed,
+        },
+        require_string,
     },
 };
 
@@ -123,19 +127,6 @@ impl MaybeApply for InsertKnowledgeArgs {
     }
 }
 
-pub(super) fn insert_knowledge_meta() -> ToolPrototype {
-    ToolPrototype {
-        id:          INSERT_KNOWLEDGE,
-        description: "Insert a new mid-grain Knowledge node \
-                      (factual/conceptual/procedural/metacognitive/LO/assessment). Use for a \
-                      single assessable idea (Assessable Atom) with stable slug, statement, \
-                      Bloom-based knowledge_type, grain level, introduction scope, \
-                      rubric/construct-irrelevant fields, and source_refs.",
-        schema:      schema_for_args::<InsertKnowledgeArgs>(),
-        parse:       parse_insert_knowledge,
-    }
-}
-
 fn build_insert_knowledge(args: &InsertKnowledgeArgs) -> crate::graph::commands::InsertKnowledge {
     crate::graph::commands::InsertKnowledge {
         slug:    args.slug.clone(),
@@ -161,8 +152,16 @@ fn build_insert_knowledge(args: &InsertKnowledgeArgs) -> crate::graph::commands:
     }
 }
 
-fn parse_insert_knowledge(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let args = super::common::parse_args_with_builder(
+crate::graph_action_tool!(
+    insert_knowledge_meta,
+    id: INSERT_KNOWLEDGE,
+    description: "Insert a new mid-grain Knowledge node \
+                  (factual/conceptual/procedural/metacognitive/LO/assessment). Use for a single \
+                  assessable idea (Assessable Atom) with stable slug, statement, Bloom-based \
+                  knowledge_type, grain level, introduction scope, rubric/construct-irrelevant \
+                  fields, and source_refs.",
+    args: InsertKnowledgeArgs,
+    prepare: |raw| super::common::parse_args_with_builder(
         INSERT_KNOWLEDGE,
         raw,
         |mut input: InsertKnowledgeArgs| {
@@ -171,34 +170,23 @@ fn parse_insert_knowledge(raw: Value, state: &CallState) -> ToolInputResult<Box<
             input.statement = require_string(input.statement, INSERT_KNOWLEDGE, "statement")?;
             Ok(input)
         },
-    )?;
+    ),
+    build: |args: &InsertKnowledgeArgs| build_insert_knowledge(args),
+    ok: |args: &InsertKnowledgeArgs, _| {
+        info!(tool = INSERT_KNOWLEDGE, slug = %args.slug, "graph insert knowledge");
+        command_ok(INSERT_KNOWLEDGE, json!({"slug": args.slug}))
+    },
+    map_err: |e| map_send_err(e, INSERT_KNOWLEDGE)
+);
 
-    parse_graph_command::<InsertKnowledgeArgs, crate::graph::commands::InsertKnowledge>(
-        INSERT_KNOWLEDGE,
-        serde_json::to_value(&args).expect("serialize args"),
-        state,
-        build_insert_knowledge,
-        |args, _| {
-            info!(tool = INSERT_KNOWLEDGE, slug = %args.slug, "graph insert knowledge");
-            command_ok(INSERT_KNOWLEDGE, json!({"slug": args.slug}))
-        },
-        |e| map_send_err(e, INSERT_KNOWLEDGE),
-    )
-}
-
-pub(super) fn update_knowledge_meta() -> ToolPrototype {
-    ToolPrototype {
-        id:          UPDATE_KNOWLEDGE,
-        description: "Update an existing Knowledge node in place (statement/metadata/tags) \
-                      without changing its identity. Use to refine wording, rubric metadata, \
-                      load/grain/scope—not for splitting/merging concepts.",
-        schema:      schema_for_args::<InsertKnowledgeArgs>(),
-        parse:       parse_update_knowledge,
-    }
-}
-
-fn parse_update_knowledge(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let args = super::common::parse_args_with_builder(
+crate::graph_action_tool!(
+    update_knowledge_meta,
+    id: UPDATE_KNOWLEDGE,
+    description: "Update an existing Knowledge node in place (statement/metadata/tags) without \
+                  changing its identity. Use to refine wording, rubric metadata, \
+                  load/grain/scope—not for splitting/merging concepts.",
+    args: InsertKnowledgeArgs,
+    prepare: |raw| super::common::parse_args_with_builder(
         UPDATE_KNOWLEDGE,
         raw,
         |mut input: InsertKnowledgeArgs| {
@@ -207,24 +195,18 @@ fn parse_update_knowledge(raw: Value, state: &CallState) -> ToolInputResult<Box<
             input.statement = require_string(input.statement, UPDATE_KNOWLEDGE, "statement")?;
             Ok(input)
         },
-    )?;
-
-    parse_graph_command::<InsertKnowledgeArgs, UpdateKnowledge>(
-        UPDATE_KNOWLEDGE,
-        serde_json::to_value(&args).expect("serialize args"),
-        state,
-        |args| UpdateKnowledge {
-            slug:    args.slug.clone(),
-            payload: build_insert_knowledge(args).payload,
-            tags:    args.tags.clone(),
-        },
-        |args, _| {
-            info!(tool = UPDATE_KNOWLEDGE, slug = %args.slug, "graph update knowledge");
-            command_ok(UPDATE_KNOWLEDGE, json!({"slug": args.slug}))
-        },
-        |e| map_send_err(e, UPDATE_KNOWLEDGE),
-    )
-}
+    ),
+    build: |args: &InsertKnowledgeArgs| UpdateKnowledge {
+        slug:    args.slug.clone(),
+        payload: build_insert_knowledge(args).payload,
+        tags:    args.tags.clone(),
+    },
+    ok: |args: &InsertKnowledgeArgs, _| {
+        info!(tool = UPDATE_KNOWLEDGE, slug = %args.slug, "graph update knowledge");
+        command_ok(UPDATE_KNOWLEDGE, json!({"slug": args.slug}))
+    },
+    map_err: |e| map_send_err(e, UPDATE_KNOWLEDGE)
+);
 
 // ---------- Insert / update teaching step ----------
 
@@ -291,18 +273,6 @@ impl MaybeApply for InsertTeachingArgs {
     }
 }
 
-pub(super) fn insert_teaching_meta() -> ToolPrototype {
-    ToolPrototype {
-        id:          INSERT_TEACHING,
-        description: "Insert a TeachingStep in the discourse layer for a specific episode. A \
-                      TeachingStep is an atomic narrative step with purpose \
-                      (setup/idea/use/consolidate) and method_tags that will be ordered by \
-                      precedes and anchored to knowledge/LOs/assessments.",
-        schema:      schema_for_args::<InsertTeachingArgs>(),
-        parse:       parse_insert_teaching,
-    }
-}
-
 fn build_insert_teaching(args: &InsertTeachingArgs) -> crate::graph::commands::InsertTeachingStep {
     crate::graph::commands::InsertTeachingStep {
         slug:    args.slug.clone(),
@@ -319,8 +289,15 @@ fn build_insert_teaching(args: &InsertTeachingArgs) -> crate::graph::commands::I
     }
 }
 
-fn parse_insert_teaching(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let args = super::common::parse_args_with_builder(
+crate::graph_action_tool!(
+    insert_teaching_meta,
+    id: INSERT_TEACHING,
+    description: "Insert a TeachingStep in the discourse layer for a specific episode. A \
+                  TeachingStep is an atomic narrative step with purpose \
+                  (setup/idea/use/consolidate) and method_tags that will be ordered by precedes \
+                  and anchored to knowledge/LOs/assessments.",
+    args: InsertTeachingArgs,
+    prepare: |raw| super::common::parse_args_with_builder(
         INSERT_TEACHING,
         raw,
         |mut input: InsertTeachingArgs| {
@@ -330,33 +307,22 @@ fn parse_insert_teaching(raw: Value, state: &CallState) -> ToolInputResult<Box<d
             input.episode = require_string(input.episode, INSERT_TEACHING, "episode")?;
             Ok(input)
         },
-    )?;
+    ),
+    build: |args: &InsertTeachingArgs| build_insert_teaching(args),
+    ok: |args: &InsertTeachingArgs, _| {
+        info!(tool = INSERT_TEACHING, slug = %args.slug, "graph insert teaching_step");
+        command_ok(INSERT_TEACHING, json!({"slug": args.slug}))
+    },
+    map_err: |e| map_send_err(e, INSERT_TEACHING)
+);
 
-    parse_graph_command::<InsertTeachingArgs, crate::graph::commands::InsertTeachingStep>(
-        INSERT_TEACHING,
-        serde_json::to_value(&args).expect("serialize args"),
-        state,
-        build_insert_teaching,
-        |args, _| {
-            info!(tool = INSERT_TEACHING, slug = %args.slug, "graph insert teaching_step");
-            command_ok(INSERT_TEACHING, json!({"slug": args.slug}))
-        },
-        |e| map_send_err(e, INSERT_TEACHING),
-    )
-}
-
-pub(super) fn update_teaching_meta() -> ToolPrototype {
-    ToolPrototype {
-        id:          UPDATE_TEACHING,
-        description: "Update an existing TeachingStep (statement, purpose, method_tags, episode) \
-                      while preserving its identity and discourse links.",
-        schema:      schema_for_args::<InsertTeachingArgs>(),
-        parse:       parse_update_teaching,
-    }
-}
-
-fn parse_update_teaching(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let args = super::common::parse_args_with_builder(
+crate::graph_action_tool!(
+    update_teaching_meta,
+    id: UPDATE_TEACHING,
+    description: "Update an existing TeachingStep (statement, purpose, method_tags, episode) \
+                  while preserving its identity and discourse links.",
+    args: InsertTeachingArgs,
+    prepare: |raw| super::common::parse_args_with_builder(
         UPDATE_TEACHING,
         raw,
         |mut input: InsertTeachingArgs| {
@@ -366,24 +332,18 @@ fn parse_update_teaching(raw: Value, state: &CallState) -> ToolInputResult<Box<d
             input.episode = require_string(input.episode, UPDATE_TEACHING, "episode")?;
             Ok(input)
         },
-    )?;
-
-    parse_graph_command::<InsertTeachingArgs, UpdateTeachingStep>(
-        UPDATE_TEACHING,
-        serde_json::to_value(&args).expect("serialize args"),
-        state,
-        |args| UpdateTeachingStep {
-            slug:    args.slug.clone(),
-            payload: build_insert_teaching(args).payload,
-            tags:    args.tags.clone(),
-        },
-        |args, _| {
-            info!(tool = UPDATE_TEACHING, slug = %args.slug, "graph update teaching_step");
-            command_ok(UPDATE_TEACHING, json!({"slug": args.slug}))
-        },
-        |e| map_send_err(e, UPDATE_TEACHING),
-    )
-}
+    ),
+    build: |args: &InsertTeachingArgs| UpdateTeachingStep {
+        slug:    args.slug.clone(),
+        payload: build_insert_teaching(args).payload,
+        tags:    args.tags.clone(),
+    },
+    ok: |args: &InsertTeachingArgs, _| {
+        info!(tool = UPDATE_TEACHING, slug = %args.slug, "graph update teaching_step");
+        command_ok(UPDATE_TEACHING, json!({"slug": args.slug}))
+    },
+    map_err: |e| map_send_err(e, UPDATE_TEACHING)
+);
 
 // ---------- Edge tools ----------
 
@@ -431,46 +391,56 @@ impl MaybeApply for AddRequiresArgs {
     }
 }
 
-pub(super) fn add_requires_meta() -> ToolPrototype {
-    ToolPrototype {
-        id:          ADD_REQUIRES,
-        description: "Add a requires edge (prerequisite) between knowledge nodes (cycle-checked; \
-                      follows the Knowledge DAG).",
-        schema:      schema_for_args::<AddRequiresArgs>(),
-        parse:       parse_add_requires,
-    }
-}
-
-fn parse_add_requires(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let args =
-        super::common::parse_args_with_builder(ADD_REQUIRES, raw, |mut input: AddRequiresArgs| {
+crate::graph_action_tool!(
+    add_requires_meta,
+    id: ADD_REQUIRES,
+    description: "Add a requires edge (prerequisite) between knowledge nodes (cycle-checked; \
+                  follows the Knowledge DAG).",
+    args: AddRequiresArgs,
+    prepare: |raw| super::common::parse_args_with_builder(
+        ADD_REQUIRES,
+        raw,
+        |mut input: AddRequiresArgs| {
             input.from_slug = require_string(input.from_slug, ADD_REQUIRES, "from_slug")?;
             input.to_slug = require_string(input.to_slug, ADD_REQUIRES, "to_slug")?;
             input.rationale = require_string(input.rationale, ADD_REQUIRES, "rationale")?;
             Ok(input)
-        })?;
-
-    parse_graph_command::<AddRequiresArgs, AddRequires>(
-        ADD_REQUIRES,
-        serde_json::to_value(&args).expect("serialize args"),
-        state,
-        |args| AddRequires {
-            from:       args.from_slug.clone(),
-            to:         args.to_slug.clone(),
-            attrs:      RequiresAttrs {
-                strength:      args.strength,
-                rationale:     args.rationale.clone(),
-                evidence_refs: args.evidence_refs.clone(),
-            },
-            confidence: args.confidence,
         },
-        |args, _| {
-            info!(tool = ADD_REQUIRES, from = %args.from_slug, to = %args.to_slug, "graph add requires");
-            command_ok(ADD_REQUIRES, json!({"from": args.from_slug, "to": args.to_slug}))
+    ),
+    build: |args: &AddRequiresArgs| AddRequires {
+        from:       args.from_slug.clone(),
+        to:         args.to_slug.clone(),
+        attrs:      RequiresAttrs {
+            strength:      args.strength,
+            rationale:     args.rationale.clone(),
+            evidence_refs: args.evidence_refs.clone(),
         },
-        |e| map_send_err(e, ADD_REQUIRES),
-    )
-}
+        confidence: args.confidence,
+    },
+    ok: |args: &AddRequiresArgs, _| {
+        info!(tool = ADD_REQUIRES, from = %args.from_slug, to = %args.to_slug, "graph add requires");
+        command_ok(ADD_REQUIRES, json!({"from": args.from_slug, "to": args.to_slug}))
+    },
+    map_err: |e| map_send_err(e, ADD_REQUIRES),
+    preflight: Some(Arc::new(
+        |args: &AddRequiresArgs, state: &CallState| -> Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<(), crate::tools::llm::ToolExecutionError>
+                    > + Send,
+            >,
+        > {
+            let from = args.from_slug.clone();
+            let to = args.to_slug.clone();
+            let graph = state.graph.clone();
+            Box::pin(async move {
+                resolve_typed::<AnyKnowledge>(&graph, Slug::new(from), ADD_REQUIRES).await?;
+                resolve_typed::<AnyKnowledge>(&graph, Slug::new(to), ADD_REQUIRES).await?;
+                Ok(())
+            })
+        },
+    ))
+);
 
 #[derive(Debug, Clone, Builder, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -522,49 +492,59 @@ impl MaybeApply for AddSupportsArgs {
     }
 }
 
-pub(super) fn add_supports_meta() -> ToolPrototype {
-    ToolPrototype {
-        id:          ADD_SUPPORTS,
-        description: "Add a supports edge (worked example / analogy / counterexample / \
-                      misconception fix / strategy hint / rubric note) from one knowledge node to \
-                      another knowledge/LO. Supports are scaffolds (Cognitive Load Theory) and \
-                      must remain fadeable.",
-        schema:      schema_for_args::<AddSupportsArgs>(),
-        parse:       parse_add_supports,
-    }
-}
-
-fn parse_add_supports(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let args =
-        super::common::parse_args_with_builder(ADD_SUPPORTS, raw, |mut input: AddSupportsArgs| {
+crate::graph_action_tool!(
+    add_supports_meta,
+    id: ADD_SUPPORTS,
+    description: "Add a supports edge (worked example / analogy / counterexample / misconception \
+                  fix / strategy hint / rubric note) from one knowledge node to another \
+                  knowledge/LO. Supports are scaffolds (Cognitive Load Theory) and must remain \
+                  fadeable.",
+    args: AddSupportsArgs,
+    prepare: |raw| super::common::parse_args_with_builder(
+        ADD_SUPPORTS,
+        raw,
+        |mut input: AddSupportsArgs| {
             input.from_slug = require_string(input.from_slug, ADD_SUPPORTS, "from_slug")?;
             input.to_slug = require_string(input.to_slug, ADD_SUPPORTS, "to_slug")?;
             Ok(input)
-        })?;
-
-    parse_graph_command::<AddSupportsArgs, AddSupports>(
-        ADD_SUPPORTS,
-        serde_json::to_value(&args).expect("serialize args"),
-        state,
-        |args| AddSupports {
-            from:       args.from_slug.clone(),
-            to:         args.to_slug.clone(),
-            attrs:      SupportsAttrs {
-                support_kind:    args.support_kind,
-                intended_effect: args.intended_effect,
-                case_tag:        args.case_tag,
-                coverage_tags:   args.coverage_tags.clone(),
-                evidence_refs:   args.evidence_refs.clone(),
-            },
-            confidence: args.confidence,
         },
-        |args, _| {
-            info!(tool = ADD_SUPPORTS, from = %args.from_slug, to = %args.to_slug, "graph add supports");
-            command_ok(ADD_SUPPORTS, json!({"from": args.from_slug, "to": args.to_slug}))
+    ),
+    build: |args: &AddSupportsArgs| AddSupports {
+        from:       args.from_slug.clone(),
+        to:         args.to_slug.clone(),
+        attrs:      SupportsAttrs {
+            support_kind:    args.support_kind,
+            intended_effect: args.intended_effect,
+            case_tag:        args.case_tag,
+            coverage_tags:   args.coverage_tags.clone(),
+            evidence_refs:   args.evidence_refs.clone(),
         },
-        |e| map_send_err(e, ADD_SUPPORTS),
-    )
-}
+        confidence: args.confidence,
+    },
+    ok: |args: &AddSupportsArgs, _| {
+        info!(tool = ADD_SUPPORTS, from = %args.from_slug, to = %args.to_slug, "graph add supports");
+        command_ok(ADD_SUPPORTS, json!({"from": args.from_slug, "to": args.to_slug}))
+    },
+    map_err: |e| map_send_err(e, ADD_SUPPORTS),
+    preflight: Some(Arc::new(
+        |args: &AddSupportsArgs, state: &CallState| -> Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<(), crate::tools::llm::ToolExecutionError>
+                    > + Send,
+            >,
+        > {
+            let from = args.from_slug.clone();
+            let to = args.to_slug.clone();
+            let graph = state.graph.clone();
+            Box::pin(async move {
+                resolve_typed::<AnyKnowledge>(&graph, Slug::new(from), ADD_SUPPORTS).await?;
+                resolve_typed::<AnyKnowledge>(&graph, Slug::new(to), ADD_SUPPORTS).await?;
+                Ok(())
+            })
+        },
+    ))
+);
 
 #[derive(Debug, Clone, Builder, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -603,47 +583,57 @@ impl MaybeApply for AddAssessesArgs {
     }
 }
 
-pub(super) fn add_assesses_meta() -> ToolPrototype {
-    ToolPrototype {
-        id:          ADD_ASSESSES,
-        description: "Add an assesses edge (assessment_item -> learning_outcome). Claim is set to \
-                      the target LO slug automatically.",
-        schema:      schema_for_args::<AddAssessesArgs>(),
-        parse:       parse_add_assesses,
-    }
-}
-
-fn parse_add_assesses(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let args =
-        super::common::parse_args_with_builder(ADD_ASSESSES, raw, |mut input: AddAssessesArgs| {
+crate::graph_action_tool!(
+    add_assesses_meta,
+    id: ADD_ASSESSES,
+    description: "Add an assesses edge (assessment_item -> learning_outcome). Claim is set to the \
+                  target LO slug automatically.",
+    args: AddAssessesArgs,
+    prepare: |raw| super::common::parse_args_with_builder(
+        ADD_ASSESSES,
+        raw,
+        |mut input: AddAssessesArgs| {
             input.from_slug = require_string(input.from_slug, ADD_ASSESSES, "from_slug")?;
             input.to_slug = require_string(input.to_slug, ADD_ASSESSES, "to_slug")?;
             Ok(input)
-        })?;
-
-    parse_graph_command::<AddAssessesArgs, AddAssesses>(
-        ADD_ASSESSES,
-        serde_json::to_value(&args).expect("serialize args"),
-        state,
-        |args| AddAssesses {
-            from:       args.from_slug.clone(),
-            to:         args.to_slug.clone(),
-            attrs:      AssessesAttrs {
-                evidence_link: EvidenceLink {
-                    claim:                args.to_slug.clone(),
-                    observation_features: args.observation_features.clone(),
-                    scope:                args.scope,
-                },
+        },
+    ),
+    build: |args: &AddAssessesArgs| AddAssesses {
+        from:       args.from_slug.clone(),
+        to:         args.to_slug.clone(),
+        attrs:      AssessesAttrs {
+            evidence_link: EvidenceLink {
+                claim:                args.to_slug.clone(),
+                observation_features: args.observation_features.clone(),
+                scope:                args.scope,
             },
-            confidence: args.confidence,
         },
-        |args, _| {
-            info!(tool = ADD_ASSESSES, from = %args.from_slug, to = %args.to_slug, "graph add assesses");
-            command_ok(ADD_ASSESSES, json!({"from": args.from_slug, "to": args.to_slug}))
+        confidence: args.confidence,
+    },
+    ok: |args: &AddAssessesArgs, _| {
+        info!(tool = ADD_ASSESSES, from = %args.from_slug, to = %args.to_slug, "graph add assesses");
+        command_ok(ADD_ASSESSES, json!({"from": args.from_slug, "to": args.to_slug}))
+    },
+    map_err: |e| map_send_err(e, ADD_ASSESSES),
+    preflight: Some(Arc::new(
+        |args: &AddAssessesArgs, state: &CallState| -> Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<(), crate::tools::llm::ToolExecutionError>
+                    > + Send,
+            >,
+        > {
+            let from = args.from_slug.clone();
+            let to = args.to_slug.clone();
+            let graph = state.graph.clone();
+            Box::pin(async move {
+                resolve_typed::<AssessmentItem>(&graph, Slug::new(from), ADD_ASSESSES).await?;
+                resolve_typed::<LearningOutcome>(&graph, Slug::new(to), ADD_ASSESSES).await?;
+                Ok(())
+            })
         },
-        |e| map_send_err(e, ADD_ASSESSES),
-    )
-}
+    ))
+);
 
 #[derive(Debug, Clone, Builder, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -679,47 +669,57 @@ impl MaybeApply for AddPrecedesArgs {
     }
 }
 
-pub(super) fn add_precedes_meta() -> ToolPrototype {
-    ToolPrototype {
-        id:          ADD_PRECEDES,
-        description: "Add a precedes edge between TeachingSteps in the same episode (acyclic). \
-                      Captures authored narrative order, not logical prerequisite.",
-        schema:      schema_for_args::<AddPrecedesArgs>(),
-        parse:       parse_add_precedes,
-    }
-}
-
-fn parse_add_precedes(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let args =
-        super::common::parse_args_with_builder(ADD_PRECEDES, raw, |mut input: AddPrecedesArgs| {
+crate::graph_action_tool!(
+    add_precedes_meta,
+    id: ADD_PRECEDES,
+    description: "Add a precedes edge between TeachingSteps in the same episode (acyclic). \
+                  Captures authored narrative order, not logical prerequisite.",
+    args: AddPrecedesArgs,
+    prepare: |raw| super::common::parse_args_with_builder(
+        ADD_PRECEDES,
+        raw,
+        |mut input: AddPrecedesArgs| {
             input.from_slug = require_string(input.from_slug, ADD_PRECEDES, "from_slug")?;
             input.to_slug = require_string(input.to_slug, ADD_PRECEDES, "to_slug")?;
             input.episode = require_string(input.episode, ADD_PRECEDES, "episode")?;
             Ok(input)
-        })?;
-
-    parse_graph_command::<AddPrecedesArgs, AddPrecedes>(
-        ADD_PRECEDES,
-        serde_json::to_value(&args).expect("serialize args"),
-        state,
-        |args| AddPrecedes {
-            from:       args.from_slug.clone(),
-            to:         args.to_slug.clone(),
-            attrs:      PrecedesAttrs {
-                episode: args.episode.clone(),
-            },
-            confidence: args.confidence,
         },
-        |args, _| {
-            info!(tool = ADD_PRECEDES, from = %args.from_slug, to = %args.to_slug, "graph add precedes");
-            command_ok(
-                ADD_PRECEDES,
-                json!({"from": args.from_slug, "to": args.to_slug, "episode": args.episode}),
-            )
+    ),
+    build: |args: &AddPrecedesArgs| AddPrecedes {
+        from:       args.from_slug.clone(),
+        to:         args.to_slug.clone(),
+        attrs:      PrecedesAttrs {
+            episode: args.episode.clone(),
         },
-        |e| map_send_err(e, ADD_PRECEDES),
-    )
-}
+        confidence: args.confidence,
+    },
+    ok: |args: &AddPrecedesArgs, _| {
+        info!(tool = ADD_PRECEDES, from = %args.from_slug, to = %args.to_slug, "graph add precedes");
+        command_ok(
+            ADD_PRECEDES,
+            json!({"from": args.from_slug, "to": args.to_slug, "episode": args.episode}),
+        )
+    },
+    map_err: |e| map_send_err(e, ADD_PRECEDES),
+    preflight: Some(Arc::new(
+        |args: &AddPrecedesArgs, state: &CallState| -> Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<(), crate::tools::llm::ToolExecutionError>
+                    > + Send,
+            >,
+        > {
+            let from = args.from_slug.clone();
+            let to = args.to_slug.clone();
+            let graph = state.graph.clone();
+            Box::pin(async move {
+                resolve_typed::<TeachingStep>(&graph, Slug::new(from), ADD_PRECEDES).await?;
+                resolve_typed::<TeachingStep>(&graph, Slug::new(to), ADD_PRECEDES).await?;
+                Ok(())
+            })
+        },
+    ))
+);
 
 #[derive(Debug, Clone, Builder, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -753,55 +753,65 @@ impl MaybeApply for AddAnchorsArgs {
     }
 }
 
-pub(super) fn add_anchors_meta() -> ToolPrototype {
-    ToolPrototype {
-        id:          ADD_ANCHORS,
-        description: "Add an anchors edge from a TeachingStep to knowledge/LO/assessment with a \
-                      specific impact: introduce/refine (instructional knowledge), target (LO), \
-                      use/motivate (any; assessment targets must use). Enforces discourse \
-                      impact/target rules.",
-        schema:      schema_for_args::<AddAnchorsArgs>(),
-        parse:       parse_add_anchors,
-    }
-}
-
-fn parse_add_anchors(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let args =
-        super::common::parse_args_with_builder(ADD_ANCHORS, raw, |mut input: AddAnchorsArgs| {
+crate::graph_action_tool!(
+    add_anchors_meta,
+    id: ADD_ANCHORS,
+    description: "Add an anchors edge from a TeachingStep to knowledge/LO/assessment with a \
+                  specific impact: introduce/refine (instructional knowledge), target (LO), \
+                  use/motivate (any; assessment targets must use). Enforces discourse \
+                  impact/target rules.",
+    args: AddAnchorsArgs,
+    prepare: |raw| super::common::parse_args_with_builder(
+        ADD_ANCHORS,
+        raw,
+        |mut input: AddAnchorsArgs| {
             input.from_slug = require_string(input.from_slug, ADD_ANCHORS, "from_slug")?;
             input.to_slug = require_string(input.to_slug, ADD_ANCHORS, "to_slug")?;
             Ok(input)
-        })?;
-
-    parse_graph_command::<AddAnchorsArgs, AddAnchors>(
-        ADD_ANCHORS,
-        serde_json::to_value(&args).expect("serialize args"),
-        state,
-        |args| AddAnchors {
-            from:       args.from_slug.clone(),
-            to:         args.to_slug.clone(),
-            attrs:      AnchorsAttrs {
-                impact: args.impact,
-            },
-            confidence: args.confidence,
         },
-        |args, _| {
-            info!(tool = ADD_ANCHORS, from = %args.from_slug, to = %args.to_slug, "graph add anchors");
-            command_ok(
-                ADD_ANCHORS,
-                json!({"from": args.from_slug, "to": args.to_slug, "impact": args.impact}),
-            )
+    ),
+    build: |args: &AddAnchorsArgs| AddAnchors {
+        from:       args.from_slug.clone(),
+        to:         args.to_slug.clone(),
+        attrs:      AnchorsAttrs {
+            impact: args.impact,
         },
-        |e| map_send_err(e, ADD_ANCHORS),
-    )
-}
+        confidence: args.confidence,
+    },
+    ok: |args: &AddAnchorsArgs, _| {
+        info!(tool = ADD_ANCHORS, from = %args.from_slug, to = %args.to_slug, "graph add anchors");
+        command_ok(
+            ADD_ANCHORS,
+            json!({"from": args.from_slug, "to": args.to_slug, "impact": args.impact}),
+        )
+    },
+    map_err: |e| map_send_err(e, ADD_ANCHORS),
+    preflight: Some(Arc::new(
+        |args: &AddAnchorsArgs, state: &CallState| -> Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<(), crate::tools::llm::ToolExecutionError>
+                    > + Send,
+            >,
+        > {
+            let from = args.from_slug.clone();
+            let to = args.to_slug.clone();
+            let graph = state.graph.clone();
+            Box::pin(async move {
+                resolve_typed::<TeachingStep>(&graph, Slug::new(from), ADD_ANCHORS).await?;
+                resolve_typed::<AnyKnowledge>(&graph, Slug::new(to), ADD_ANCHORS).await?;
+                Ok(())
+            })
+        },
+    ))
+);
 
 // ---------- Rename / remove ----------
 
 const RENAME_NODE: &str = "graph_rename_node";
 const REMOVE_NODE: &str = "graph_remove_node";
 
-#[derive(Debug, Clone, Builder, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Builder, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RenameNodeArgs {
     #[builder(with = |v: String| -> ToolInputResult<_> {
@@ -823,39 +833,27 @@ impl MaybeApply for RenameNodeArgs {
     }
 }
 
-pub(super) fn rename_node_meta() -> ToolPrototype {
-    ToolPrototype {
-        id:          RENAME_NODE,
-        description: "Rename a node slug and update assesses.claim if needed.",
-        schema:      schema_for_args::<RenameNodeArgs>(),
-        parse:       parse_rename_node,
-    }
-}
+crate::graph_action_tool!(
+    rename_node_meta,
+    id: RENAME_NODE,
+    description: "Rename a node slug and update assesses.claim if needed.",
+    args: RenameNodeArgs,
+    prepare: |raw| super::common::parse_args_with_builder(RENAME_NODE, raw, |mut input: RenameNodeArgs| {
+        input.old_slug = require_string(input.old_slug, RENAME_NODE, "old_slug")?;
+        input.new_slug = require_string(input.new_slug, RENAME_NODE, "new_slug")?;
+        Ok(input)
+    }),
+    build: |args: &RenameNodeArgs| RenameNode {
+        old_slug: args.old_slug.clone(),
+        new_slug: args.new_slug.clone(),
+    },
+    ok: |args: &RenameNodeArgs, _| {
+        command_ok(RENAME_NODE, json!({"old_slug": args.old_slug, "new_slug": args.new_slug}))
+    },
+    map_err: |e| map_send_err(e, RENAME_NODE)
+);
 
-fn parse_rename_node(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let args =
-        super::common::parse_args_with_builder(RENAME_NODE, raw, |mut input: RenameNodeArgs| {
-            input.old_slug = require_string(input.old_slug, RENAME_NODE, "old_slug")?;
-            input.new_slug = require_string(input.new_slug, RENAME_NODE, "new_slug")?;
-            Ok(input)
-        })?;
-    Ok(Box::new(GraphCommandTool::new(
-        args,
-        state.graph.clone(),
-        state.clone(),
-        |args| RenameNode {
-            old_slug: args.old_slug.clone(),
-            new_slug: args.new_slug.clone(),
-        },
-        |args, _| {
-            command_ok(RENAME_NODE, json!({"old_slug": args.old_slug, "new_slug": args.new_slug}))
-        },
-        |e| map_send_err(e, RENAME_NODE),
-        RENAME_NODE,
-    )))
-}
-
-#[derive(Debug, Clone, Builder, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Builder, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RemoveNodeArgs {
     #[builder(with = |v: String| -> ToolInputResult<_> {
@@ -873,37 +871,28 @@ impl MaybeApply for RemoveNodeArgs {
     }
 }
 
-pub(super) fn remove_node_meta() -> ToolPrototype {
-    ToolPrototype {
-        id:          REMOVE_NODE,
-        description: "Delete a node and all connected edges.",
-        schema:      schema_for_args::<RemoveNodeArgs>(),
-        parse:       parse_remove_node,
-    }
-}
-
-fn parse_remove_node(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let args =
-        super::common::parse_args_with_builder(REMOVE_NODE, raw, |mut input: RemoveNodeArgs| {
+crate::graph_action_tool!(
+    remove_node_meta,
+    id: REMOVE_NODE,
+    description: "Delete a node and all connected edges.",
+    args: RemoveNodeArgs,
+    prepare: |raw| super::common::parse_args_with_builder(
+        REMOVE_NODE,
+        raw,
+        |mut input: RemoveNodeArgs| {
             input.slug = require_string(input.slug, REMOVE_NODE, "slug")?;
             Ok(input)
-        })?;
-
-    Ok(Box::new(GraphCommandTool::new(
-        args,
-        state.graph.clone(),
-        state.clone(),
-        |args| RemoveNode {
-            slug: args.slug.clone(),
         },
-        |args, _| {
-            info!(tool = REMOVE_NODE, slug = %args.slug, "graph remove node");
-            command_ok(REMOVE_NODE, json!({"slug": args.slug}))
-        },
-        |e| map_send_err(e, REMOVE_NODE),
-        REMOVE_NODE,
-    )))
-}
+    ),
+    build: |args: &RemoveNodeArgs| RemoveNode {
+        slug: args.slug.clone(),
+    },
+    ok: |args: &RemoveNodeArgs, _| {
+        info!(tool = REMOVE_NODE, slug = %args.slug, "graph remove node");
+        command_ok(REMOVE_NODE, json!({"slug": args.slug}))
+    },
+    map_err: |e| map_send_err(e, REMOVE_NODE)
+);
 
 // ---------- Registration ----------
 

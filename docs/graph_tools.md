@@ -16,8 +16,11 @@ Command previews also return a cost block with byte/token hints so the gateway c
 | id | kind | purpose | key params |
 | --- | --- | --- | --- |
 | `graph_neighbors` | view | Neighbors of a slug, filtered by edge kind/direction | `slug`, `edge_kind` (requires/supports/assesses/precedes/anchors), `direction` (incoming/outgoing/both), `limit`, `offset` |
+| `graph_get_node` | view | Fetch a node with typed fields by slug | `slug` |
 | `graph_first_principles` | view | Paged list of first-principle instructional nodes | `limit`, `offset` |
 | `graph_first_principles_summary` | analysis | Counts of first principles by knowledge type | `fetch_body` |
+| `graph_lo_reachability` | view | Reachability/coverage bundle for an LO (with anchors) | `lo_slug`, `limit`, `offset` |
+| `graph_lo_coverage` | view | Coverage/criteria view for an LO (paged) | `lo_slug`, `limit`, `offset` |
 | `graph_lo_alignment_summary` | analysis | Compact LO alignment summary (reachability, coverage, anchors) | `lo_slug`, `fetch_body` |
 | `graph_lo_assessments_view` | view | Assessments for an LO with reachability flag | `lo_slug`, `reachable_only` (bool), `limit`, `offset` |
 | `graph_lo_missing_criteria_view` | view | Missing rubric criteria for an LO | `lo_slug`, `limit`, `offset` |
@@ -29,6 +32,7 @@ Command previews also return a cost block with byte/token hints so the gateway c
 | `graph_keystone` | analysis | Top keystone scores (capped at 20 entries) | — |
 | `graph_dag_check` | analysis | Requires DAG boolean + topo length | — |
 | `graph_extraneous` | analysis | Extraneous knowledge for assessment vs LO | `assessment_slug`, `lo_slug`, optional `intended_slugs` |
+| `graph_redundant_requires` | analysis | List/prune redundant requires edges | `prune`, `limit`, `offset`, `apply` |
 | `graph_assessment_gaps` | analysis | LOS w/o target assessments; orphan/unreachable assessments | `fetch_body` |
 | `graph_discourse_orphans` | analysis | TeachingSteps lacking precedes links | `episode` (optional) |
 | `graph_borrow_ahead` | analysis | Borrow-ahead uses within an episode | `episode` |
@@ -47,6 +51,7 @@ All command outputs now follow `{type: "graph_command", tool: <id>, status: "ok"
 - Views are always bounded (`limit`/`offset`); use `has_more` to paginate.
 - Summaries are compact; heavy tools provide previews unless `fetch_body=true`.
 - Edge kind filters use the `EdgeKindFilter` enum—stringly values are rejected.
+- Command preflight now resolves slugs with type guards: requires/supports expect knowledge nodes; assesses expects assessment_item -> learning_outcome; precedes/anchors ensure teaching_step sources (and anchors require knowledge/LO/assessment targets) before applying mutations.
 - Strict mode: `--graph-strict-quality` promotes alignment/coverage/practice/example/discourse warnings to errors. Use it in CI; leave it off locally while staging edits.
 - Supports: all supports must carry a `case_tag`; supports into high `intrinsic_load` targets must include `coverage_tags`.
 - Purity & provenance: extraneous prerequisites and SourceRef revision mismatches are fatal regardless of strictness.

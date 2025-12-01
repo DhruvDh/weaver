@@ -812,11 +812,11 @@ impl Message<ApplyRuntimeConfig> for GraphManager {
         if strict_quality != prev_strict
             && let Err(err) = self.service.set_strict_quality(strict_quality)
         {
+            self.validation_timeout_ms = prev_timeout;
             return Err(err.into());
         }
 
         let prev_commit = self.course_commit.clone();
-        let prev_strict_mode = self.service.strict_quality();
         let expected = if course_commit.is_empty() {
             None
         } else {
@@ -825,9 +825,13 @@ impl Message<ApplyRuntimeConfig> for GraphManager {
         self.service.set_expected_revision(expected);
         self.course_commit = course_commit;
 
-        if let Err(err) = self.service.validate_global_invariants() {
-            if strict_quality != prev_strict_mode {
-                let _ = self.service.set_strict_quality(prev_strict_mode);
+        if let Err(err) = self
+            .service
+            .validate_global_invariants_off_thread(Duration::from_millis(new_timeout))
+            .await
+        {
+            if strict_quality != prev_strict {
+                let _ = self.service.set_strict_quality(prev_strict);
             }
             self.course_commit = prev_commit.clone();
             let prev_expected = if prev_commit.is_empty() {

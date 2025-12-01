@@ -1,22 +1,18 @@
-use std::{path::PathBuf, sync::Arc};
-
 use anyhow::Context;
 use async_trait::async_trait;
 use bon::Builder;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::json;
 use tracing::info;
 
 use super::{
-    CallState, RenderPayloadConfig, ToolExecutionError, ToolInputError, ToolInputResult,
-    ToolInstance, ToolOutput, ToolPayloadMode, ToolPrototype, prepare_payload_estimates,
-    render_payload, render_relative_path, resolve_workspace_path, schema_for_args, trim_optional,
+    CallState, ToolExecutionError, ToolInputError, ToolInputResult, ToolInstance, ToolOutput,
+    ToolPayloadMode,
+    common::{ToolRunPayload, ToolRunner},
+    render_relative_path, resolve_workspace_path, trim_optional,
 };
-use crate::{
-    llm_gateway::GatewayMetrics,
-    tools::search::{self, SearchOptions},
-};
+use crate::tools::search::{self, SearchOptions};
 
 const IDENTIFIER: &str = "search_text";
 const DESCRIPTION: &str = "Run a regex search (ripgrep-style) within the workspace.";
@@ -68,53 +64,43 @@ struct SearchTextPayload {
     fetch_body: bool,
 }
 
-pub(super) fn search_text_meta() -> ToolPrototype {
-    ToolPrototype {
-        id:          IDENTIFIER,
-        description: DESCRIPTION,
-        schema:      schema_for_args::<SearchTextArgs>(),
-        parse:       parse_search_text,
-    }
-}
+crate::basic_tool!(
+    search_text_meta,
+    id: IDENTIFIER,
+    description: DESCRIPTION,
+    args: SearchTextArgs,
+    prepare: |raw, _state: &CallState| {
+        let payload: SearchTextPayload =
+            serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
+                tool:    IDENTIFIER,
+                message: err.to_string(),
+            })?;
 
-fn parse_search_text(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let payload: SearchTextPayload =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    IDENTIFIER,
-            message: err.to_string(),
-        })?;
+        let args = match trim_optional(payload.path) {
+            Some(path) => SearchTextArgs::builder()
+                .pattern(payload.pattern)?
+                .path(path)?
+                .allow(payload.allow)
+                .fetch_body(payload.fetch_body)
+                .build(),
+            None => SearchTextArgs::builder()
+                .pattern(payload.pattern)?
+                .allow(payload.allow)
+                .fetch_body(payload.fetch_body)
+                .build(),
+        };
 
-    let args = match trim_optional(payload.path) {
-        Some(path) => SearchTextArgs::builder()
-            .pattern(payload.pattern)?
-            .path(path)?
-            .allow(payload.allow)
-            .fetch_body(payload.fetch_body)
-            .build(),
-        None => SearchTextArgs::builder()
-            .pattern(payload.pattern)?
-            .allow(payload.allow)
-            .fetch_body(payload.fetch_body)
-            .build(),
-    };
-
-    Ok(Box::new(SearchTextTool {
+        Ok(args)
+    },
+    runner: |args: SearchTextArgs, state: &CallState| SearchTextTool {
         args,
-        depth: state.depth,
-        workspace_root: Arc::clone(&state.workspace_root),
-        metrics: Arc::clone(&state.metrics),
-        model: Arc::clone(&state.model),
-        conversation_id: Arc::clone(&state.conversation_id),
-    }))
-}
+        state: state.clone(),
+    }
+);
 
 struct SearchTextTool {
-    args:            SearchTextArgs,
-    depth:           usize,
-    workspace_root:  Arc<PathBuf>,
-    metrics:         Arc<GatewayMetrics>,
-    model:           Arc<String>,
-    conversation_id: Arc<String>,
+    args:  SearchTextArgs,
+    state: CallState,
 }
 
 #[async_trait]
@@ -123,9 +109,9 @@ impl ToolInstance for SearchTextTool {
         let requested_path = self.args.path.clone();
         let scope = match requested_path.as_deref() {
             Some(relative) => {
-                resolve_workspace_path(self.workspace_root.as_ref(), relative, IDENTIFIER)?
+                resolve_workspace_path(self.state.workspace_root.as_ref(), relative, IDENTIFIER)?
             }
-            None => (*self.workspace_root).clone(),
+            None => (*self.state.workspace_root).clone(),
         };
 
         let mode = ToolPayloadMode::from_fetch_flag(self.args.fetch_body);
@@ -151,10 +137,10 @@ impl ToolInstance for SearchTextTool {
 
         let match_count = result.total_matches;
         let approx_bytes = result.total_bytes;
-        let token_estimates =
-            prepare_payload_estimates(&self.metrics, self.model.as_str(), approx_bytes);
-        let safe_tokens = token_estimates.safe_tokens;
         let truncated = result.truncated;
+        let scope_rendered = render_relative_path(self.state.workspace_root.as_ref(), &scope);
+        let pattern = self.args.pattern.clone();
+        let allow = self.args.allow.clone();
 
         let mut hints = vec![
             format!("{match_count} matches across roughly {approx_bytes} bytes of context."),
@@ -167,82 +153,68 @@ impl ToolInstance for SearchTextTool {
             } else {
                 "Set fetch_body=true to retrieve all matches.".to_string()
             },
-            format!("Pattern: `{}`", self.args.pattern),
-            format!("Scope: {}", render_relative_path(self.workspace_root.as_ref(), &scope)),
+            format!("Pattern: `{pattern}`"),
+            format!("Scope: {scope_rendered}"),
             "Refine the regex or narrow the path to reduce match volume.".to_string(),
         ];
-        if !self.args.allow.is_empty() {
-            hints.push(format!("Allowing directories: {}", self.args.allow.join(", ")));
+        if !allow.is_empty() {
+            hints.push(format!("Allowing directories: {}", allow.join(", ")));
         }
 
-        let rendered = render_payload(
-            RenderPayloadConfig {
-                mode,
-                tool: IDENTIFIER,
-                approx_bytes,
-                safe_tokens,
-                preview_hints: hints,
-                metrics: &self.metrics,
-                model: self.model.as_str(),
-                conversation_id: self.conversation_id.as_str(),
-            },
-            || {
-                let matches = result
-                    .matches
-                    .into_iter()
-                    .map(|m| {
-                        json!({
-                            "path": render_relative_path(self.workspace_root.as_ref(), &m.path),
-                            "line_number": m.line_number,
-                            "line": m.context,
-                        })
-                    })
-                    .collect::<Vec<_>>();
-
+        let matches = result
+            .matches
+            .into_iter()
+            .map(|m| {
                 json!({
-                    "type": "data",
-                    "mode": "body",
-                    "pattern": &self.args.pattern,
-                    "scope": render_relative_path(self.workspace_root.as_ref(), &scope),
-                    "match_count": match_count,
-                    "truncated": truncated,
-                    "caps": { "max_matches": max_matches, "max_bytes": max_bytes },
-                    "matches": matches,
-                    "bytes": approx_bytes,
-                    "approx_tokens": safe_tokens,
+                    "path": render_relative_path(self.state.workspace_root.as_ref(), &m.path),
+                    "line_number": m.line_number,
+                    "line": m.context,
                 })
-            },
+            })
+            .collect::<Vec<_>>();
+
+        info!(
+            mode = ?mode,
+            depth = self.state.depth,
+            approx_bytes,
+            scope = %scope.display(),
+            pattern = %pattern,
+            match_count,
+            truncated,
+            "tool_call search_text",
         );
 
-        match mode {
-            ToolPayloadMode::Preview => {
-                info!(
-                    mode = %mode.as_str(),
-                    depth = self.depth,
-                    preview_bytes = rendered.payload_bytes,
-                    approx_bytes,
-                    scope = %scope.display(),
-                    pattern = %self.args.pattern,
-                    match_count,
-                    truncated,
-                    "tool_call search_text preview",
-                );
-            }
-            ToolPayloadMode::Body => {
-                info!(
-                    mode = %mode.as_str(),
-                    depth = self.depth,
-                    payload_bytes = rendered.payload_bytes,
-                    approx_bytes,
-                    scope = %scope.display(),
-                    pattern = %self.args.pattern,
-                    match_count,
-                    truncated,
-                    "tool_call search_text body",
-                );
-            }
-        }
-
-        Ok(rendered.output)
+        ToolRunner::new(IDENTIFIER, &self.state)
+            .with_mode(mode)
+            .hints(hints)
+            .run(|_| async move {
+                Ok(ToolRunPayload {
+                    body:          json!({
+                        "type": "data",
+                        "mode": "body",
+                        "pattern": pattern,
+                        "scope": scope_rendered,
+                        "match_count": match_count,
+                        "truncated": truncated,
+                        "caps": { "max_matches": max_matches, "max_bytes": max_bytes },
+                        "matches": matches,
+                        "bytes": approx_bytes,
+                    }),
+                    approx_bytes:  Some(approx_bytes),
+                    preview:       Some(json!({
+                        "type": "data",
+                        "tool": IDENTIFIER,
+                        "mode": "preview",
+                        "pattern": pattern,
+                        "scope": scope_rendered,
+                        "match_count": match_count,
+                        "truncated": truncated,
+                        "approx_bytes": approx_bytes,
+                    })),
+                    preview_hints: Vec::new(),
+                    page:          None,
+                })
+            })
+            .await
     }
 }

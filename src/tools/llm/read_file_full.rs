@@ -1,19 +1,18 @@
-use std::{path::PathBuf, sync::Arc};
-
 use anyhow::Context;
 use async_trait::async_trait;
 use bon::Builder;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::json;
 use tracing::info;
 
 use super::{
-    CallState, RenderPayloadConfig, ToolExecutionError, ToolInputError, ToolInputResult,
-    ToolInstance, ToolOutput, ToolPayloadMode, ToolPrototype, prepare_payload_estimates,
-    render_payload, render_relative_path, resolve_workspace_path, schema_for_args,
+    CallState, ToolExecutionError, ToolInputError, ToolInputResult, ToolInstance, ToolOutput,
+    ToolPayloadMode,
+    common::{ToolRunPayload, ToolRunner},
+    render_relative_path, resolve_workspace_path,
 };
-use crate::{llm_gateway::GatewayMetrics, tools::filesystem};
+use crate::tools::filesystem;
 
 const IDENTIFIER: &str = "read_file_full";
 const DESCRIPTION: &str = "Read the full contents of a UTF-8 text file.";
@@ -43,113 +42,92 @@ struct ReadFileFullPayload {
     fetch_body: bool,
 }
 
-pub(super) fn read_file_full_meta() -> ToolPrototype {
-    ToolPrototype {
-        id:          IDENTIFIER,
-        description: DESCRIPTION,
-        schema:      schema_for_args::<ReadFileFullArgs>(),
-        parse:       parse_read_file_full,
-    }
-}
+crate::basic_tool!(
+    read_file_full_meta,
+    id: IDENTIFIER,
+    description: DESCRIPTION,
+    args: ReadFileFullArgs,
+    prepare: |raw, _state: &CallState| {
+        let payload: ReadFileFullPayload =
+            serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
+                tool:    IDENTIFIER,
+                message: err.to_string(),
+            })?;
 
-fn parse_read_file_full(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let payload: ReadFileFullPayload =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    IDENTIFIER,
-            message: err.to_string(),
-        })?;
-
-    let args = ReadFileFullArgs::builder()
-        .path(payload.path)?
-        .fetch_body(payload.fetch_body)
-        .build();
-
-    Ok(Box::new(ReadFileFullTool {
+        let args = ReadFileFullArgs::builder()
+            .path(payload.path)?
+            .fetch_body(payload.fetch_body)
+            .build();
+        Ok(args)
+    },
+    runner: |args: ReadFileFullArgs, state: &CallState| ReadFileFullTool {
         args,
-        depth: state.depth,
-        workspace_root: Arc::clone(&state.workspace_root),
-        metrics: Arc::clone(&state.metrics),
-        model: Arc::clone(&state.model),
-        conversation_id: Arc::clone(&state.conversation_id),
-    }))
-}
+        state: state.clone(),
+    }
+);
 
 struct ReadFileFullTool {
-    args:            ReadFileFullArgs,
-    depth:           usize,
-    workspace_root:  Arc<PathBuf>,
-    metrics:         Arc<GatewayMetrics>,
-    model:           Arc<String>,
-    conversation_id: Arc<String>,
+    args:  ReadFileFullArgs,
+    state: CallState,
 }
 
 #[async_trait]
 impl ToolInstance for ReadFileFullTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let resolved =
-            resolve_workspace_path(self.workspace_root.as_ref(), &self.args.path, IDENTIFIER)?;
+        let resolved = resolve_workspace_path(
+            self.state.workspace_root.as_ref(),
+            &self.args.path,
+            IDENTIFIER,
+        )?;
         let content = filesystem::read_file_full(&resolved)
             .await
             .with_context(|| format!("read_file_full failed for {}", resolved.display()))?;
 
         let file_bytes = content.len() as u64;
         let line_count = content.lines().count() as u64;
-        let token_estimates =
-            prepare_payload_estimates(&self.metrics, self.model.as_str(), file_bytes);
-        let safe_tokens = token_estimates.safe_tokens;
         let mode = ToolPayloadMode::from_fetch_flag(self.args.fetch_body);
-        let hints = vec![
-            format!("Path: {}", render_relative_path(self.workspace_root.as_ref(), &resolved)),
-            format!("Target file has {} lines.", line_count),
-            "Re-run read_file_full with fetch_body=true if you need the entire file.".to_string(),
-            "Call read_file_range to focus on a smaller portion.".to_string(),
-        ];
+        let path_hint = render_relative_path(self.state.workspace_root.as_ref(), &resolved);
+        let runner = ToolRunner::new(IDENTIFIER, &self.state)
+            .with_mode(mode)
+            .hints(vec![
+                format!("Path: {path_hint}"),
+                format!("Target file has {} lines.", line_count),
+                "Re-run read_file_full with fetch_body=true if you need the entire file."
+                    .to_string(),
+                "Call read_file_range to focus on a smaller portion.".to_string(),
+            ]);
 
-        let rendered = render_payload(
-            RenderPayloadConfig {
-                mode,
-                tool: IDENTIFIER,
-                approx_bytes: file_bytes,
-                safe_tokens,
-                preview_hints: hints,
-                metrics: &self.metrics,
-                model: self.model.as_str(),
-                conversation_id: self.conversation_id.as_str(),
-            },
-            || {
-                json!({
-                    "type": "data",
-                    "mode": "body",
-                    "path": render_relative_path(self.workspace_root.as_ref(), &resolved),
-                    "content": content,
-                    "bytes": file_bytes,
-                    "approx_tokens": safe_tokens,
-                })
-            },
+        info!(
+            mode = ?mode,
+            depth = self.state.depth,
+            file_bytes,
+            line_count,
+            "tool_call read_file_full",
         );
 
-        match mode {
-            ToolPayloadMode::Preview => {
-                info!(
-                    mode = %mode.as_str(),
-                    depth = self.depth,
-                    preview_bytes = rendered.payload_bytes,
-                    file_bytes,
-                    line_count,
-                    "tool_call read_file_full preview",
-                );
-            }
-            ToolPayloadMode::Body => {
-                info!(
-                    mode = %mode.as_str(),
-                    depth = self.depth,
-                    payload_bytes = rendered.payload_bytes,
-                    file_bytes,
-                    "tool_call read_file_full body",
-                );
-            }
-        }
-
-        Ok(rendered.output)
+        runner
+            .run(move |_mode| async move {
+                Ok(ToolRunPayload {
+                    body:          json!({
+                        "type": "data",
+                        "mode": "body",
+                        "path": path_hint,
+                        "content": content,
+                        "bytes": file_bytes,
+                    }),
+                    approx_bytes:  Some(file_bytes),
+                    preview:       Some(json!({
+                        "type": "data",
+                        "tool": IDENTIFIER,
+                        "mode": "preview",
+                        "path": path_hint,
+                        "bytes": file_bytes,
+                        "line_count": line_count,
+                    })),
+                    preview_hints: Vec::new(),
+                    page:          None,
+                })
+            })
+            .await
     }
 }

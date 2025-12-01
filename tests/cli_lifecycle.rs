@@ -1,16 +1,40 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Once},
 };
 
 use futures::FutureExt;
+use kameo_persistence::PersistentActor;
+use tracing_subscriber::EnvFilter;
+use url::Url;
 use uuid::Uuid;
 use weaver::{
     app::{Cli, GatewayMode, RerunMode, RuntimeOptions, run_app},
-    graph::{IntroductionScope, commands::InsertKnowledge, model::KnowledgeNode, persist},
-    schema::types::{KnowledgeType, SourceRef},
+    graph::{
+        CurriculumGraph, EdgeKind, EdgePayload, IntroductionScope, KnowledgeNode, NodeKind,
+        commands::InsertKnowledge,
+        manager::{ApplyRuntimeConfig, GraphManager, GraphManagerState},
+        model::{NodePayload, RequiresAttrs},
+        persist,
+    },
+    schema::types::{KnowledgeType, SourceRef, Strength},
 };
+
+static LOG_INIT: Once = Once::new();
+
+fn init_test_logging() {
+    // Silence extremely chatty invariant warnings in test runs while preserving
+    // other warning/error output.
+    LOG_INIT.call_once(|| {
+        let filter =
+            EnvFilter::new("warn,weaver.graph.invariants=error,weaver.graph.validation=error");
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_test_writer()
+            .try_init();
+    });
+}
 
 fn temp_root(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("weaver-cli-{label}-{}", Uuid::new_v4()));
@@ -55,6 +79,8 @@ fn base_cli(root: &Path, snapshot: &Path, commit: &str, autosave_secs: u64) -> C
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cli_persists_snapshot_and_hook_mutation() -> anyhow::Result<()> {
+    init_test_logging();
+
     let root = temp_root("persist");
     fs::create_dir_all(root.join("workspace"))?;
     let snapshot = root.join("graph_snapshot.json");
@@ -98,6 +124,8 @@ async fn cli_persists_snapshot_and_hook_mutation() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn autosave_interval_zero_is_rejected() {
+    init_test_logging();
+
     let root = temp_root("autosave-zero");
     fs::create_dir_all(root.join("workspace")).unwrap();
     let snapshot = root.join("graph_snapshot.json");
@@ -113,6 +141,8 @@ async fn autosave_interval_zero_is_rejected() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn skip_demo_allows_missing_openai_model() -> anyhow::Result<()> {
+    init_test_logging();
+
     // Safe in test process: we only need to clear this for the next call and
     // no other threads rely on it.
     unsafe {
@@ -141,5 +171,92 @@ async fn skip_demo_allows_missing_openai_model() -> anyhow::Result<()> {
         result.is_err(),
         "expected FileReader init to fail when skip_demo is false and OPENAI_MODEL is absent"
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn apply_runtime_config_respects_timeout() -> anyhow::Result<()> {
+    init_test_logging();
+
+    const NODES: usize = 2_000;
+    let state_dir: PathBuf =
+        std::env::temp_dir().join(format!("weaver-apply-config-{}", Uuid::new_v4()));
+    fs::create_dir_all(&state_dir)?;
+    let state_url =
+        Url::from_directory_path(&state_dir).map_err(|_| anyhow::anyhow!("invalid state url"))?;
+
+    let evidence = SourceRef {
+        path:       "dummy".into(),
+        start_line: 1,
+        end_line:   1,
+        revision:   "deadbeef".into(),
+    };
+
+    let mut graph = CurriculumGraph::default();
+    let mut ids = Vec::with_capacity(NODES);
+    for i in 0..NODES {
+        let node = KnowledgeNode {
+            title: format!("k{i}"),
+            statement: "stmt".into(),
+            knowledge_type: KnowledgeType::Conceptual,
+            source_refs: vec![evidence.clone()],
+            confidence: 1.0,
+            rubric_criteria: vec![],
+            construct_irrelevant_demands: vec![],
+            grain_level: None,
+            intrinsic_load: None,
+            introduction_scope: IntroductionScope::InCourse,
+        };
+        let payload = NodePayload {
+            logical_id: uuid::Uuid::new_v4(),
+            slug:       format!("k{i}"),
+            kind:       NodeKind::Knowledge(node),
+            tags:       vec![],
+        };
+        ids.push(graph.add_node(payload));
+    }
+
+    let requires = RequiresAttrs {
+        strength:      Strength::Necessary,
+        rationale:     "chain".into(),
+        evidence_refs: vec![evidence.clone()],
+    };
+    for i in 0..(NODES - 1) {
+        graph.add_edge(
+            ids[i],
+            ids[i + 1],
+            EdgePayload {
+                kind:       EdgeKind::Requires(requires.clone()),
+                confidence: 1.0,
+            },
+        );
+    }
+
+    let state = GraphManagerState::new(graph, String::new(), false, 0, 2_000);
+    let actor = GraphManager::spawn_persistent(state_url, state).await?;
+
+    let result = actor
+        .ask(ApplyRuntimeConfig {
+            course_commit:         String::new(),
+            strict_quality:        false,
+            validation_timeout_ms: 1,
+        })
+        .await;
+
+    let err = match result {
+        Err(kameo::error::SendError::HandlerError(err)) => err,
+        other => panic!("expected handler timeout error, got {other:?}"),
+    };
+    let graph_err = err
+        .downcast_ref::<weaver::graph::GraphError>()
+        .expect("error should be GraphError");
+    if let weaver::graph::GraphError::InvariantTimeout { timeout_ms } = graph_err {
+        assert_eq!(*timeout_ms, 1, "timeout should propagate configured limit");
+    } else {
+        panic!("expected invariant timeout, got {graph_err:?}");
+    }
+
+    actor.stop_gracefully().await.expect("stop graph manager");
+    actor.wait_for_shutdown().await;
     Ok(())
 }

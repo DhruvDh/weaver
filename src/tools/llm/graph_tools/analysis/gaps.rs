@@ -1,28 +1,16 @@
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use bon::Builder;
-use kameo::prelude::ActorRef;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::json;
 use tracing::info;
 
-use super::{
-    CachedGapBundle, SummaryContext, cache_gap_bundle, decode_cached, load_graph_with_version,
-};
-use crate::{
-    graph::manager::GraphManager,
-    llm_gateway::GatewayMetrics,
-    tools::llm::{
-        CallState, ToolExecutionError, ToolInputResult, ToolInstance, ToolOutput, ToolPrototype,
-        graph_tools::{
-            analysis_cache::AnalysisCache,
-            common,
-            common::{paginate, parse_with},
-        },
-        payload_size_bytes, schema_for_args,
-    },
+use super::{CachedGapBundle, cache_gap_bundle, decode_cached, load_graph_with_version};
+use crate::tools::llm::{
+    CallState, ToolExecutionError, ToolInstance, ToolOutput, ToolPayloadMode, ToolPrototype,
+    common::{ToolRunPayload, ToolRunner},
+    graph_tools::common,
+    payload_size_bytes,
 };
 
 const GAP_SUMMARY: &str = "graph_gap_summary";
@@ -61,134 +49,69 @@ pub(super) fn tool_prototypes() -> Vec<ToolPrototype> {
     ]
 }
 
-pub(super) fn gap_summary_meta() -> ToolPrototype {
-    ToolPrototype {
-        id:          GAP_SUMMARY,
-        description: "Compact summary of example gaps, fadeability issues, and practice gaps with \
-                      preview/cost support.",
-        schema:      schema_for_args::<GapSummaryArgs>(),
-        parse:       parse_gap_summary,
+crate::analysis_tool!(
+    gap_summary_meta,
+    id: GAP_SUMMARY,
+    description: "Compact summary of example gaps, fadeability issues, and practice gaps with \
+                  preview/cost support.",
+    args: GapSummaryArgs,
+    prepare: |raw| crate::tools::llm::common::parse_args(GAP_SUMMARY, raw),
+    runner: |args: GapSummaryArgs, state: &CallState| GapSummaryTool {
+        args,
+        state: state.clone(),
     }
-}
+);
 
-pub(super) fn example_gaps_view_meta() -> ToolPrototype {
-    ToolPrototype {
-        id:          EXAMPLE_GAPS_VIEW,
-        description: "View example/variety gaps with pagination.",
-        schema:      schema_for_args::<GapViewArgs>(),
-        parse:       parse_example_gaps_view,
+crate::analysis_tool!(
+    example_gaps_view_meta,
+    id: EXAMPLE_GAPS_VIEW,
+    description: "View example/variety gaps with pagination.",
+    args: GapViewArgs,
+    prepare: |raw| crate::tools::llm::common::parse_args(EXAMPLE_GAPS_VIEW, raw),
+    runner: |args: GapViewArgs, state: &CallState| ExampleGapsViewTool {
+        args,
+        state: state.clone(),
     }
-}
+);
 
-pub(super) fn fadeability_view_meta() -> ToolPrototype {
-    ToolPrototype {
-        id:          FADEABILITY_VIEW,
-        description: "View assessments that fail fadeability (supports acting as hidden \
-                      prerequisites).",
-        schema:      schema_for_args::<GapViewArgs>(),
-        parse:       parse_fadeability_view,
+crate::analysis_tool!(
+    fadeability_view_meta,
+    id: FADEABILITY_VIEW,
+    description: "View assessments that fail fadeability (supports acting as hidden \
+                  prerequisites).",
+    args: GapViewArgs,
+    prepare: |raw| crate::tools::llm::common::parse_args(FADEABILITY_VIEW, raw),
+    runner: |args: GapViewArgs, state: &CallState| FadeabilityViewTool {
+        args,
+        state: state.clone(),
     }
-}
+);
 
-pub(super) fn practice_gaps_view_meta() -> ToolPrototype {
-    ToolPrototype {
-        id:          PRACTICE_GAPS_VIEW,
-        description: "View procedural practice gaps with pagination.",
-        schema:      schema_for_args::<GapViewArgs>(),
-        parse:       parse_practice_gaps_view,
+crate::analysis_tool!(
+    practice_gaps_view_meta,
+    id: PRACTICE_GAPS_VIEW,
+    description: "View procedural practice gaps with pagination.",
+    args: GapViewArgs,
+    prepare: |raw| crate::tools::llm::common::parse_args(PRACTICE_GAPS_VIEW, raw),
+    runner: |args: GapViewArgs, state: &CallState| PracticeGapsViewTool {
+        args,
+        state: state.clone(),
     }
-}
-
-fn parse_gap_summary(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    parse_with(
-        GAP_SUMMARY,
-        raw,
-        state,
-        |args: GapSummaryArgs| Ok(args),
-        |args, state| {
-            Ok(GapSummaryTool {
-                args,
-                graph: state.graph.clone(),
-                metrics: Arc::clone(&state.metrics),
-                model: Arc::clone(&state.model),
-                conversation_id: Arc::clone(&state.conversation_id),
-                analysis_cache: Arc::clone(&state.analysis_cache),
-            })
-        },
-    )
-}
-
-fn parse_example_gaps_view(
-    raw: Value,
-    state: &CallState,
-) -> ToolInputResult<Box<dyn ToolInstance>> {
-    parse_with(
-        EXAMPLE_GAPS_VIEW,
-        raw,
-        state,
-        |args: GapViewArgs| Ok(args),
-        |args, state| {
-            Ok(ExampleGapsViewTool {
-                args,
-                graph: state.graph.clone(),
-                analysis_cache: Arc::clone(&state.analysis_cache),
-            })
-        },
-    )
-}
-
-fn parse_fadeability_view(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    parse_with(
-        FADEABILITY_VIEW,
-        raw,
-        state,
-        |args: GapViewArgs| Ok(args),
-        |args, state| {
-            Ok(FadeabilityViewTool {
-                args,
-                graph: state.graph.clone(),
-                analysis_cache: Arc::clone(&state.analysis_cache),
-            })
-        },
-    )
-}
-
-fn parse_practice_gaps_view(
-    raw: Value,
-    state: &CallState,
-) -> ToolInputResult<Box<dyn ToolInstance>> {
-    parse_with(
-        PRACTICE_GAPS_VIEW,
-        raw,
-        state,
-        |args: GapViewArgs| Ok(args),
-        |args, state| {
-            Ok(PracticeGapsViewTool {
-                args,
-                graph: state.graph.clone(),
-                analysis_cache: Arc::clone(&state.analysis_cache),
-            })
-        },
-    )
-}
+);
 
 struct GapSummaryTool {
-    args:            GapSummaryArgs,
-    graph:           ActorRef<GraphManager>,
-    metrics:         Arc<GatewayMetrics>,
-    model:           Arc<String>,
-    conversation_id: Arc<String>,
-    analysis_cache:  Arc<AnalysisCache>,
+    args:  GapSummaryArgs,
+    state: CallState,
 }
 
 #[async_trait]
 impl ToolInstance for GapSummaryTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
         let (graph, graph_version) =
-            load_graph_with_version(&self.graph, &self.analysis_cache).await?;
-        let meta = common::graph_meta(&self.graph).await?;
+            load_graph_with_version(&self.state.graph, &self.state.analysis_cache).await?;
+        let meta = common::graph_meta(&self.state.graph).await?;
 
-        let cached = cache_gap_bundle(&self.analysis_cache, graph_version, &graph);
+        let cached = cache_gap_bundle(&self.state.analysis_cache, graph_version, &graph);
         let bundle: CachedGapBundle = decode_cached(&cached.payload)?;
 
         let payload = json!({
@@ -207,35 +130,41 @@ impl ToolInstance for GapSummaryTool {
             }
         });
 
-        super::finalize_summary_tool(
-            GAP_SUMMARY,
-            payload,
-            self.args.fetch_body,
-            SummaryContext {
-                metrics:         self.metrics.as_ref(),
-                model:           self.model.as_str(),
-                conversation_id: self.conversation_id.as_str(),
-                hint_prefix:     "Summary is",
-                meta:            &meta,
-            },
-        )
+        let mode = ToolPayloadMode::from_fetch_flag(self.args.fetch_body);
+        let approx = crate::tools::llm::payload_size_bytes(&payload);
+        ToolRunner::new(GAP_SUMMARY, &self.state)
+            .with_mode(mode)
+            .with_meta(meta)
+            .hints(vec![format!(
+                "Summary is ~{} bytes; set fetch_body=true to retrieve it.",
+                approx
+            )])
+            .run(move |_| async move {
+                Ok(ToolRunPayload {
+                    body:          payload,
+                    approx_bytes:  Some(approx),
+                    preview:       None,
+                    preview_hints: Vec::new(),
+                    page:          None,
+                })
+            })
+            .await
     }
 }
 
 struct ExampleGapsViewTool {
-    args:           GapViewArgs,
-    graph:          ActorRef<GraphManager>,
-    analysis_cache: Arc<AnalysisCache>,
+    args:  GapViewArgs,
+    state: CallState,
 }
 
 #[async_trait]
 impl ToolInstance for ExampleGapsViewTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
         let (graph, graph_version) =
-            load_graph_with_version(&self.graph, &self.analysis_cache).await?;
-        let meta = common::graph_meta(&self.graph).await?;
+            load_graph_with_version(&self.state.graph, &self.state.analysis_cache).await?;
+        let meta = common::graph_meta(&self.state.graph).await?;
 
-        let cached = cache_gap_bundle(&self.analysis_cache, graph_version, &graph);
+        let cached = cache_gap_bundle(&self.state.analysis_cache, graph_version, &graph);
         let bundle: CachedGapBundle = decode_cached(&cached.payload)?;
         let gaps = bundle
             .example_gaps
@@ -243,38 +172,54 @@ impl ToolInstance for ExampleGapsViewTool {
             .map(|gap| json!({ "slug": gap.slug, "description": gap.description }))
             .collect::<Vec<_>>();
 
-        let (gaps, offset, limit, has_more) = paginate(gaps, self.args.limit, self.args.offset);
+        let (gaps, page) = crate::paginate!(gaps, self.args.limit, self.args.offset);
 
         let payload = json!({
             "type": "graph_view",
             "tool": EXAMPLE_GAPS_VIEW,
-            "offset": offset,
-            "limit": limit,
-            "has_more": has_more,
+            "offset": page.offset,
+            "limit": page.limit,
+            "has_more": page.has_more,
             "gaps": gaps,
         });
 
-        info!(tool = EXAMPLE_GAPS_VIEW, offset, limit, has_more, "graph example gaps view");
-
-        let payload = common::attach_meta(payload, &meta);
-        Ok(ToolOutput::with_byte_hint(payload.clone(), payload_size_bytes(&payload)))
+        info!(
+            tool = EXAMPLE_GAPS_VIEW,
+            offset = page.offset,
+            limit = page.limit,
+            has_more = page.has_more,
+            "graph example gaps view"
+        );
+        let approx = payload_size_bytes(&payload);
+        ToolRunner::new(EXAMPLE_GAPS_VIEW, &self.state)
+            .with_mode(ToolPayloadMode::Body)
+            .with_meta(meta)
+            .run(move |_| async move {
+                Ok(ToolRunPayload {
+                    body:          payload,
+                    approx_bytes:  Some(approx),
+                    preview:       None,
+                    preview_hints: Vec::new(),
+                    page:          Some(page),
+                })
+            })
+            .await
     }
 }
 
 struct FadeabilityViewTool {
-    args:           GapViewArgs,
-    graph:          ActorRef<GraphManager>,
-    analysis_cache: Arc<AnalysisCache>,
+    args:  GapViewArgs,
+    state: CallState,
 }
 
 #[async_trait]
 impl ToolInstance for FadeabilityViewTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
         let (graph, graph_version) =
-            load_graph_with_version(&self.graph, &self.analysis_cache).await?;
-        let meta = common::graph_meta(&self.graph).await?;
+            load_graph_with_version(&self.state.graph, &self.state.analysis_cache).await?;
+        let meta = common::graph_meta(&self.state.graph).await?;
 
-        let cached = cache_gap_bundle(&self.analysis_cache, graph_version, &graph);
+        let cached = cache_gap_bundle(&self.state.analysis_cache, graph_version, &graph);
         let bundle: CachedGapBundle = decode_cached(&cached.payload)?;
         let issues = bundle
             .fadeability
@@ -292,38 +237,54 @@ impl ToolInstance for FadeabilityViewTool {
             })
             .collect::<Vec<_>>();
 
-        let (issues, offset, limit, has_more) = paginate(issues, self.args.limit, self.args.offset);
+        let (issues, page) = crate::paginate!(issues, self.args.limit, self.args.offset);
 
         let payload = json!({
             "type": "graph_view",
             "tool": FADEABILITY_VIEW,
-            "offset": offset,
-            "limit": limit,
-            "has_more": has_more,
+            "offset": page.offset,
+            "limit": page.limit,
+            "has_more": page.has_more,
             "assessments": issues,
         });
 
-        info!(tool = FADEABILITY_VIEW, offset, limit, has_more, "graph fadeability view");
-
-        let payload = common::attach_meta(payload, &meta);
-        Ok(ToolOutput::with_byte_hint(payload.clone(), payload_size_bytes(&payload)))
+        info!(
+            tool = FADEABILITY_VIEW,
+            offset = page.offset,
+            limit = page.limit,
+            has_more = page.has_more,
+            "graph fadeability view"
+        );
+        let approx = payload_size_bytes(&payload);
+        ToolRunner::new(FADEABILITY_VIEW, &self.state)
+            .with_mode(ToolPayloadMode::Body)
+            .with_meta(meta)
+            .run(move |_| async move {
+                Ok(ToolRunPayload {
+                    body:          payload,
+                    approx_bytes:  Some(approx),
+                    preview:       None,
+                    preview_hints: Vec::new(),
+                    page:          Some(page),
+                })
+            })
+            .await
     }
 }
 
 struct PracticeGapsViewTool {
-    args:           GapViewArgs,
-    graph:          ActorRef<GraphManager>,
-    analysis_cache: Arc<AnalysisCache>,
+    args:  GapViewArgs,
+    state: CallState,
 }
 
 #[async_trait]
 impl ToolInstance for PracticeGapsViewTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
         let (graph, graph_version) =
-            load_graph_with_version(&self.graph, &self.analysis_cache).await?;
-        let meta = common::graph_meta(&self.graph).await?;
+            load_graph_with_version(&self.state.graph, &self.state.analysis_cache).await?;
+        let meta = common::graph_meta(&self.state.graph).await?;
 
-        let cached = cache_gap_bundle(&self.analysis_cache, graph_version, &graph);
+        let cached = cache_gap_bundle(&self.state.analysis_cache, graph_version, &graph);
         let bundle: CachedGapBundle = decode_cached(&cached.payload)?;
         let gaps = bundle
             .practice_gaps
@@ -331,20 +292,37 @@ impl ToolInstance for PracticeGapsViewTool {
             .map(|g| json!({ "slug": g.slug }))
             .collect::<Vec<_>>();
 
-        let (gaps, offset, limit, has_more) = paginate(gaps, self.args.limit, self.args.offset);
+        let (gaps, page) = crate::paginate!(gaps, self.args.limit, self.args.offset);
 
         let payload = json!({
             "type": "graph_view",
             "tool": PRACTICE_GAPS_VIEW,
-            "offset": offset,
-            "limit": limit,
-            "has_more": has_more,
+            "offset": page.offset,
+            "limit": page.limit,
+            "has_more": page.has_more,
             "gaps": gaps,
         });
 
-        info!(tool = PRACTICE_GAPS_VIEW, offset, limit, has_more, "graph practice gaps view");
-
-        let payload = common::attach_meta(payload, &meta);
-        Ok(ToolOutput::with_byte_hint(payload.clone(), payload_size_bytes(&payload)))
+        info!(
+            tool = PRACTICE_GAPS_VIEW,
+            offset = page.offset,
+            limit = page.limit,
+            has_more = page.has_more,
+            "graph practice gaps view"
+        );
+        let approx = payload_size_bytes(&payload);
+        ToolRunner::new(PRACTICE_GAPS_VIEW, &self.state)
+            .with_mode(ToolPayloadMode::Body)
+            .with_meta(meta)
+            .run(move |_| async move {
+                Ok(ToolRunPayload {
+                    body:          payload,
+                    approx_bytes:  Some(approx),
+                    preview:       None,
+                    preview_hints: Vec::new(),
+                    page:          Some(page),
+                })
+            })
+            .await
     }
 }

@@ -1,8 +1,7 @@
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use async_trait::async_trait;
 use bon::Builder;
-use kameo::prelude::ActorRef;
 use petgraph::visit::EdgeRef;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -10,25 +9,27 @@ use serde_json::{Value, json};
 use tracing::info;
 
 use super::{
-    SummaryContext, cache_lo_bundle, decode_cached, finalize_summary_tool, load_graph_with_version,
-    load_lo_with_graph, load_lo_with_graph_only,
+    cache_lo_bundle, decode_cached, load_graph_with_version, load_lo_with_graph,
+    load_lo_with_graph_only,
 };
 use crate::{
     analysis,
     graph::CurriculumGraph,
     schema::types::KnowledgeType,
     tools::llm::{
-        CallState, ToolExecutionError, ToolInputResult, ToolInstance, ToolOutput, ToolPrototype,
+        CallState, ToolExecutionError, ToolInstance, ToolOutput, ToolPayloadMode, ToolPrototype,
+        common::{
+            AssessmentItem, LearningOutcome, Slug, ToolRunPayload, ToolRunner, resolve_typed,
+        },
         graph_tools::{
             analysis::{CachedLoBundle, NoArgs},
-            analysis_cache::{AnalysisCache, AnalysisCacheKey, AnalysisKind},
-            common,
-            common::{
-                ensure_knowledge_type, map_send_err_inf, paginate, parse_with, resolve_slug,
-                resolve_slugs,
+            analysis_cache::{
+                AnalysisCacheKey, AnalysisKind, with_cached_analysis, with_cached_analysis_result,
             },
+            common,
+            common::{map_send_err_inf, resolve_slugs},
         },
-        payload_size_bytes, require_string, schema_for_args,
+        payload_size_bytes, require_string,
     },
 };
 
@@ -36,67 +37,64 @@ use crate::{
 
 const DAG_CHECK: &str = "graph_dag_check";
 
-pub(super) fn dag_check_meta() -> ToolPrototype {
-    ToolPrototype {
-        id:          DAG_CHECK,
-        description: "Check the Requires DAG invariant: ensures all requires edges are acyclic \
-                      (Knowledge Space Theory). Returns is_dag and topological order length.",
-        schema:      schema_for_args::<NoArgs>(),
-        parse:       parse_dag_check,
+crate::analysis_tool!(
+    dag_check_meta,
+    id: DAG_CHECK,
+    description: "Check the Requires DAG invariant: ensures all requires edges are acyclic \
+                  (Knowledge Space Theory). Returns is_dag and topological order length.",
+    args: NoArgs,
+    prepare: |raw| crate::tools::llm::common::parse_args(DAG_CHECK, raw),
+    runner: |_: NoArgs, state: &CallState| DAGCheckTool {
+        state: state.clone(),
     }
-}
-
-fn parse_dag_check(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    parse_with(
-        DAG_CHECK,
-        raw,
-        state,
-        |args: NoArgs| Ok(args),
-        |_, state| {
-            Ok(DAGCheckTool {
-                graph:          state.graph.clone(),
-                analysis_cache: Arc::clone(&state.analysis_cache),
-            })
-        },
-    )
-}
+);
 
 struct DAGCheckTool {
-    graph:          ActorRef<crate::graph::manager::GraphManager>,
-    analysis_cache: Arc<AnalysisCache>,
+    state: CallState,
 }
 
 #[async_trait]
 impl ToolInstance for DAGCheckTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
         let (graph, graph_version) =
-            load_graph_with_version(&self.graph, &self.analysis_cache).await?;
-        let meta = common::graph_meta(&self.graph).await?;
+            load_graph_with_version(&self.state.graph, &self.state.analysis_cache).await?;
+        let meta = common::graph_meta(&self.state.graph).await?;
 
         let cache_key = AnalysisCacheKey {
             graph_version,
             kind: AnalysisKind::DagCheck,
         };
 
-        let cached = self.analysis_cache.get_or_insert_with(cache_key, || {
-            let dag = analysis::requires_is_dag(&graph);
-            let topo = analysis::requires_toposort(&graph).ok();
-            json!({
+        let graph = Arc::clone(&graph);
+        let payload = with_cached_analysis(
+            &self.state.analysis_cache,
+            cache_key,
+            graph_version,
+            move || async move {
+                let dag = analysis::requires_is_dag(&graph);
+                let topo = analysis::requires_toposort(&graph).ok();
+                json!({
                     "type": "graph_analysis",
                     "tool": DAG_CHECK,
-                "is_dag": dag,
-                "topo_order_count": topo.as_ref().map(|v| v.len()),
-            })
-        });
+                    "is_dag": dag,
+                    "topo_order_count": topo.as_ref().map(|v| v.len()),
+                })
+            },
+        )
+        .await;
 
-        let payload = common::attach_meta(cached.payload.clone(), &meta);
         info!(
             tool = DAG_CHECK,
             is_dag = payload["is_dag"].as_bool().unwrap_or(false),
             topo_order_count = payload["topo_order_count"].as_u64(),
             "graph requires dag check"
         );
-        Ok(ToolOutput::with_byte_hint(payload.clone(), payload_size_bytes(&payload)))
+
+        ToolRunner::new(DAG_CHECK, &self.state)
+            .with_mode(crate::tools::llm::ToolPayloadMode::Body)
+            .with_meta(meta)
+            .run(|_| async move { Ok(ToolRunPayload::new(payload)) })
+            .await
     }
 }
 
@@ -127,79 +125,48 @@ pub struct FirstPrinciplesSummaryArgs {
     pub fetch_body: bool,
 }
 
-pub(super) fn first_principles_meta() -> ToolPrototype {
-    ToolPrototype {
-        id:          FIRST_PRINCIPLES_VIEW,
-        description: "View first-principles (requires in-degree 0 instructional knowledge) with \
-                      pagination.",
-        schema:      schema_for_args::<FirstPrinciplesViewArgs>(),
-        parse:       parse_first_principles_view,
+crate::analysis_tool!(
+    first_principles_meta,
+    id: FIRST_PRINCIPLES_VIEW,
+    description: "View first-principles (requires in-degree 0 instructional knowledge) with \
+                  pagination.",
+    args: FirstPrinciplesViewArgs,
+    prepare: |raw| crate::tools::llm::common::parse_args(FIRST_PRINCIPLES_VIEW, raw),
+    runner: |args: FirstPrinciplesViewArgs, state: &CallState| FirstPrinciplesViewTool {
+        args,
+        state: state.clone(),
     }
-}
+);
 
-pub(super) fn first_principles_summary_meta() -> ToolPrototype {
-    ToolPrototype {
-        id:          FIRST_PRINCIPLES_SUMMARY,
-        description: "Summary of first-principles counts by knowledge type; returns preview \
-                      unless fetch_body=true.",
-        schema:      schema_for_args::<FirstPrinciplesSummaryArgs>(),
-        parse:       parse_first_principles_summary,
+crate::analysis_tool!(
+    first_principles_summary_meta,
+    id: FIRST_PRINCIPLES_SUMMARY,
+    description: "Summary of first-principles counts by knowledge type; returns preview \
+                  unless fetch_body=true.",
+    args: FirstPrinciplesSummaryArgs,
+    prepare: |raw| crate::tools::llm::common::parse_args(FIRST_PRINCIPLES_SUMMARY, raw),
+    runner: |args: FirstPrinciplesSummaryArgs, state: &CallState| FirstPrinciplesSummaryTool {
+        args,
+        state: state.clone(),
     }
-}
-
-fn parse_first_principles_view(
-    raw: Value,
-    state: &CallState,
-) -> ToolInputResult<Box<dyn ToolInstance>> {
-    parse_with(
-        FIRST_PRINCIPLES_VIEW,
-        raw,
-        state,
-        |args: FirstPrinciplesViewArgs| Ok(args),
-        |args, state| {
-            Ok(FirstPrinciplesViewTool {
-                args,
-                graph: state.graph.clone(),
-            })
-        },
-    )
-}
-
-fn parse_first_principles_summary(
-    raw: Value,
-    state: &CallState,
-) -> ToolInputResult<Box<dyn ToolInstance>> {
-    parse_with(
-        FIRST_PRINCIPLES_SUMMARY,
-        raw,
-        state,
-        |args: FirstPrinciplesSummaryArgs| Ok(args),
-        |args, state| {
-            Ok(FirstPrinciplesSummaryTool {
-                args,
-                graph: state.graph.clone(),
-                metrics: Arc::clone(&state.metrics),
-                model: Arc::clone(&state.model),
-                conversation_id: Arc::clone(&state.conversation_id),
-            })
-        },
-    )
-}
+);
 
 struct FirstPrinciplesViewTool {
     args:  FirstPrinciplesViewArgs,
-    graph: ActorRef<crate::graph::manager::GraphManager>,
+    state: CallState,
 }
 
 #[async_trait]
 impl ToolInstance for FirstPrinciplesViewTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
         let graph: Arc<CurriculumGraph> = self
+            .state
             .graph
             .ask(crate::graph::commands::GetGraph)
             .await
             .map_err(map_send_err_inf)?;
-
+        let meta = common::graph_meta(&self.state.graph).await?;
+        let mode = ToolPayloadMode::Body;
         let fps = analysis::first_principles(&graph);
         let items: Vec<_> = fps
             .iter()
@@ -212,43 +179,57 @@ impl ToolInstance for FirstPrinciplesViewTool {
             })
             .collect();
 
-        let (items, offset, limit, has_more) = paginate(items, self.args.limit, self.args.offset);
+        let (items, page) = crate::paginate!(items, self.args.limit, self.args.offset);
 
         let payload = json!({
             "type": "graph_view",
             "tool": FIRST_PRINCIPLES_VIEW,
-            "offset": offset,
-            "limit": limit,
-            "has_more": has_more,
+            "offset": page.offset,
+            "limit": page.limit,
+            "has_more": page.has_more,
             "items": items,
         });
 
         info!(
             tool = FIRST_PRINCIPLES_VIEW,
-            offset, limit, has_more, "graph first_principles view"
+            offset = page.offset,
+            limit = page.limit,
+            has_more = page.has_more,
+            "graph first_principles view"
         );
 
-        Ok(ToolOutput::with_byte_hint(payload.clone(), payload_size_bytes(&payload)))
+        let approx = payload_size_bytes(&payload);
+        ToolRunner::new(FIRST_PRINCIPLES_VIEW, &self.state)
+            .with_mode(mode)
+            .with_meta(meta)
+            .run(move |_| async move {
+                Ok(ToolRunPayload {
+                    body:          payload,
+                    approx_bytes:  Some(approx),
+                    preview:       None,
+                    preview_hints: Vec::new(),
+                    page:          Some(page),
+                })
+            })
+            .await
     }
 }
 
 struct FirstPrinciplesSummaryTool {
-    args:            FirstPrinciplesSummaryArgs,
-    graph:           ActorRef<crate::graph::manager::GraphManager>,
-    metrics:         Arc<crate::llm_gateway::GatewayMetrics>,
-    model:           Arc<String>,
-    conversation_id: Arc<String>,
+    args:  FirstPrinciplesSummaryArgs,
+    state: CallState,
 }
 
 #[async_trait]
 impl ToolInstance for FirstPrinciplesSummaryTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
         let graph: Arc<CurriculumGraph> = self
+            .state
             .graph
             .ask(crate::graph::commands::GetGraph)
             .await
             .map_err(map_send_err_inf)?;
-        let meta = common::graph_meta(&self.graph).await?;
+        let meta = common::graph_meta(&self.state.graph).await?;
 
         let fps = analysis::first_principles(&graph);
         let mut counts = std::collections::HashMap::new();
@@ -271,18 +252,25 @@ impl ToolInstance for FirstPrinciplesSummaryTool {
             }
         });
 
-        finalize_summary_tool(
-            FIRST_PRINCIPLES_SUMMARY,
-            payload,
-            self.args.fetch_body,
-            SummaryContext {
-                metrics:         self.metrics.as_ref(),
-                model:           self.model.as_str(),
-                conversation_id: self.conversation_id.as_str(),
-                hint_prefix:     "Summary is",
-                meta:            &meta,
-            },
-        )
+        let mode = ToolPayloadMode::from_fetch_flag(self.args.fetch_body);
+        let approx = payload_size_bytes(&payload);
+        ToolRunner::new(FIRST_PRINCIPLES_SUMMARY, &self.state)
+            .with_mode(mode)
+            .with_meta(meta)
+            .hints(vec![format!(
+                "Summary is ~{} bytes; set fetch_body=true to retrieve it.",
+                approx
+            )])
+            .run(move |_| async move {
+                Ok(ToolRunPayload {
+                    body:          payload,
+                    approx_bytes:  Some(approx),
+                    preview:       None,
+                    preview_hints: Vec::new(),
+                    page:          None,
+                })
+            })
+            .await
     }
 }
 
@@ -362,143 +350,151 @@ pub struct LoAlignmentArgs {
     )]
     pub fetch_body: bool,
 }
-
-pub(super) fn lo_reach_meta() -> ToolPrototype {
-    ToolPrototype {
-        id:          LO_REACH,
-        description: "Constructive Alignment predicate for a Learning Outcome: which assessments \
-                      are reachable from first principles via requires* paths and target this LO.",
-        schema:      schema_for_args::<LoReachArgs>(),
-        parse:       parse_lo_reach,
-    }
-}
-
-pub(super) fn lo_alignment_meta() -> ToolPrototype {
-    ToolPrototype {
-        id:          LO_ALIGNMENT,
-        description: "High-level alignment summary for a Learning Outcome: reachability from \
-                      first principles via assessments (constructive alignment), rubric coverage \
-                      vs observation_features, and target anchors. Use this first when checking \
-                      LO alignment; use reachability/coverage tools for deeper debugging.",
-        schema:      schema_for_args::<LoAlignmentArgs>(),
-        parse:       parse_lo_alignment,
-    }
-}
-
-pub(super) fn lo_assessments_view_meta() -> ToolPrototype {
-    ToolPrototype {
-        id:          LO_ASSESSMENTS_VIEW,
-        description: "View assessments linked to an LO with reachability flags (paged).",
-        schema:      schema_for_args::<LoAssessmentsViewArgs>(),
-        parse:       parse_lo_assessments_view,
-    }
-}
-
-pub(super) fn lo_missing_criteria_view_meta() -> ToolPrototype {
-    ToolPrototype {
-        id:          LO_MISSING_CRITERIA_VIEW,
-        description: "View missing rubric criteria for an LO (paged).",
-        schema:      schema_for_args::<LoMissingCriteriaViewArgs>(),
-        parse:       parse_lo_missing_criteria_view,
-    }
-}
-
-pub(super) fn lo_anchors_view_meta() -> ToolPrototype {
-    ToolPrototype {
-        id:          LO_ANCHORS_VIEW,
-        description: "View anchors (teaching steps) targeting an LO (paged).",
-        schema:      schema_for_args::<LoAnchorsViewArgs>(),
-        parse:       parse_lo_anchors_view,
-    }
-}
-
-pub(super) fn coverage_meta() -> ToolPrototype {
-    ToolPrototype {
-        id:          COVERAGE,
-        description: "Coverage report for a Learning Outcome: compares rubric_criteria to \
-                      observation_features on target assesses edges; use to find rubric coverage \
-                      gaps.",
-        schema:      schema_for_args::<LoReachArgs>(),
-        parse:       parse_lo_coverage,
-    }
-}
-
-fn parse_lo_reach(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    parse_with(
+crate::analysis_tool!(
+    lo_reach_meta,
+    id: LO_REACH,
+    description: "Constructive Alignment predicate for a Learning Outcome: which assessments \
+                  are reachable from first principles via requires* paths and target this LO.",
+    args: LoReachArgs,
+    prepare: |raw| super::common::parse_args_with_builder(
         LO_REACH,
         raw,
-        state,
         |mut input: LoReachArgs| {
             input.lo_slug = require_string(input.lo_slug, LO_REACH, "lo_slug")?;
             Ok(input)
         },
-        |args, state| {
-            Ok(LoReachTool {
-                args,
-                graph: state.graph.clone(),
-                analysis_cache: Arc::clone(&state.analysis_cache),
-            })
-        },
-    )
-}
+    ),
+    runner: |args: LoReachArgs, state: &CallState| LoReachTool {
+        args,
+        state: state.clone(),
+    }
+);
 
-fn parse_lo_alignment(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    parse_with(
+crate::analysis_tool!(
+    lo_alignment_meta,
+    id: LO_ALIGNMENT,
+    description: "High-level alignment summary for a Learning Outcome: reachability from \
+                  first principles via assessments (constructive alignment), rubric coverage \
+                  vs observation_features, and target anchors. Use this first when checking \
+                  LO alignment; use reachability/coverage tools for deeper debugging.",
+    args: LoAlignmentArgs,
+    prepare: |raw| super::common::parse_args_with_builder(
         LO_ALIGNMENT,
         raw,
-        state,
         |mut input: LoAlignmentArgs| {
             input.lo_slug = require_string(input.lo_slug, LO_ALIGNMENT, "lo_slug")?;
             Ok(input)
         },
-        |args, state| {
-            Ok(LoAlignmentTool {
-                args,
-                graph: state.graph.clone(),
-                metrics: Arc::clone(&state.metrics),
-                model: Arc::clone(&state.model),
-                conversation_id: Arc::clone(&state.conversation_id),
-                analysis_cache: Arc::clone(&state.analysis_cache),
-            })
-        },
-    )
-}
+    ),
+    runner: |args: LoAlignmentArgs, state: &CallState| LoAlignmentTool {
+        args,
+        state: state.clone(),
+    }
+);
 
-fn parse_lo_coverage(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    parse_with(
+crate::analysis_tool!(
+    lo_assessments_view_meta,
+    id: LO_ASSESSMENTS_VIEW,
+    description: "View assessments linked to an LO with reachability flags (paged).",
+    args: LoAssessmentsViewArgs,
+    prepare: |raw| super::common::parse_args_with_builder(
+        LO_ASSESSMENTS_VIEW,
+        raw,
+        |mut input: LoAssessmentsViewArgs| {
+            input.lo_slug = require_string(input.lo_slug, LO_ASSESSMENTS_VIEW, "lo_slug")?;
+            Ok(input)
+        },
+    ),
+    runner: |args: LoAssessmentsViewArgs, state: &CallState| LoAssessmentsViewTool {
+        args,
+        state: state.clone(),
+    }
+);
+
+crate::analysis_tool!(
+    lo_missing_criteria_view_meta,
+    id: LO_MISSING_CRITERIA_VIEW,
+    description: "View missing rubric criteria for an LO (paged).",
+    args: LoMissingCriteriaViewArgs,
+    prepare: |raw| super::common::parse_args_with_builder(
+        LO_MISSING_CRITERIA_VIEW,
+        raw,
+        |mut input: LoMissingCriteriaViewArgs| {
+            input.lo_slug = require_string(input.lo_slug, LO_MISSING_CRITERIA_VIEW, "lo_slug")?;
+            Ok(input)
+        },
+    ),
+    runner: |args: LoMissingCriteriaViewArgs, state: &CallState| LoMissingCriteriaViewTool {
+        args,
+        state: state.clone(),
+    }
+);
+
+crate::analysis_tool!(
+    lo_anchors_view_meta,
+    id: LO_ANCHORS_VIEW,
+    description: "View anchors (teaching steps) targeting an LO (paged).",
+    args: LoAnchorsViewArgs,
+    prepare: |raw| super::common::parse_args_with_builder(
+        LO_ANCHORS_VIEW,
+        raw,
+        |mut input: LoAnchorsViewArgs| {
+            input.lo_slug = require_string(input.lo_slug, LO_ANCHORS_VIEW, "lo_slug")?;
+            Ok(input)
+        },
+    ),
+    runner: |args: LoAnchorsViewArgs, state: &CallState| LoAnchorsViewTool {
+        args,
+        state: state.clone(),
+    }
+);
+
+crate::analysis_tool!(
+    coverage_meta,
+    id: COVERAGE,
+    description: "Coverage report for a Learning Outcome: compares rubric_criteria to \
+                  observation_features on target assesses edges; use to find rubric coverage \
+                  gaps.",
+    args: LoReachArgs,
+    prepare: |raw| super::common::parse_args_with_builder(
         COVERAGE,
         raw,
-        state,
         |mut input: LoReachArgs| {
             input.lo_slug = require_string(input.lo_slug, COVERAGE, "lo_slug")?;
             Ok(input)
         },
-        |args, state| {
-            Ok(LoCoverageTool {
-                args,
-                graph: state.graph.clone(),
-                analysis_cache: Arc::clone(&state.analysis_cache),
-            })
-        },
-    )
-}
+    ),
+    runner: |args: LoReachArgs, state: &CallState| LoCoverageTool {
+        args,
+        state: state.clone(),
+    }
+);
 
 struct LoReachTool {
-    args:           LoReachArgs,
-    graph:          ActorRef<crate::graph::manager::GraphManager>,
-    analysis_cache: Arc<AnalysisCache>,
+    args:  LoReachArgs,
+    state: CallState,
 }
 
 #[async_trait]
 impl ToolInstance for LoReachTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let (graph, graph_version, lo) =
-            load_lo_with_graph(&self.graph, &self.analysis_cache, &self.args.lo_slug, LO_REACH)
-                .await?;
-        let meta = common::graph_meta(&self.graph).await?;
+        let mode = ToolPayloadMode::Body;
+        let (graph, graph_version, lo) = load_lo_with_graph(
+            &self.state.graph,
+            &self.state.analysis_cache,
+            &self.args.lo_slug,
+            LO_REACH,
+        )
+        .await?;
+        let meta = common::graph_meta(&self.state.graph).await?;
 
-        let cached =
-            cache_lo_bundle(&self.analysis_cache, graph_version, &graph, lo, &self.args.lo_slug);
+        let cached = cache_lo_bundle(
+            &self.state.analysis_cache,
+            graph_version,
+            &graph,
+            lo,
+            &self.args.lo_slug,
+        );
         let bundle: CachedLoBundle = decode_cached(&cached.payload)?;
 
         let assessments = bundle
@@ -518,27 +514,49 @@ impl ToolInstance for LoReachTool {
             "assessments": assessments,
         });
         info!(tool = LO_REACH, lo_slug = %self.args.lo_slug, "graph lo reachability");
-        let payload = common::attach_meta(payload, &meta);
-        Ok(ToolOutput::with_byte_hint(payload.clone(), payload_size_bytes(&payload)))
+        let approx = payload_size_bytes(&payload);
+
+        ToolRunner::new(LO_REACH, &self.state)
+            .with_mode(mode)
+            .with_meta(meta)
+            .run(move |_| async move {
+                Ok(ToolRunPayload {
+                    body:          payload,
+                    approx_bytes:  Some(approx),
+                    preview:       None,
+                    preview_hints: Vec::new(),
+                    page:          None,
+                })
+            })
+            .await
     }
 }
 
 struct LoCoverageTool {
-    args:           LoReachArgs,
-    graph:          ActorRef<crate::graph::manager::GraphManager>,
-    analysis_cache: Arc<AnalysisCache>,
+    args:  LoReachArgs,
+    state: CallState,
 }
 
 #[async_trait]
 impl ToolInstance for LoCoverageTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let (graph, graph_version, lo) =
-            load_lo_with_graph(&self.graph, &self.analysis_cache, &self.args.lo_slug, COVERAGE)
-                .await?;
-        let meta = common::graph_meta(&self.graph).await?;
+        let mode = ToolPayloadMode::Body;
+        let (graph, graph_version, lo) = load_lo_with_graph(
+            &self.state.graph,
+            &self.state.analysis_cache,
+            &self.args.lo_slug,
+            COVERAGE,
+        )
+        .await?;
+        let meta = common::graph_meta(&self.state.graph).await?;
 
-        let cached =
-            cache_lo_bundle(&self.analysis_cache, graph_version, &graph, lo, &self.args.lo_slug);
+        let cached = cache_lo_bundle(
+            &self.state.analysis_cache,
+            graph_version,
+            &graph,
+            lo,
+            &self.args.lo_slug,
+        );
         let bundle: CachedLoBundle = decode_cached(&cached.payload)?;
 
         let payload = json!({
@@ -550,30 +568,49 @@ impl ToolInstance for LoCoverageTool {
             "unused_observation_features": bundle.coverage.unused_observation_features,
         });
         info!(tool = COVERAGE, lo_slug = %self.args.lo_slug, "graph lo coverage");
-        let payload = common::attach_meta(payload, &meta);
-        Ok(ToolOutput::with_byte_hint(payload.clone(), payload_size_bytes(&payload)))
+        let approx = payload_size_bytes(&payload);
+
+        ToolRunner::new(COVERAGE, &self.state)
+            .with_mode(mode)
+            .with_meta(meta)
+            .run(move |_| async move {
+                Ok(ToolRunPayload {
+                    body:          payload,
+                    approx_bytes:  Some(approx),
+                    preview:       None,
+                    preview_hints: Vec::new(),
+                    page:          None,
+                })
+            })
+            .await
     }
 }
 
 struct LoAlignmentTool {
-    args:            LoAlignmentArgs,
-    graph:           ActorRef<crate::graph::manager::GraphManager>,
-    metrics:         Arc<crate::llm_gateway::GatewayMetrics>,
-    model:           Arc<String>,
-    conversation_id: Arc<String>,
-    analysis_cache:  Arc<AnalysisCache>,
+    args:  LoAlignmentArgs,
+    state: CallState,
 }
 
 #[async_trait]
 impl ToolInstance for LoAlignmentTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let (graph, graph_version, lo) =
-            load_lo_with_graph(&self.graph, &self.analysis_cache, &self.args.lo_slug, LO_ALIGNMENT)
-                .await?;
-        let meta = common::graph_meta(&self.graph).await?;
+        let mode = ToolPayloadMode::from_fetch_flag(self.args.fetch_body);
+        let (graph, graph_version, lo) = load_lo_with_graph(
+            &self.state.graph,
+            &self.state.analysis_cache,
+            &self.args.lo_slug,
+            LO_ALIGNMENT,
+        )
+        .await?;
+        let meta = common::graph_meta(&self.state.graph).await?;
 
-        let cached =
-            cache_lo_bundle(&self.analysis_cache, graph_version, &graph, lo, &self.args.lo_slug);
+        let cached = cache_lo_bundle(
+            &self.state.analysis_cache,
+            graph_version,
+            &graph,
+            lo,
+            &self.args.lo_slug,
+        );
         let bundle: CachedLoBundle = decode_cached(&cached.payload)?;
 
         let reachable: Vec<_> = bundle
@@ -616,103 +653,51 @@ impl ToolInstance for LoAlignmentTool {
             }
         });
 
-        finalize_summary_tool(
-            LO_ALIGNMENT,
-            payload,
-            self.args.fetch_body,
-            SummaryContext {
-                metrics:         self.metrics.as_ref(),
-                model:           self.model.as_str(),
-                conversation_id: self.conversation_id.as_str(),
-                hint_prefix:     "Summary is",
-                meta:            &meta,
-            },
-        )
+        let approx = payload_size_bytes(&payload);
+        ToolRunner::new(LO_ALIGNMENT, &self.state)
+            .with_mode(mode)
+            .with_meta(meta)
+            .hints(vec![format!(
+                "Summary is ~{} bytes; set fetch_body=true to retrieve it.",
+                approx
+            )])
+            .run(move |_| async move {
+                Ok(ToolRunPayload {
+                    body:          payload,
+                    approx_bytes:  Some(approx),
+                    preview:       None,
+                    preview_hints: Vec::new(),
+                    page:          None,
+                })
+            })
+            .await
     }
 }
 
-fn parse_lo_assessments_view(
-    raw: Value,
-    state: &CallState,
-) -> ToolInputResult<Box<dyn ToolInstance>> {
-    parse_with(
-        LO_ASSESSMENTS_VIEW,
-        raw,
-        state,
-        |mut input: LoAssessmentsViewArgs| {
-            input.lo_slug = require_string(input.lo_slug, LO_ASSESSMENTS_VIEW, "lo_slug")?;
-            Ok(input)
-        },
-        |args, state| {
-            Ok(LoAssessmentsViewTool {
-                args,
-                graph: state.graph.clone(),
-                analysis_cache: Arc::clone(&state.analysis_cache),
-            })
-        },
-    )
-}
-
-fn parse_lo_missing_criteria_view(
-    raw: Value,
-    state: &CallState,
-) -> ToolInputResult<Box<dyn ToolInstance>> {
-    parse_with(
-        LO_MISSING_CRITERIA_VIEW,
-        raw,
-        state,
-        |mut input: LoMissingCriteriaViewArgs| {
-            input.lo_slug = require_string(input.lo_slug, LO_MISSING_CRITERIA_VIEW, "lo_slug")?;
-            Ok(input)
-        },
-        |args, state| {
-            Ok(LoMissingCriteriaViewTool {
-                args,
-                graph: state.graph.clone(),
-                analysis_cache: Arc::clone(&state.analysis_cache),
-            })
-        },
-    )
-}
-
-fn parse_lo_anchors_view(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    parse_with(
-        LO_ANCHORS_VIEW,
-        raw,
-        state,
-        |mut input: LoAnchorsViewArgs| {
-            input.lo_slug = require_string(input.lo_slug, LO_ANCHORS_VIEW, "lo_slug")?;
-            Ok(input)
-        },
-        |args, state| {
-            Ok(LoAnchorsViewTool {
-                args,
-                graph: state.graph.clone(),
-            })
-        },
-    )
-}
-
 struct LoAssessmentsViewTool {
-    args:           LoAssessmentsViewArgs,
-    graph:          ActorRef<crate::graph::manager::GraphManager>,
-    analysis_cache: Arc<AnalysisCache>,
+    args:  LoAssessmentsViewArgs,
+    state: CallState,
 }
 
 #[async_trait]
 impl ToolInstance for LoAssessmentsViewTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
         let (graph, graph_version, lo) = load_lo_with_graph(
-            &self.graph,
-            &self.analysis_cache,
+            &self.state.graph,
+            &self.state.analysis_cache,
             &self.args.lo_slug,
             LO_ASSESSMENTS_VIEW,
         )
         .await?;
-        let meta = common::graph_meta(&self.graph).await?;
+        let meta = common::graph_meta(&self.state.graph).await?;
 
-        let cached =
-            cache_lo_bundle(&self.analysis_cache, graph_version, &graph, lo, &self.args.lo_slug);
+        let cached = cache_lo_bundle(
+            &self.state.analysis_cache,
+            graph_version,
+            &graph,
+            lo,
+            &self.args.lo_slug,
+        );
         let bundle: CachedLoBundle = decode_cached(&cached.payload)?;
 
         let items: Vec<_> = bundle
@@ -731,93 +716,120 @@ impl ToolInstance for LoAssessmentsViewTool {
             })
             .collect();
 
-        let (items, offset, limit, has_more) = paginate(items, self.args.limit, self.args.offset);
+        let (items, page) = crate::paginate!(items, self.args.limit, self.args.offset);
 
         let payload = json!({
             "type": "graph_view",
             "tool": LO_ASSESSMENTS_VIEW,
             "lo_slug": self.args.lo_slug,
-            "offset": offset,
-            "limit": limit,
-            "has_more": has_more,
+            "offset": page.offset,
+            "limit": page.limit,
+            "has_more": page.has_more,
             "assessments": items,
         });
 
         info!(
             tool = LO_ASSESSMENTS_VIEW,
             lo_slug = %self.args.lo_slug,
-            offset,
-            limit,
-            has_more,
+            offset = page.offset,
+            limit = page.limit,
+            has_more = page.has_more,
             "graph lo assessments view"
         );
 
-        let payload = common::attach_meta(payload, &meta);
-        Ok(ToolOutput::with_byte_hint(payload.clone(), payload_size_bytes(&payload)))
+        let approx = payload_size_bytes(&payload);
+        ToolRunner::new(LO_ASSESSMENTS_VIEW, &self.state)
+            .with_mode(ToolPayloadMode::Body)
+            .with_meta(meta)
+            .run(move |_| async move {
+                Ok(ToolRunPayload {
+                    body:          payload,
+                    approx_bytes:  Some(approx),
+                    preview:       None,
+                    preview_hints: Vec::new(),
+                    page:          Some(page),
+                })
+            })
+            .await
     }
 }
 
 struct LoMissingCriteriaViewTool {
-    args:           LoMissingCriteriaViewArgs,
-    graph:          ActorRef<crate::graph::manager::GraphManager>,
-    analysis_cache: Arc<AnalysisCache>,
+    args:  LoMissingCriteriaViewArgs,
+    state: CallState,
 }
 
 #[async_trait]
 impl ToolInstance for LoMissingCriteriaViewTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
         let (graph, graph_version, lo) = load_lo_with_graph(
-            &self.graph,
-            &self.analysis_cache,
+            &self.state.graph,
+            &self.state.analysis_cache,
             &self.args.lo_slug,
             LO_MISSING_CRITERIA_VIEW,
         )
         .await?;
-        let meta = common::graph_meta(&self.graph).await?;
+        let meta = common::graph_meta(&self.state.graph).await?;
 
-        let cached =
-            cache_lo_bundle(&self.analysis_cache, graph_version, &graph, lo, &self.args.lo_slug);
+        let cached = cache_lo_bundle(
+            &self.state.analysis_cache,
+            graph_version,
+            &graph,
+            lo,
+            &self.args.lo_slug,
+        );
         let bundle: CachedLoBundle = decode_cached(&cached.payload)?;
         let missing = bundle.coverage.missing;
 
-        let (missing, offset, limit, has_more) =
-            paginate(missing, self.args.limit, self.args.offset);
+        let (missing, page) = crate::paginate!(missing, self.args.limit, self.args.offset);
 
         let payload = json!({
             "type": "graph_view",
             "tool": LO_MISSING_CRITERIA_VIEW,
             "lo_slug": self.args.lo_slug,
-            "offset": offset,
-            "limit": limit,
-            "has_more": has_more,
+            "offset": page.offset,
+            "limit": page.limit,
+            "has_more": page.has_more,
             "missing": missing,
         });
 
         info!(
             tool = LO_MISSING_CRITERIA_VIEW,
             lo_slug = %self.args.lo_slug,
-            offset,
-            limit,
-            has_more,
+            offset = page.offset,
+            limit = page.limit,
+            has_more = page.has_more,
             "graph lo missing criteria view"
         );
 
-        let payload = common::attach_meta(payload, &meta);
-        Ok(ToolOutput::with_byte_hint(payload.clone(), payload_size_bytes(&payload)))
+        let approx = payload_size_bytes(&payload);
+        ToolRunner::new(LO_MISSING_CRITERIA_VIEW, &self.state)
+            .with_mode(ToolPayloadMode::Body)
+            .with_meta(meta)
+            .run(move |_| async move {
+                Ok(ToolRunPayload {
+                    body:          payload,
+                    approx_bytes:  Some(approx),
+                    preview:       None,
+                    preview_hints: Vec::new(),
+                    page:          Some(page),
+                })
+            })
+            .await
     }
 }
 
 struct LoAnchorsViewTool {
     args:  LoAnchorsViewArgs,
-    graph: ActorRef<crate::graph::manager::GraphManager>,
+    state: CallState,
 }
 
 #[async_trait]
 impl ToolInstance for LoAnchorsViewTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
         let (graph, lo) =
-            load_lo_with_graph_only(&self.graph, &self.args.lo_slug, LO_ANCHORS_VIEW).await?;
-        let meta = common::graph_meta(&self.graph).await?;
+            load_lo_with_graph_only(&self.state.graph, &self.args.lo_slug, LO_ANCHORS_VIEW).await?;
+        let meta = common::graph_meta(&self.state.graph).await?;
 
         let anchors: Vec<_> = graph
             .edges_directed(lo, petgraph::Direction::Incoming)
@@ -830,30 +842,41 @@ impl ToolInstance for LoAnchorsViewTool {
             })
             .collect();
 
-        let (anchors, offset, limit, has_more) =
-            paginate(anchors, self.args.limit, self.args.offset);
+        let (anchors, page) = crate::paginate!(anchors, self.args.limit, self.args.offset);
 
         let payload = json!({
             "type": "graph_view",
             "tool": LO_ANCHORS_VIEW,
             "lo_slug": self.args.lo_slug,
-            "offset": offset,
-            "limit": limit,
-            "has_more": has_more,
+            "offset": page.offset,
+            "limit": page.limit,
+            "has_more": page.has_more,
             "anchors": anchors,
         });
 
         info!(
             tool = LO_ANCHORS_VIEW,
             lo_slug = %self.args.lo_slug,
-            offset,
-            limit,
-            has_more,
+            offset = page.offset,
+            limit = page.limit,
+            has_more = page.has_more,
             "graph lo anchors view"
         );
 
-        let payload = common::attach_meta(payload, &meta);
-        Ok(ToolOutput::with_byte_hint(payload.clone(), payload_size_bytes(&payload)))
+        let approx = payload_size_bytes(&payload);
+        ToolRunner::new(LO_ANCHORS_VIEW, &self.state)
+            .with_mode(ToolPayloadMode::Body)
+            .with_meta(meta)
+            .run(move |_| async move {
+                Ok(ToolRunPayload {
+                    body:          payload,
+                    approx_bytes:  Some(approx),
+                    preview:       None,
+                    preview_hints: Vec::new(),
+                    page:          Some(page),
+                })
+            })
+            .await
     }
 }
 
@@ -861,74 +884,68 @@ impl ToolInstance for LoAnchorsViewTool {
 
 const KEYSTONE: &str = "graph_keystone";
 
-pub(super) fn keystone_meta() -> ToolPrototype {
-    ToolPrototype {
-        id:          KEYSTONE,
-        description: "Compute keystone scores (in_reach * out_reach) for knowledge nodes to \
-                      identify structurally critical concepts in the requires DAG (betweenness \
-                      approximation). Higher scores imply more reasoning paths depend on the \
-                      node. Returns top nodes only to keep output bounded.",
-        schema:      schema_for_args::<NoArgs>(),
-        parse:       parse_keystone,
+crate::analysis_tool!(
+    keystone_meta,
+    id: KEYSTONE,
+    description: "Compute keystone scores (in_reach * out_reach) for knowledge nodes to \
+                  identify structurally critical concepts in the requires DAG (betweenness \
+                  approximation). Higher scores imply more reasoning paths depend on the \
+                  node. Returns top nodes only to keep output bounded.",
+    args: NoArgs,
+    prepare: |raw| crate::tools::llm::common::parse_args(KEYSTONE, raw),
+    runner: |_: NoArgs, state: &CallState| KeystoneTool {
+        state: state.clone(),
     }
-}
-
-fn parse_keystone(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    parse_with(
-        KEYSTONE,
-        raw,
-        state,
-        |args: NoArgs| Ok(args),
-        |_, state| {
-            Ok(KeystoneTool {
-                graph:          state.graph.clone(),
-                analysis_cache: Arc::clone(&state.analysis_cache),
-            })
-        },
-    )
-}
+);
 
 struct KeystoneTool {
-    graph:          ActorRef<crate::graph::manager::GraphManager>,
-    analysis_cache: Arc<AnalysisCache>,
+    state: CallState,
 }
 
 #[async_trait]
 impl ToolInstance for KeystoneTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
         let (graph, graph_version) =
-            load_graph_with_version(&self.graph, &self.analysis_cache).await?;
+            load_graph_with_version(&self.state.graph, &self.state.analysis_cache).await?;
+        let meta = common::graph_meta(&self.state.graph).await?;
 
         let cache_key = AnalysisCacheKey {
             graph_version,
             kind: AnalysisKind::Keystone,
         };
 
-        let cached = self.analysis_cache.get_or_insert_with(cache_key, || {
-            let scores = analysis::keystone_scores(&graph);
-            let top_n = 20usize;
-            let rendered: Vec<_> = scores
-                .into_iter()
-                .take(top_n)
-                .map(|score| {
-                    json!({
-                        "slug": graph[score.node].slug,
-                        "score": score.score,
-                        "in_reach": score.in_reach,
-                        "out_reach": score.out_reach,
-                    })
-                })
-                .collect();
+        let payload = with_cached_analysis_result(
+            &self.state.analysis_cache,
+            cache_key,
+            graph_version,
+            || {
+                let graph = Arc::clone(&graph);
+                async move {
+                    let scores = analysis::keystone_scores(&graph);
+                    let top_n = 20usize;
+                    let rendered: Vec<_> = scores
+                        .into_iter()
+                        .take(top_n)
+                        .map(|score| {
+                            json!({
+                                "slug": graph[score.node].slug,
+                                "score": score.score,
+                                "in_reach": score.in_reach,
+                                "out_reach": score.out_reach,
+                            })
+                        })
+                        .collect();
 
-            json!({
-                "type": "graph_analysis",
-                "tool": KEYSTONE,
-                "total_ranked": rendered.len(),
-                "scores": rendered,
-            })
-        });
-
-        let payload = cached.payload.clone();
+                    Ok::<Value, ToolExecutionError>(json!({
+                        "type": "graph_analysis",
+                        "tool": KEYSTONE,
+                        "total_ranked": rendered.len(),
+                        "scores": rendered,
+                    }))
+                }
+            },
+        )
+        .await?;
 
         info!(
             tool = KEYSTONE,
@@ -936,7 +953,20 @@ impl ToolInstance for KeystoneTool {
             "graph keystone scores"
         );
 
-        Ok(ToolOutput::with_byte_hint(payload.clone(), payload_size_bytes(&payload)))
+        let approx = payload_size_bytes(&payload);
+        ToolRunner::new(KEYSTONE, &self.state)
+            .with_mode(ToolPayloadMode::Body)
+            .with_meta(meta)
+            .run(move |_| async move {
+                Ok(ToolRunPayload {
+                    body:          payload,
+                    approx_bytes:  Some(approx),
+                    preview:       None,
+                    preview_hints: Vec::new(),
+                    page:          None,
+                })
+            })
+            .await
     }
 }
 
@@ -964,73 +994,61 @@ pub struct AlignmentGapsArgs {
     )]
     pub fetch_body: bool,
 }
-
-pub(super) fn extraneous_meta() -> ToolPrototype {
-    ToolPrototype {
-        id:          EXTRANEOUS,
-        description: "Extraneous(A,L): knowledge required by an assessment via requires* but not \
-                      intended for the target LO. Compares to construct_irrelevant_demands to \
-                      surface construct-irrelevant demands.",
-        schema:      schema_for_args::<ExtraneousArgs>(),
-        parse:       parse_extraneous,
-    }
-}
-
-fn parse_extraneous(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    parse_with(
+crate::analysis_tool!(
+    extraneous_meta,
+    id: EXTRANEOUS,
+    description: "Extraneous(A,L): knowledge required by an assessment via requires* but not \
+                  intended for the target LO. Compares to construct_irrelevant_demands to \
+                  surface construct-irrelevant demands.",
+    args: ExtraneousArgs,
+    prepare: |raw| super::common::parse_args_with_builder(
         EXTRANEOUS,
         raw,
-        state,
         |mut input: ExtraneousArgs| {
-            input.assessment_slug =
-                require_string(input.assessment_slug, EXTRANEOUS, "assessment_slug")?;
+            input.assessment_slug = require_string(input.assessment_slug, EXTRANEOUS, "assessment_slug")?;
             input.lo_slug = require_string(input.lo_slug, EXTRANEOUS, "lo_slug")?;
             Ok(input)
         },
-        |args, state| {
-            Ok(ExtraneousTool {
-                args,
-                graph: state.graph.clone(),
-            })
-        },
-    )
-}
+    ),
+    runner: |args: ExtraneousArgs, state: &CallState| ExtraneousTool {
+        args,
+        state: state.clone(),
+    }
+);
 
 struct ExtraneousTool {
     args:  ExtraneousArgs,
-    graph: ActorRef<crate::graph::manager::GraphManager>,
+    state: CallState,
 }
 
 #[async_trait]
 impl ToolInstance for ExtraneousTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let assessment =
-            resolve_slug(&self.graph, self.args.assessment_slug.clone(), EXTRANEOUS).await?;
-        let lo = resolve_slug(&self.graph, self.args.lo_slug.clone(), EXTRANEOUS).await?;
+        let assessment = resolve_typed::<AssessmentItem>(
+            &self.state.graph,
+            Slug::new(self.args.assessment_slug.clone()),
+            EXTRANEOUS,
+        )
+        .await?;
+        let lo = resolve_typed::<LearningOutcome>(
+            &self.state.graph,
+            Slug::new(self.args.lo_slug.clone()),
+            EXTRANEOUS,
+        )
+        .await?;
         let graph: Arc<CurriculumGraph> = self
+            .state
             .graph
             .ask(crate::graph::commands::GetGraph)
             .await
             .map_err(map_send_err_inf)?;
-        ensure_knowledge_type(
-            &graph,
-            assessment,
-            &self.args.assessment_slug,
-            KnowledgeType::AssessmentItem,
-            EXTRANEOUS,
-        )?;
-        ensure_knowledge_type(
-            &graph,
-            lo,
-            &self.args.lo_slug,
-            KnowledgeType::LearningOutcome,
-            EXTRANEOUS,
-        )?;
+        let meta = common::graph_meta(&self.state.graph).await?;
 
-        let mut intended = std::collections::HashSet::new();
+        let mut intended = HashSet::new();
         if !self.args.intended_slugs.is_empty() {
             let ids =
-                resolve_slugs(&self.graph, self.args.intended_slugs.clone(), EXTRANEOUS).await?;
+                resolve_slugs(&self.state.graph, self.args.intended_slugs.clone(), EXTRANEOUS)
+                    .await?;
             intended.extend(ids);
         }
         if intended.is_empty() {
@@ -1064,86 +1082,94 @@ impl ToolInstance for ExtraneousTool {
             lo_slug = %self.args.lo_slug,
             "graph extraneous report"
         );
-        Ok(ToolOutput::with_byte_hint(payload.clone(), payload_size_bytes(&payload)))
-    }
-}
-
-pub(super) fn alignment_gaps_meta() -> ToolPrototype {
-    ToolPrototype {
-        id:          ALIGNMENT_GAPS,
-        description: "Course-wide alignment gaps: LOs with no target assessments, assessments \
-                      with no LO, and assessments unreachable from first principles (constructive \
-                      alignment scan).",
-        schema:      schema_for_args::<AlignmentGapsArgs>(),
-        parse:       parse_alignment_gaps,
-    }
-}
-
-fn parse_alignment_gaps(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    parse_with(
-        ALIGNMENT_GAPS,
-        raw,
-        state,
-        |args: AlignmentGapsArgs| Ok(args),
-        |args, state| {
-            Ok(AlignmentGapsTool {
-                args,
-                graph: state.graph.clone(),
-                metrics: Arc::clone(&state.metrics),
-                model: Arc::clone(&state.model),
-                conversation_id: Arc::clone(&state.conversation_id),
-                analysis_cache: Arc::clone(&state.analysis_cache),
+        let approx = payload_size_bytes(&payload);
+        ToolRunner::new(EXTRANEOUS, &self.state)
+            .with_mode(ToolPayloadMode::Body)
+            .with_meta(meta)
+            .run(move |_| async move {
+                Ok(ToolRunPayload {
+                    body:          payload,
+                    approx_bytes:  Some(approx),
+                    preview:       None,
+                    preview_hints: Vec::new(),
+                    page:          None,
+                })
             })
-        },
-    )
+            .await
+    }
 }
+crate::analysis_tool!(
+    alignment_gaps_meta,
+    id: ALIGNMENT_GAPS,
+    description: "Course-wide alignment gaps: LOs with no target assessments, assessments \
+                  with no LO, and assessments unreachable from first principles (constructive \
+                  alignment scan).",
+    args: AlignmentGapsArgs,
+    prepare: |raw| crate::tools::llm::common::parse_args(ALIGNMENT_GAPS, raw),
+    runner: |args: AlignmentGapsArgs, state: &CallState| AlignmentGapsTool {
+        args,
+        state: state.clone(),
+    }
+);
 
 struct AlignmentGapsTool {
-    args:            AlignmentGapsArgs,
-    graph:           ActorRef<crate::graph::manager::GraphManager>,
-    metrics:         Arc<crate::llm_gateway::GatewayMetrics>,
-    model:           Arc<String>,
-    conversation_id: Arc<String>,
-    analysis_cache:  Arc<AnalysisCache>,
+    args:  AlignmentGapsArgs,
+    state: CallState,
 }
 
 #[async_trait]
 impl ToolInstance for AlignmentGapsTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
+        let mode = ToolPayloadMode::from_fetch_flag(self.args.fetch_body);
         let (graph, graph_version) =
-            load_graph_with_version(&self.graph, &self.analysis_cache).await?;
-        let meta = common::graph_meta(&self.graph).await?;
+            load_graph_with_version(&self.state.graph, &self.state.analysis_cache).await?;
+        let meta = common::graph_meta(&self.state.graph).await?;
 
         let cache_key = AnalysisCacheKey {
             graph_version,
             kind: AnalysisKind::AssessmentGaps,
         };
 
-        let cached = self.analysis_cache.get_or_insert_with(cache_key, || {
-            let los = analysis::lo_missing_target_assessments(&graph);
-            let orphan = analysis::orphan_assessments(&graph);
-            let unreachable = analysis::unreachable_assessments(&graph);
-            json!({
-                "type": "graph_analysis",
-                "tool": ALIGNMENT_GAPS,
-                "los_missing_target_assessment": los.into_iter().map(|n| graph[n].slug.clone()).collect::<Vec<_>>(),
-                "assessments_without_lo": orphan.into_iter().map(|n| graph[n].slug.clone()).collect::<Vec<_>>(),
-                "assessments_unreachable": unreachable.into_iter().map(|n| graph[n].slug.clone()).collect::<Vec<_>>(),
-            })
-        });
-
-        finalize_summary_tool(
-            ALIGNMENT_GAPS,
-            cached.payload.clone(),
-            self.args.fetch_body,
-            SummaryContext {
-                metrics:         self.metrics.as_ref(),
-                model:           self.model.as_str(),
-                conversation_id: self.conversation_id.as_str(),
-                hint_prefix:     "Payload is",
-                meta:            &meta,
+        let payload = with_cached_analysis_result(
+            &self.state.analysis_cache,
+            cache_key,
+            graph_version,
+            || {
+                let graph = Arc::clone(&graph);
+                async move {
+                    let los = analysis::lo_missing_target_assessments(&graph);
+                    let orphan = analysis::orphan_assessments(&graph);
+                    let unreachable = analysis::unreachable_assessments(&graph);
+                    Ok::<Value, ToolExecutionError>(json!({
+                        "type": "graph_analysis",
+                        "tool": ALIGNMENT_GAPS,
+                        "los_missing_target_assessment": los.into_iter().map(|n| graph[n].slug.clone()).collect::<Vec<_>>(),
+                        "assessments_without_lo": orphan.into_iter().map(|n| graph[n].slug.clone()).collect::<Vec<_>>(),
+                        "assessments_unreachable": unreachable.into_iter().map(|n| graph[n].slug.clone()).collect::<Vec<_>>(),
+                    }))
+                }
             },
         )
+        .await?;
+
+        let approx = payload_size_bytes(&payload);
+        ToolRunner::new(ALIGNMENT_GAPS, &self.state)
+            .with_mode(mode)
+            .with_meta(meta)
+            .hints(vec![format!(
+                "Payload is ~{} bytes; set fetch_body=true to retrieve it.",
+                approx
+            )])
+            .run(move |_| async move {
+                Ok(ToolRunPayload {
+                    body:          payload,
+                    approx_bytes:  Some(approx),
+                    preview:       None,
+                    preview_hints: Vec::new(),
+                    page:          None,
+                })
+            })
+            .await
     }
 }
 

@@ -7,18 +7,13 @@ use anyhow::anyhow;
 use bon::Builder;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::json;
 use tracing::info;
 
-use super::common::{
-    MaybeApply, map_send_err_anyhow, parse_args_with_builder, parse_graph_command,
-};
+use super::common::{MaybeApply, map_send_err_anyhow, parse_args_with_builder};
 use crate::{
     graph::{commands::LoadSnapshot, manager::SaveSnapshot},
-    tools::llm::{
-        CallState, ToolExecutionError, ToolInputError, ToolPrototype, require_string,
-        schema_for_args,
-    },
+    tools::llm::{ToolExecutionError, ToolInputError, ToolPrototype, require_string},
 };
 
 fn command_ok(tool: &'static str, extra: serde_json::Value) -> serde_json::Value {
@@ -39,7 +34,7 @@ fn command_ok(tool: &'static str, extra: serde_json::Value) -> serde_json::Value
 const SAVE_SNAPSHOT: &str = "graph_save_now";
 const LOAD_SNAPSHOT: &str = "graph_load_snapshot";
 
-#[derive(Debug, Clone, Builder, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Builder, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SaveSnapshotArgs {
     #[serde(default)]
@@ -55,45 +50,33 @@ impl MaybeApply for SaveSnapshotArgs {
     }
 }
 
-pub(super) fn save_snapshot_meta() -> ToolPrototype {
-    ToolPrototype {
-        id:          SAVE_SNAPSHOT,
-        description: "Persist the in-memory graph to disk immediately. Use only when explicitly \
-                      asked to save a snapshot; autosave runs separately. Path defaults to \
-                      GRAPH_SNAPSHOT_PATH or graph_snapshot.json.",
-        schema:      schema_for_args::<SaveSnapshotArgs>(),
-        parse:       parse_save_snapshot,
-    }
-}
-
 fn build_save_snapshot(args: &SaveSnapshotArgs) -> SaveSnapshot {
     SaveSnapshot {
         path: PathBuf::from(resolve_snapshot_path(args.path.clone())),
     }
 }
 
-fn ok_save_snapshot(args: &SaveSnapshotArgs, _: ()) -> Value {
+fn ok_save_snapshot(args: &SaveSnapshotArgs, _: ()) -> serde_json::Value {
     let path = resolve_snapshot_path(args.path.clone());
     command_ok(SAVE_SNAPSHOT, json!({"path": path}))
 }
 
-fn parse_save_snapshot(
-    raw: Value,
-    state: &CallState,
-) -> crate::tools::llm::ToolInputResult<Box<dyn crate::tools::llm::ToolInstance>> {
-    parse_graph_command::<SaveSnapshotArgs, SaveSnapshot>(
-        SAVE_SNAPSHOT,
-        raw,
-        state,
-        build_save_snapshot,
-        |args, reply| {
-            let path = resolve_snapshot_path(args.path.clone());
-            info!(tool = SAVE_SNAPSHOT, path = %path, "graph save snapshot");
-            ok_save_snapshot(args, reply)
-        },
-        map_send_err_anyhow,
-    )
-}
+crate::graph_action_tool!(
+    save_snapshot_meta,
+    id: SAVE_SNAPSHOT,
+    description: "Persist the in-memory graph to disk immediately. Use only when explicitly asked \
+                  to save a snapshot; autosave runs separately. Path defaults to \
+                  GRAPH_SNAPSHOT_PATH or graph_snapshot.json.",
+    args: SaveSnapshotArgs,
+    prepare: |raw| super::common::parse_args_with_builder(SAVE_SNAPSHOT, raw, |args: SaveSnapshotArgs| Ok(args)),
+    build: |args: &SaveSnapshotArgs| build_save_snapshot(args),
+    ok: |args: &SaveSnapshotArgs, reply: ()| {
+        let path = resolve_snapshot_path(args.path.clone());
+        info!(tool = SAVE_SNAPSHOT, path = %path, "graph save snapshot");
+        ok_save_snapshot(args, reply)
+    },
+    map_err: map_send_err_anyhow
+);
 
 #[derive(Debug, Clone, Builder, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -110,16 +93,6 @@ pub struct LoadSnapshotArgs {
 impl MaybeApply for LoadSnapshotArgs {
     fn apply_flag(&self) -> bool {
         self.apply
-    }
-}
-
-pub(super) fn load_snapshot_meta() -> ToolPrototype {
-    ToolPrototype {
-        id:          LOAD_SNAPSHOT,
-        description: "Load a graph snapshot from disk, replacing the in-memory graph. Use only \
-                      when explicitly asked to restore from a snapshot path.",
-        schema:      schema_for_args::<LoadSnapshotArgs>(),
-        parse:       parse_load_snapshot,
     }
 }
 
@@ -155,32 +128,32 @@ fn map_load_snapshot_err(
     }
 }
 
-fn parse_load_snapshot(
-    raw: Value,
-    state: &CallState,
-) -> crate::tools::llm::ToolInputResult<Box<dyn crate::tools::llm::ToolInstance>> {
-    let args = parse_args_with_builder(LOAD_SNAPSHOT, raw, |mut input: LoadSnapshotArgs| {
-        input.path = require_string(input.path, LOAD_SNAPSHOT, "path")?;
-        Ok(input)
-    })?;
-    if !Path::new(&args.path).exists() {
-        return Err(ToolInputError::InvalidPayload {
-            tool:    LOAD_SNAPSHOT,
-            message: format!("snapshot file `{}` not found", args.path),
-        });
-    }
-    parse_graph_command::<LoadSnapshotArgs, LoadSnapshot>(
-        LOAD_SNAPSHOT,
-        serde_json::to_value(&args).expect("serialize"),
-        state,
-        build_load_snapshot,
-        |args, _| {
-            info!(tool = LOAD_SNAPSHOT, path = %args.path, "graph load snapshot");
-            command_ok(LOAD_SNAPSHOT, json!({"path": args.path}))
-        },
-        map_load_snapshot_err,
-    )
-}
+crate::graph_action_tool!(
+    load_snapshot_meta,
+    id: LOAD_SNAPSHOT,
+    description: "Load a graph snapshot from disk, replacing the in-memory graph. Use only when \
+                  explicitly asked to restore from a snapshot path.",
+    args: LoadSnapshotArgs,
+    prepare: |raw| {
+        let args = parse_args_with_builder(LOAD_SNAPSHOT, raw, |mut input: LoadSnapshotArgs| {
+            input.path = require_string(input.path, LOAD_SNAPSHOT, "path")?;
+            Ok(input)
+        })?;
+        if !Path::new(&args.path).exists() {
+            return Err(ToolInputError::InvalidPayload {
+                tool:    LOAD_SNAPSHOT,
+                message: format!("snapshot file `{}` not found", args.path),
+            });
+        }
+        Ok(args)
+    },
+    build: |args: &LoadSnapshotArgs| build_load_snapshot(args),
+    ok: |args: &LoadSnapshotArgs, _| {
+        info!(tool = LOAD_SNAPSHOT, path = %args.path, "graph load snapshot");
+        command_ok(LOAD_SNAPSHOT, json!({"path": args.path}))
+    },
+    map_err: map_load_snapshot_err
+);
 
 fn resolve_snapshot_path(path: Option<String>) -> String {
     path.or_else(|| env::var("GRAPH_SNAPSHOT_PATH").ok())

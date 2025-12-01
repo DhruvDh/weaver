@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use anyhow::anyhow;
 use async_trait::async_trait;
 use kameo::{
@@ -6,16 +8,12 @@ use kameo::{
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::{
     graph::{CurriculumGraph, GraphError, NodeId, NodeKind},
     schema::types::KnowledgeType,
-    tools::llm::{
-        CallState, ToolExecutionError, ToolInputError, ToolInputResult, ToolInstance, ToolOutput,
-        apply_preview_cost, estimate_tokens_from_characters, payload_size_bytes,
-        prepare_payload_estimates,
-    },
+    tools::llm::{CallState, ToolExecutionError, ToolInputError, ToolInputResult, ToolInstance},
 };
 
 /// Map graph errors into tool-facing errors.
@@ -103,74 +101,104 @@ pub(crate) fn ensure_knowledge_type(
     }
 }
 
-/// Generic, minimal boilerplate tool wrapper for simple graph commands that are
-/// just an actor message + a JSON success payload.
-type MsgReply<Msg> = <crate::graph::manager::GraphManager as kameo::message::Message<Msg>>::Reply;
+/// Ensure a slug resolves to some Knowledge node (any knowledge_type).
+pub(crate) fn ensure_any_knowledge(
+    graph: &CurriculumGraph,
+    id: NodeId,
+    slug: &str,
+    tool: &'static str,
+) -> Result<(), ToolExecutionError> {
+    match &graph[id].kind {
+        NodeKind::Knowledge(_) => Ok(()),
+        _ => Err(ToolExecutionError::Input(ToolInputError::InvalidPayload {
+            tool,
+            message: format!("slug `{}` is not a knowledge node (required by this tool)", slug),
+        })),
+    }
+}
 
-pub(crate) struct GraphCommandTool<Args, Msg>
+/// Ensure a slug resolves to instructional knowledge (non-LO/non-assessment).
+#[allow(dead_code)]
+pub(crate) fn ensure_instructional_knowledge(
+    graph: &CurriculumGraph,
+    id: NodeId,
+    slug: &str,
+    tool: &'static str,
+) -> Result<(), ToolExecutionError> {
+    match &graph[id].kind {
+        NodeKind::Knowledge(k) if k.knowledge_type.is_instructional_knowledge() => Ok(()),
+        _ => Err(ToolExecutionError::Input(ToolInputError::InvalidPayload {
+            tool,
+            message: format!(
+                "slug `{}` must be instructional knowledge \
+                 (factual/conceptual/procedural/metacognitive)",
+                slug
+            ),
+        })),
+    }
+}
+
+/// Ensure a slug resolves to a TeachingStep node.
+pub(crate) fn ensure_teaching_step(
+    graph: &CurriculumGraph,
+    id: NodeId,
+    slug: &str,
+    tool: &'static str,
+) -> Result<(), ToolExecutionError> {
+    match &graph[id].kind {
+        NodeKind::TeachingStep(_) => Ok(()),
+        _ => Err(ToolExecutionError::Input(ToolInputError::InvalidPayload {
+            tool,
+            message: format!("slug `{}` is not a teaching_step node (required by this tool)", slug),
+        })),
+    }
+}
+
+/// Generic adapter from args/build/map closures into the GraphAction trait so
+/// existing command parsers can stay simple.
+struct GraphActionAdapter<Args, Msg>
 where
     Msg: Send + 'static,
     crate::graph::manager::GraphManager: kameo::message::Message<Msg>,
 {
     args:    Args,
-    graph:   ActorRef<crate::graph::manager::GraphManager>,
-    state:   CallState,
     build:   fn(&Args) -> Msg,
     map_ok:  fn(&Args, <MsgReply<Msg> as kameo::Reply>::Ok) -> Value,
     map_err: fn(SendError<Msg, <MsgReply<Msg> as kameo::Reply>::Error>) -> ToolExecutionError,
     tool:    &'static str,
 }
 
-impl<Args, Msg> GraphCommandTool<Args, Msg>
-where
-    Msg: Send + 'static,
-    crate::graph::manager::GraphManager: kameo::message::Message<Msg>,
-{
-    pub(crate) fn new(
-        args: Args,
-        graph: ActorRef<crate::graph::manager::GraphManager>,
-        state: CallState,
-        build: fn(&Args) -> Msg,
-        map_ok: fn(&Args, <MsgReply<Msg> as kameo::Reply>::Ok) -> Value,
-        map_err: fn(SendError<Msg, <MsgReply<Msg> as kameo::Reply>::Error>) -> ToolExecutionError,
-        tool: &'static str,
-    ) -> Self {
-        Self {
-            args,
-            graph,
-            state,
-            build,
-            map_ok,
-            map_err,
-            tool,
-        }
-    }
-}
+type MsgReply<Msg> = <crate::graph::manager::GraphManager as kameo::message::Message<Msg>>::Reply;
 
 #[async_trait]
-impl<Args, Msg> ToolInstance for GraphCommandTool<Args, Msg>
+impl<Args, Msg> crate::tools::llm::common::GraphAction for GraphActionAdapter<Args, Msg>
 where
-    Args: Send + Sync + MaybeApply + 'static,
+    Args: MaybeApply + Send + Sync + 'static,
     Msg: Send + 'static,
     crate::graph::manager::GraphManager: kameo::message::Message<Msg>,
 {
-    async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let meta = graph_meta(&self.graph).await?;
-        if !self.args.apply_flag() {
-            let preview = json!({
-                "type": "graph_command",
-                "tool": self.tool,
-                "status": "preview",
-                "apply": false,
-                "hint": "Set apply=true to execute this mutation"
-            });
-            return Ok(preview_with_cost(self.tool, preview, &meta, &self.state));
-        }
-        let msg = (self.build)(&self.args);
-        let reply: <MsgReply<Msg> as kameo::Reply>::Ok =
-            self.graph.ask(msg).await.map_err(|e| (self.map_err)(e))?;
-        let payload = attach_meta((self.map_ok)(&self.args, reply), &meta);
-        Ok(apply_with_byte_hint(payload))
+    type Msg = Msg;
+    type Reply = <MsgReply<Msg> as kameo::Reply>::Ok;
+    type Err = <MsgReply<Msg> as kameo::Reply>::Error;
+
+    fn tool(&self) -> &'static str {
+        self.tool
+    }
+
+    fn apply(&self) -> bool {
+        self.args.apply_flag()
+    }
+
+    fn build_message(&self) -> Self::Msg {
+        (self.build)(&self.args)
+    }
+
+    fn map_ok(&self, reply: Self::Reply) -> Value {
+        (self.map_ok)(&self.args, reply)
+    }
+
+    fn map_err(&self, err: SendError<Self::Msg, Self::Err>) -> ToolExecutionError {
+        (self.map_err)(err)
     }
 }
 
@@ -181,6 +209,7 @@ pub(crate) fn parse_graph_command<Args, Msg>(
     build: fn(&Args) -> Msg,
     map_ok: fn(&Args, <MsgReply<Msg> as kameo::Reply>::Ok) -> Value,
     map_err: fn(SendError<Msg, <MsgReply<Msg> as kameo::Reply>::Error>) -> ToolExecutionError,
+    preflight: Option<crate::tools::llm::common::ArgsPreflight<Args>>,
 ) -> ToolInputResult<Box<dyn ToolInstance>>
 where
     Args: for<'de> Deserialize<'de> + JsonSchema + Clone + Send + Sync + MaybeApply + 'static,
@@ -192,14 +221,24 @@ where
         message: err.to_string(),
     })?;
 
-    Ok(Box::new(GraphCommandTool::new(
+    let action = GraphActionAdapter {
         args,
-        state.graph.clone(),
-        state.clone(),
         build,
         map_ok,
         map_err,
         tool,
+    };
+
+    let preflight = preflight.map(|pf| {
+        Arc::new(move |action: &GraphActionAdapter<Args, Msg>, state: &CallState| {
+            pf(&action.args, state)
+        }) as Arc<crate::tools::llm::common::GraphActionPreflight<_>>
+    });
+
+    Ok(Box::new(crate::tools::llm::common::GraphActionInstance::new(
+        action,
+        state.clone(),
+        preflight,
     )))
 }
 
@@ -222,43 +261,8 @@ where
     build(input)
 }
 
-/// Parse args and build a ToolInstance in one step, using a preparatory
-/// transform/validation on Args.
-pub(crate) fn parse_with<Args, Prep, Build, Inst>(
-    tool: &'static str,
-    raw: Value,
-    state: &CallState,
-    prep: Prep,
-    build: Build,
-) -> ToolInputResult<Box<dyn ToolInstance>>
-where
-    Args: for<'de> Deserialize<'de>,
-    Prep: FnOnce(Args) -> ToolInputResult<Args>,
-    Build: FnOnce(Args, &CallState) -> ToolInputResult<Inst>,
-    Inst: ToolInstance + 'static,
-{
-    let args = parse_args_with_builder(tool, raw, prep)?;
-    let instance = build(args, state)?;
-    Ok(Box::new(instance))
-}
-
 pub(crate) fn default_confidence() -> f32 {
     1.0
-}
-
-/// Paginate a list with limit/offset and return the slice plus metadata.
-/// Clamps limit to [1, 200] and offset to the vector length to avoid panics.
-pub(crate) fn paginate<T>(
-    mut items: Vec<T>,
-    limit: Option<usize>,
-    offset: Option<usize>,
-) -> (Vec<T>, usize, usize, bool) {
-    let len = items.len();
-    let limit = limit.unwrap_or(50).clamp(1, 200);
-    let offset = offset.unwrap_or(0).min(len);
-    let end = (offset + limit).min(len);
-    let has_more = end < len;
-    (items.drain(offset..end).collect(), offset, limit, has_more)
 }
 
 /// Resolve a slug to a NodeId through GraphManager to keep slug lookups
@@ -299,57 +303,4 @@ pub(crate) async fn graph_meta(
         .ask(crate::graph::manager::GetGraphMeta)
         .await
         .map_err(map_send_err_inf)
-}
-
-pub(crate) fn attach_meta(
-    mut payload: serde_json::Value,
-    meta: &crate::graph::manager::GraphMeta,
-) -> serde_json::Value {
-    if let serde_json::Value::Object(ref mut obj) = payload {
-        obj.insert(
-            "meta".to_string(),
-            serde_json::to_value(meta).unwrap_or(serde_json::Value::Null),
-        );
-    }
-    payload
-}
-
-fn preview_with_cost(
-    _tool: &'static str,
-    payload: serde_json::Value,
-    meta: &crate::graph::manager::GraphMeta,
-    state: &CallState,
-) -> ToolOutput {
-    let approx_bytes = payload_size_bytes(&payload);
-    let estimates = prepare_payload_estimates(&state.metrics, state.model.as_str(), approx_bytes);
-    let mut with_cost = payload;
-    if let serde_json::Value::Object(ref mut obj) = with_cost {
-        obj.insert(
-            "cost".to_string(),
-            json!({
-                "bytes_total": approx_bytes,
-                "approx_tokens": estimates.safe_tokens,
-                "preview_tokens": Value::Null,
-                "remaining_tokens": Value::Null,
-                "remaining_ratio": Value::Null,
-            }),
-        );
-    }
-    let preview_tokens = estimate_tokens_from_characters(payload_size_bytes(&with_cost) as usize);
-    apply_preview_cost(
-        &mut with_cost,
-        &state.metrics,
-        state.model.as_str(),
-        state.conversation_id.as_str(),
-        preview_tokens,
-        estimates.safe_tokens,
-    );
-    let with_meta = attach_meta(with_cost, meta);
-    let hint = payload_size_bytes(&with_meta);
-    ToolOutput::with_byte_hint(with_meta, hint)
-}
-
-fn apply_with_byte_hint(payload: serde_json::Value) -> ToolOutput {
-    let size = payload_size_bytes(&payload);
-    ToolOutput::with_byte_hint(payload, size)
 }

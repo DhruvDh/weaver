@@ -2,15 +2,16 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use kameo::prelude::ActorRef;
-use serde_json::{Value, json};
+use serde_json::json;
 
 use super::{
     analysis_cache::AnalysisCache,
-    common::{attach_meta, graph_meta, parse_args_with_builder},
+    common::{graph_meta, parse_args_with_builder},
 };
 use crate::tools::llm::{
-    CallState, ToolExecutionError, ToolInputResult, ToolInstance, ToolOutput, ToolPrototype,
-    schema_for_args,
+    CallState, ToolExecutionError, ToolInstance, ToolOutput, ToolPayloadMode, ToolPrototype,
+    common::{ToolRunPayload, ToolRunner},
+    payload_size_bytes,
 };
 
 const CLEAR_CACHE: &str = "graph_analysis_cache_clear";
@@ -20,25 +21,26 @@ const CLEAR_CACHE: &str = "graph_analysis_cache_clear";
 struct ClearCacheArgs;
 
 pub(super) fn tool_prototypes() -> Vec<ToolPrototype> {
-    vec![ToolPrototype {
-        id:          CLEAR_CACHE,
-        description: "Clear all analysis cache entries (ops/admin tool).",
-        schema:      schema_for_args::<ClearCacheArgs>(),
-        parse:       parse_clear_cache,
-    }]
+    vec![clear_cache_meta()]
 }
 
-fn parse_clear_cache(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    parse_args_with_builder(CLEAR_CACHE, raw, |args: ClearCacheArgs| Ok(args))?;
-    Ok(Box::new(ClearCacheTool {
+crate::analysis_tool!(
+    clear_cache_meta,
+    id: CLEAR_CACHE,
+    description: "Clear all analysis cache entries (ops/admin tool).",
+    args: ClearCacheArgs,
+    prepare: |raw| parse_args_with_builder(CLEAR_CACHE, raw, |args: ClearCacheArgs| Ok(args)),
+    runner: |_: ClearCacheArgs, state: &CallState| ClearCacheTool {
         analysis_cache: Arc::clone(&state.analysis_cache),
-        graph:          state.graph.clone(),
-    }))
-}
+        graph: state.graph.clone(),
+        state: state.clone(),
+    }
+);
 
 struct ClearCacheTool {
     analysis_cache: Arc<AnalysisCache>,
     graph:          ActorRef<crate::graph::manager::GraphManager>,
+    state:          CallState,
 }
 
 #[async_trait]
@@ -56,16 +58,27 @@ impl ToolInstance for ClearCacheTool {
         );
 
         let meta = graph_meta(&self.graph).await?;
-        let payload = attach_meta(
-            json!({
-                "type": "graph_admin",
-                "tool": CLEAR_CACHE,
-                "cleared": before,
-                "remaining": after,
-            }),
-            &meta,
-        );
+        let body = json!({
+            "type": "graph_admin",
+            "tool": CLEAR_CACHE,
+            "cleared": before,
+            "remaining": after,
+        });
+        let approx = payload_size_bytes(&body);
 
-        Ok(ToolOutput::new(payload))
+        ToolRunner::new(CLEAR_CACHE, &self.state)
+            .with_mode(ToolPayloadMode::Body)
+            .with_meta(meta)
+            .hints(vec![format!("Cleared {before} entries; {after} remain.")])
+            .run(move |_| async move {
+                Ok(ToolRunPayload {
+                    body,
+                    approx_bytes: Some(approx),
+                    preview: None,
+                    preview_hints: Vec::new(),
+                    page: None,
+                })
+            })
+            .await
     }
 }

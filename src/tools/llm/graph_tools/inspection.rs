@@ -1,16 +1,16 @@
 use async_trait::async_trait;
 use bon::Builder;
-use kameo::prelude::ActorRef;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::json;
 
-use super::common::{map_send_err, paginate, parse_args_with_builder};
+use super::common::{map_send_err, parse_args_with_builder};
 use crate::{
     graph::{NodeKind, commands::EdgeKindFilter},
     tools::llm::{
-        CallState, ToolExecutionError, ToolInputResult, ToolInstance, ToolOutput, ToolPrototype,
-        payload_size_bytes, require_string, schema_for_args,
+        CallState, ToolExecutionError, ToolInstance, ToolOutput, ToolPayloadMode, ToolPrototype,
+        common::{ToolRunPayload, ToolRunner},
+        require_string,
     },
 };
 
@@ -53,31 +53,26 @@ pub enum NeighborDirectionArg {
     Both,
 }
 
-pub(super) fn neighbors_meta() -> ToolPrototype {
-    ToolPrototype {
-        id:          GRAPH_NEIGHBORS,
-        description: "Inspect local graph structure: list neighbors with edge_kind and direction \
-                      (requires/supports/assesses/precedes/anchors). Use to read prerequisites, \
-                      scaffolds, assessment links, and discourse anchors around a node.",
-        schema:      schema_for_args::<NeighborsArgs>(),
-        parse:       parse_neighbors,
-    }
-}
-
-fn parse_neighbors(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let args = parse_args_with_builder(GRAPH_NEIGHBORS, raw, |mut input: NeighborsArgs| {
+crate::analysis_tool!(
+    neighbors_meta,
+    id: GRAPH_NEIGHBORS,
+    description: "Inspect local graph structure: list neighbors with edge_kind and direction \
+                  (requires/supports/assesses/precedes/anchors). Use to read prerequisites, \
+                  scaffolds, assessment links, and discourse anchors around a node.",
+    args: NeighborsArgs,
+    prepare: |raw| parse_args_with_builder(GRAPH_NEIGHBORS, raw, |mut input: NeighborsArgs| {
         input.slug = require_string(input.slug, GRAPH_NEIGHBORS, "slug")?;
         Ok(input)
-    })?;
-    Ok(Box::new(NeighborsTool {
+    }),
+    runner: |args: NeighborsArgs, state: &CallState| NeighborsTool {
         args,
-        graph: state.graph.clone(),
-    }))
-}
+        state: state.clone(),
+    }
+);
 
 struct NeighborsTool {
     args:  NeighborsArgs,
-    graph: ActorRef<crate::graph::manager::GraphManager>,
+    state: CallState,
 }
 
 #[async_trait]
@@ -92,6 +87,7 @@ impl ToolInstance for NeighborsTool {
         };
 
         let neighbors = self
+            .state
             .graph
             .ask(Neighbors {
                 slug: self.args.slug.clone(),
@@ -101,8 +97,7 @@ impl ToolInstance for NeighborsTool {
             .await
             .map_err(|e| map_send_err(e, GRAPH_NEIGHBORS))?;
 
-        let (page, offset, limit, has_more) =
-            paginate(neighbors, self.args.limit, self.args.offset);
+        let (page, page_meta) = crate::paginate!(neighbors, self.args.limit, self.args.offset);
 
         let rendered: Vec<_> = page
             .iter()
@@ -115,24 +110,31 @@ impl ToolInstance for NeighborsTool {
             })
             .collect();
 
-        let meta = super::common::graph_meta(&self.graph).await?;
+        let meta = super::common::graph_meta(&self.state.graph).await?;
+        let slug = self.args.slug.clone();
+        let neighbors = rendered;
 
-        let payload = super::common::attach_meta(
-            json!({
-                "type": "graph_view",
-                "tool": GRAPH_NEIGHBORS,
-                "slug": self.args.slug,
-                "offset": offset,
-                "limit": limit,
-                "has_more": has_more,
-                "neighbors": rendered,
-            }),
-            &meta,
-        );
-
-        let payload_size = crate::tools::llm::payload_size_bytes(&payload);
-
-        Ok(ToolOutput::with_byte_hint(payload, payload_size))
+        ToolRunner::new(GRAPH_NEIGHBORS, &self.state)
+            .with_mode(ToolPayloadMode::Body)
+            .with_meta(meta)
+            .run(move |_| async move {
+                Ok(ToolRunPayload {
+                    body:          json!({
+                        "type": "graph_view",
+                        "tool": GRAPH_NEIGHBORS,
+                        "slug": slug,
+                        "offset": page_meta.offset,
+                        "limit": page_meta.limit,
+                        "has_more": page_meta.has_more,
+                        "neighbors": neighbors,
+                    }),
+                    approx_bytes:  None,
+                    preview:       None,
+                    preview_hints: Vec::new(),
+                    page:          Some(page_meta),
+                })
+            })
+            .await
     }
 }
 
@@ -153,44 +155,40 @@ pub struct GetNodeArgs {
     pub slug: String,
 }
 
-pub(super) fn get_node_meta() -> ToolPrototype {
-    ToolPrototype {
-        id:          GET_NODE,
-        description: "Fetch a node payload by slug (kind, statement, rubric/construct-irrelevant \
-                      data, grain/load/scope, source_refs, tags). Use this before proposing edits \
-                      or edges.",
-        schema:      schema_for_args::<GetNodeArgs>(),
-        parse:       parse_get_node,
-    }
-}
-
-fn parse_get_node(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let args = parse_args_with_builder(GET_NODE, raw, |mut input: GetNodeArgs| {
+crate::analysis_tool!(
+    get_node_meta,
+    id: GET_NODE,
+    description: "Fetch a node payload by slug (kind, statement, rubric/construct-irrelevant \
+                  data, grain/load/scope, source_refs, tags). Use this before proposing edits \
+                  or edges.",
+    args: GetNodeArgs,
+    prepare: |raw| parse_args_with_builder(GET_NODE, raw, |mut input: GetNodeArgs| {
         input.slug = require_string(input.slug, GET_NODE, "slug")?;
         Ok(input)
-    })?;
-    Ok(Box::new(GetNodeTool {
+    }),
+    runner: |args: GetNodeArgs, state: &CallState| GetNodeTool {
         args,
-        graph: state.graph.clone(),
-    }))
-}
+        state: state.clone(),
+    }
+);
 
 struct GetNodeTool {
     args:  GetNodeArgs,
-    graph: ActorRef<crate::graph::manager::GraphManager>,
+    state: CallState,
 }
 
 #[async_trait]
 impl ToolInstance for GetNodeTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
         let payload = self
+            .state
             .graph
             .ask(crate::graph::commands::GetNode {
                 slug: self.args.slug.clone(),
             })
             .await
             .map_err(|e| map_send_err(e, GET_NODE))?;
-        let meta = super::common::graph_meta(&self.graph).await?;
+        let meta = super::common::graph_meta(&self.state.graph).await?;
         let value = match &payload.kind {
             NodeKind::Knowledge(k) => json!({
                 "slug": payload.slug,
@@ -222,15 +220,17 @@ impl ToolInstance for GetNodeTool {
                 "tags": payload.tags,
             }),
         };
-        let payload = super::common::attach_meta(
-            json!({
-                "type": "graph_view",
-                "tool": GET_NODE,
-                "node": value,
-            }),
-            &meta,
-        );
-        Ok(ToolOutput::with_byte_hint(payload.clone(), payload_size_bytes(&payload)))
+        ToolRunner::new(GET_NODE, &self.state)
+            .with_mode(ToolPayloadMode::Body)
+            .with_meta(meta)
+            .run(|_| async move {
+                Ok(ToolRunPayload::new(json!({
+                    "type": "graph_view",
+                    "tool": GET_NODE,
+                    "node": value,
+                })))
+            })
+            .await
     }
 }
 

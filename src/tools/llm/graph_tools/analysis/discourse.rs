@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bon::Builder;
-use kameo::prelude::ActorRef;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -11,14 +10,13 @@ use tracing::info;
 use super::load_graph_with_version;
 use crate::{
     analysis,
-    graph::manager::GraphManager,
     tools::llm::{
-        CallState, ToolExecutionError, ToolInputResult, ToolInstance, ToolOutput, ToolPrototype,
-        graph_tools::{
-            analysis_cache::{AnalysisCache, AnalysisCacheKey, AnalysisKind},
-            common::parse_with,
+        CallState, ToolExecutionError, ToolInstance, ToolOutput, ToolPayloadMode, ToolPrototype,
+        common::{ToolRunPayload, ToolRunner},
+        graph_tools::analysis_cache::{
+            AnalysisCacheKey, AnalysisKind, with_cached_analysis_result,
         },
-        payload_size_bytes, require_string, schema_for_args,
+        payload_size_bytes, require_string,
     },
 };
 
@@ -33,46 +31,30 @@ pub struct DiscourseOrphansArgs {
     pub episode: Option<String>,
 }
 
-pub(super) fn discourse_orphans_meta() -> ToolPrototype {
-    ToolPrototype {
-        id:          DISCOURSE_ORPHANS,
-        description: "Discourse continuity: list TeachingSteps with no precedes links in their \
-                      episode (orphans). Optionally filter by episode.",
-        schema:      schema_for_args::<DiscourseOrphansArgs>(),
-        parse:       parse_discourse_orphans,
+crate::analysis_tool!(
+    discourse_orphans_meta,
+    id: DISCOURSE_ORPHANS,
+    description: "Discourse continuity: list TeachingSteps with no precedes links in their \
+                  episode (orphans). Optionally filter by episode.",
+    args: DiscourseOrphansArgs,
+    prepare: |raw| crate::tools::llm::common::parse_args(DISCOURSE_ORPHANS, raw),
+    runner: |args: DiscourseOrphansArgs, state: &CallState| DiscourseOrphansTool {
+        args,
+        state: state.clone(),
     }
-}
-
-fn parse_discourse_orphans(
-    raw: Value,
-    state: &CallState,
-) -> ToolInputResult<Box<dyn ToolInstance>> {
-    parse_with(
-        DISCOURSE_ORPHANS,
-        raw,
-        state,
-        |args: DiscourseOrphansArgs| Ok(args),
-        |args, state| {
-            Ok(DiscourseOrphansTool {
-                args,
-                graph: state.graph.clone(),
-                analysis_cache: Arc::clone(&state.analysis_cache),
-            })
-        },
-    )
-}
+);
 
 struct DiscourseOrphansTool {
-    args:           DiscourseOrphansArgs,
-    graph:          ActorRef<GraphManager>,
-    analysis_cache: Arc<AnalysisCache>,
+    args:  DiscourseOrphansArgs,
+    state: CallState,
 }
 
 #[async_trait]
 impl ToolInstance for DiscourseOrphansTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
         let (graph, graph_version) =
-            load_graph_with_version(&self.graph, &self.analysis_cache).await?;
+            load_graph_with_version(&self.state.graph, &self.state.analysis_cache).await?;
+        let meta = super::common::graph_meta(&self.state.graph).await?;
 
         let cache_key = AnalysisCacheKey {
             graph_version,
@@ -81,24 +63,52 @@ impl ToolInstance for DiscourseOrphansTool {
             },
         };
 
-        let cached = self.analysis_cache.get_or_insert_with(cache_key, || {
-            let list = analysis::discourse_orphans(&graph, self.args.episode.as_deref());
-            let slugs: Vec<_> = list.into_iter().map(|n| graph[n].slug.clone()).collect();
-            json!({
-                "type": "graph_analysis",
-                "tool": DISCOURSE_ORPHANS,
-                "episode": self.args.episode,
-                "orphans": slugs,
-            })
-        });
-        let payload = cached.payload.clone();
+        let payload = with_cached_analysis_result(
+            &self.state.analysis_cache,
+            cache_key,
+            graph_version,
+            || {
+                let graph = Arc::clone(&graph);
+                let episode = self.args.episode.clone();
+                async move {
+                    let list = analysis::discourse_orphans(&graph, episode.as_deref());
+                    let slugs: Vec<_> = list.into_iter().map(|n| graph[n].slug.clone()).collect();
+                    Ok::<Value, ToolExecutionError>(json!({
+                        "type": "graph_analysis",
+                        "tool": DISCOURSE_ORPHANS,
+                        "episode": episode,
+                        "orphans": slugs,
+                    }))
+                }
+            },
+        )
+        .await?;
+
+        let orphan_count = payload["orphans"]
+            .as_array()
+            .map(|v: &Vec<_>| v.len())
+            .unwrap_or(0);
         info!(
             tool = DISCOURSE_ORPHANS,
             episode = ?self.args.episode,
-            orphan_count = payload["orphans"].as_array().map(|v: &Vec<_>| v.len()).unwrap_or(0),
+            orphan_count,
             "graph discourse orphans"
         );
-        Ok(ToolOutput::with_byte_hint(payload.clone(), payload_size_bytes(&payload)))
+        let approx = payload_size_bytes(&payload);
+
+        ToolRunner::new(DISCOURSE_ORPHANS, &self.state)
+            .with_mode(ToolPayloadMode::Body)
+            .with_meta(meta)
+            .run(move |_| async move {
+                Ok(ToolRunPayload {
+                    body:          payload,
+                    approx_bytes:  Some(approx),
+                    preview:       None,
+                    preview_hints: Vec::new(),
+                    page:          None,
+                })
+            })
+            .await
     }
 }
 
@@ -109,47 +119,38 @@ pub struct BorrowAheadArgs {
     pub episode: String,
 }
 
-pub(super) fn borrow_ahead_meta() -> ToolPrototype {
-    ToolPrototype {
-        id:          BORROW_AHEAD,
-        description: "Borrow-ahead detection within an episode: steps that use knowledge before \
-                      introduction in-scope, classified by introduction_scope and ordering \
-                      severity.",
-        schema:      schema_for_args::<BorrowAheadArgs>(),
-        parse:       parse_borrow_ahead,
-    }
-}
-
-fn parse_borrow_ahead(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    parse_with(
+crate::analysis_tool!(
+    borrow_ahead_meta,
+    id: BORROW_AHEAD,
+    description: "Borrow-ahead detection within an episode: steps that use knowledge before \
+                  introduction in-scope, classified by introduction_scope and ordering \
+                  severity.",
+    args: BorrowAheadArgs,
+    prepare: |raw| super::common::parse_args_with_builder(
         BORROW_AHEAD,
         raw,
-        state,
         |mut input: BorrowAheadArgs| {
             input.episode = require_string(input.episode, BORROW_AHEAD, "episode")?;
             Ok(input)
         },
-        |args, state| {
-            Ok(BorrowAheadTool {
-                args,
-                graph: state.graph.clone(),
-                analysis_cache: Arc::clone(&state.analysis_cache),
-            })
-        },
-    )
-}
+    ),
+    runner: |args: BorrowAheadArgs, state: &CallState| BorrowAheadTool {
+        args,
+        state: state.clone(),
+    }
+);
 
 struct BorrowAheadTool {
-    args:           BorrowAheadArgs,
-    graph:          ActorRef<GraphManager>,
-    analysis_cache: Arc<AnalysisCache>,
+    args:  BorrowAheadArgs,
+    state: CallState,
 }
 
 #[async_trait]
 impl ToolInstance for BorrowAheadTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
         let (graph, graph_version) =
-            load_graph_with_version(&self.graph, &self.analysis_cache).await?;
+            load_graph_with_version(&self.state.graph, &self.state.analysis_cache).await?;
+        let meta = super::common::graph_meta(&self.state.graph).await?;
 
         let cache_key = AnalysisCacheKey {
             graph_version,
@@ -158,33 +159,61 @@ impl ToolInstance for BorrowAheadTool {
             },
         };
 
-        let cached = self.analysis_cache.get_or_insert_with(cache_key, || {
-            let results = analysis::borrow_ahead(&graph, &self.args.episode);
-            let rendered: Vec<_> = results
-                .into_iter()
-                .map(|b| {
-                    json!({
-                        "step_slug": graph[b.step].slug.clone(),
-                        "target_slug": graph[b.target].slug.clone(),
-                        "severity": b.severity,
-                    })
-                })
-                .collect();
-            json!({
-                "type": "graph_analysis",
-                "tool": BORROW_AHEAD,
-                "episode": self.args.episode,
-                "borrow_ahead": rendered,
-            })
-        });
-        let payload = cached.payload.clone();
+        let payload = with_cached_analysis_result(
+            &self.state.analysis_cache,
+            cache_key,
+            graph_version,
+            || {
+                let graph = Arc::clone(&graph);
+                let episode = self.args.episode.clone();
+                async move {
+                    let results = analysis::borrow_ahead(&graph, &episode);
+                    let rendered: Vec<_> = results
+                        .into_iter()
+                        .map(|b| {
+                            json!({
+                                "step_slug": graph[b.step].slug.clone(),
+                                "target_slug": graph[b.target].slug.clone(),
+                                "severity": b.severity,
+                            })
+                        })
+                        .collect();
+                    Ok::<Value, ToolExecutionError>(json!({
+                        "type": "graph_analysis",
+                        "tool": BORROW_AHEAD,
+                        "episode": episode,
+                        "borrow_ahead": rendered,
+                    }))
+                }
+            },
+        )
+        .await?;
+
+        let count = payload["borrow_ahead"]
+            .as_array()
+            .map(|v: &Vec<_>| v.len())
+            .unwrap_or(0);
         info!(
             tool = BORROW_AHEAD,
             episode = %self.args.episode,
-            count = payload["borrow_ahead"].as_array().map(|v: &Vec<_>| v.len()).unwrap_or(0),
+            count,
             "graph borrow ahead"
         );
-        Ok(ToolOutput::with_byte_hint(payload.clone(), payload_size_bytes(&payload)))
+        let approx = payload_size_bytes(&payload);
+
+        ToolRunner::new(BORROW_AHEAD, &self.state)
+            .with_mode(ToolPayloadMode::Body)
+            .with_meta(meta)
+            .run(move |_| async move {
+                Ok(ToolRunPayload {
+                    body:          payload,
+                    approx_bytes:  Some(approx),
+                    preview:       None,
+                    preview_hints: Vec::new(),
+                    page:          None,
+                })
+            })
+            .await
     }
 }
 

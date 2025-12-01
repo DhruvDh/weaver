@@ -1,16 +1,16 @@
-use std::{path::PathBuf, sync::Arc};
-
 use anyhow::Context;
 use async_trait::async_trait;
 use bon::Builder;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::json;
 use tracing::info;
 
 use super::{
     CallState, ToolExecutionError, ToolInputError, ToolInputResult, ToolInstance, ToolOutput,
-    ToolPrototype, render_relative_path, resolve_workspace_path, schema_for_args, trim_optional,
+    ToolPayloadMode,
+    common::{ToolRunPayload, ToolRunner},
+    render_relative_path, resolve_workspace_path, trim_optional,
 };
 use crate::tools::filesystem;
 
@@ -35,51 +35,47 @@ struct ListDirectoryPayload {
     path: Option<String>,
 }
 
-pub(super) fn list_directory_meta() -> ToolPrototype {
-    ToolPrototype {
-        id:          IDENTIFIER,
-        description: DESCRIPTION,
-        schema:      schema_for_args::<ListDirectoryArgs>(),
-        parse:       parse_list_directory,
-    }
-}
+crate::basic_tool!(
+    list_directory_meta,
+    id: IDENTIFIER,
+    description: DESCRIPTION,
+    args: ListDirectoryArgs,
+    prepare: |raw, _state: &CallState| {
+        let payload: ListDirectoryPayload =
+            serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
+                tool:    IDENTIFIER,
+                message: err.to_string(),
+            })?;
 
-fn parse_list_directory(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let payload: ListDirectoryPayload =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    IDENTIFIER,
-            message: err.to_string(),
-        })?;
-
-    let args = match trim_optional(payload.path) {
-        Some(path) => ListDirectoryArgs::builder().path(path)?.build(),
-        None => ListDirectoryArgs::builder().build(),
-    };
-
-    Ok(Box::new(ListDirectoryTool {
+        let args = match trim_optional(payload.path) {
+            Some(path) => ListDirectoryArgs::builder().path(path)?.build(),
+            None => ListDirectoryArgs::builder().build(),
+        };
+        Ok(args)
+    },
+    runner: |args: ListDirectoryArgs, state: &CallState| ListDirectoryTool {
         args,
-        depth: state.depth,
-        workspace_root: Arc::clone(&state.workspace_root),
-    }))
-}
+        state: state.clone(),
+    }
+);
 
 struct ListDirectoryTool {
-    args:           ListDirectoryArgs,
-    depth:          usize,
-    workspace_root: Arc<PathBuf>,
+    args:  ListDirectoryArgs,
+    state: CallState,
 }
 
 #[async_trait]
 impl ToolInstance for ListDirectoryTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
         let relative = self.args.path.as_deref().unwrap_or(".");
-        let resolved = resolve_workspace_path(self.workspace_root.as_ref(), relative, IDENTIFIER)?;
+        let resolved =
+            resolve_workspace_path(self.state.workspace_root.as_ref(), relative, IDENTIFIER)?;
         let entries = filesystem::list_dir(&resolved)
             .await
             .with_context(|| format!("list_directory failed for {}", resolved.display()))?;
         info!(
             "tool_call list_directory depth={} path={} entry_count={}",
-            self.depth,
+            self.state.depth,
             resolved.display(),
             entries.len()
         );
@@ -88,12 +84,22 @@ impl ToolInstance for ListDirectoryTool {
             .map(|entry| {
                 json!({
                     "name": entry.name,
-                    "path": render_relative_path(self.workspace_root.as_ref(), &entry.path),
+                    "path": render_relative_path(self.state.workspace_root.as_ref(), &entry.path),
                     "kind": entry.kind.as_str(),
                     "size": entry.size,
                 })
             })
             .collect::<Vec<_>>();
-        Ok(ToolOutput::new(json!({ "entries": rendered })))
+        let entries_payload = rendered;
+        ToolRunner::new(IDENTIFIER, &self.state)
+            .with_mode(ToolPayloadMode::Body)
+            .run(move |_| async move {
+                Ok(ToolRunPayload::new(json!({
+                    "type": "data",
+                    "mode": "body",
+                    "entries": entries_payload
+                })))
+            })
+            .await
     }
 }

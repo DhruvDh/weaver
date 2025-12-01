@@ -15,14 +15,15 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::info;
 
-use super::common::{attach_meta, graph_meta, parse_args_with_builder};
+use super::common::{graph_meta, parse_args_with_builder};
 use crate::{
     graph::{CurriculumGraph, EdgeKind, traversal},
     tools::llm::{
-        CallState, RenderPayloadConfig, ToolExecutionError, ToolInputError, ToolInputResult,
-        ToolInstance, ToolOutput, ToolPayloadMode, ToolPrototype,
-        analysis_cache::{AnalysisCacheKey, AnalysisKind},
-        payload_size_bytes, prepare_payload_estimates, render_payload, schema_for_args,
+        CallState, ToolExecutionError, ToolInputError, ToolInstance, ToolOutput, ToolPayloadMode,
+        ToolPrototype,
+        analysis_cache::{AnalysisCacheKey, AnalysisKind, with_cached_analysis_result},
+        common::{Page, ToolRunPayload, ToolRunner},
+        payload_size_bytes, require_string,
     },
 };
 
@@ -51,49 +52,20 @@ async fn join_blocking_json(
     }
 }
 
-async fn respond_with_envelope(
-    tool: &'static str,
-    payload: Value,
-    fetch_body: bool,
-    state: &CallState,
-) -> Result<ToolOutput, ToolExecutionError> {
-    let meta = graph_meta(&state.graph).await?;
-    let approx_bytes = payload_size_bytes(&payload);
-    let estimates = prepare_payload_estimates(&state.metrics, state.model.as_str(), approx_bytes);
-    let mode = ToolPayloadMode::from_fetch_flag(fetch_body);
-    let rendered = render_payload(
-        RenderPayloadConfig {
-            mode,
-            tool,
-            approx_bytes,
-            safe_tokens: estimates.safe_tokens,
-            preview_hints: vec![
-                "Set fetch_body=true to stream results.".to_string(),
-                "Use limit to bound output volume.".to_string(),
-            ],
-            metrics: &state.metrics,
-            model: state.model.as_str(),
-            conversation_id: state.conversation_id.as_str(),
-        },
-        || attach_meta(payload, &meta),
-    );
-
-    Ok(match mode {
-        ToolPayloadMode::Preview => {
-            let with_meta = attach_meta(rendered.output.payload, &meta);
-            let hint_bytes = payload_size_bytes(&with_meta);
-            ToolOutput::with_byte_hint(with_meta, hint_bytes)
-        }
-        ToolPayloadMode::Body => rendered.output,
-    })
-}
-
 const REQUIRES_CYCLES: &str = "graph_requires_cycles";
 const REQUIRES_PAGERANK: &str = "graph_requires_pagerank";
 const REQUIRES_BRIDGES: &str = "graph_requires_bridges";
 const REQUIRES_ARTICULATION: &str = "graph_requires_articulation";
 const REQUIRES_FEEDBACK: &str = "graph_requires_feedback_arcs";
 const REQUIRES_SHORTEST_PATH: &str = "graph_requires_shortest_path";
+pub(crate) const ALGORITHM_TOOL_IDS: &[&str] = &[
+    REQUIRES_CYCLES,
+    REQUIRES_PAGERANK,
+    REQUIRES_BRIDGES,
+    REQUIRES_ARTICULATION,
+    REQUIRES_FEEDBACK,
+    REQUIRES_SHORTEST_PATH,
+];
 
 #[derive(Debug, Clone, Builder, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -136,94 +108,107 @@ const fn default_iterations() -> usize {
     20
 }
 
+crate::analysis_tool!(
+    requires_cycles_meta,
+    id: REQUIRES_CYCLES,
+    description: "Detect cycles in the requires layer (returns SCCs > size 1).",
+    args: CyclesArgs,
+    prepare: |raw| parse_args_with_builder(REQUIRES_CYCLES, raw, |args: CyclesArgs| Ok(args)),
+    runner: |args: CyclesArgs, state: &CallState| CyclesTool {
+        args,
+        state: state.clone(),
+    }
+);
+
+crate::analysis_tool!(
+    requires_pagerank_meta,
+    id: REQUIRES_PAGERANK,
+    description: "PageRank over the requires layer (influence of knowledge nodes).",
+    args: PageRankArgs,
+    prepare: |raw| {
+        let mut args = parse_args_with_builder(REQUIRES_PAGERANK, raw, |args: PageRankArgs| Ok(args))?;
+        if !(0.0..=1.0).contains(&args.damping) {
+            return Err(ToolInputError::InvalidPayload {
+                tool:    REQUIRES_PAGERANK,
+                message: "damping must be between 0 and 1".into(),
+            });
+        }
+        if args.iterations == 0 {
+            args.iterations = default_iterations();
+        }
+        Ok(args)
+    },
+    runner: |args: PageRankArgs, state: &CallState| PageRankTool {
+        args,
+        state: state.clone(),
+    }
+);
+
+crate::analysis_tool!(
+    requires_bridges_meta,
+    id: REQUIRES_BRIDGES,
+    description: "Bridges (cut edges) in the requires layer.",
+    args: CyclesArgs,
+    prepare: |raw| parse_args_with_builder(REQUIRES_BRIDGES, raw, |args: CyclesArgs| Ok(args)),
+    runner: |args: CyclesArgs, state: &CallState| BridgesTool {
+        args,
+        state: state.clone(),
+    }
+);
+
+crate::analysis_tool!(
+    requires_articulation_meta,
+    id: REQUIRES_ARTICULATION,
+    description: "Articulation points (cut nodes) in the requires layer.",
+    args: CyclesArgs,
+    prepare: |raw| parse_args_with_builder(REQUIRES_ARTICULATION, raw, |args: CyclesArgs| Ok(args)),
+    runner: |args: CyclesArgs, state: &CallState| ArticulationTool {
+        args,
+        state: state.clone(),
+    }
+);
+
+crate::analysis_tool!(
+    requires_feedback_meta,
+    id: REQUIRES_FEEDBACK,
+    description: "Greedy feedback arc set suggestions to break requires cycles.",
+    args: CyclesArgs,
+    prepare: |raw| parse_args_with_builder(REQUIRES_FEEDBACK, raw, |args: CyclesArgs| Ok(args)),
+    runner: |args: CyclesArgs, state: &CallState| FeedbackTool {
+        args,
+        state: state.clone(),
+    }
+);
+
+crate::analysis_tool!(
+    requires_shortest_path_meta,
+    id: REQUIRES_SHORTEST_PATH,
+    description: "Dijkstra shortest path (requires-only, unit weights) between two slugs.",
+    args: ShortestPathArgs,
+    prepare: |raw| parse_args_with_builder(
+        REQUIRES_SHORTEST_PATH,
+        raw,
+        |mut args: ShortestPathArgs| {
+            args.from_slug = require_string(args.from_slug, REQUIRES_SHORTEST_PATH, "from_slug")?;
+            args.to_slug = require_string(args.to_slug, REQUIRES_SHORTEST_PATH, "to_slug")?;
+            Ok(args)
+        },
+    ),
+    runner: |args: ShortestPathArgs, state: &CallState| ShortestPathTool {
+        args,
+        state: state.clone(),
+    }
+);
+
 pub(super) fn tool_prototypes() -> Vec<ToolPrototype> {
     vec![
-        ToolPrototype {
-            id:          REQUIRES_CYCLES,
-            description: "Detect cycles in the requires layer (returns SCCs > size 1).",
-            schema:      schema_for_args::<CyclesArgs>(),
-            parse:       parse_cycles,
-        },
-        ToolPrototype {
-            id:          REQUIRES_PAGERANK,
-            description: "PageRank over the requires layer (influence of knowledge nodes).",
-            schema:      schema_for_args::<PageRankArgs>(),
-            parse:       parse_pagerank,
-        },
-        ToolPrototype {
-            id:          REQUIRES_BRIDGES,
-            description: "Bridges (cut edges) in the requires layer.",
-            schema:      schema_for_args::<CyclesArgs>(),
-            parse:       parse_bridges,
-        },
-        ToolPrototype {
-            id:          REQUIRES_ARTICULATION,
-            description: "Articulation points (cut nodes) in the requires layer.",
-            schema:      schema_for_args::<CyclesArgs>(),
-            parse:       parse_articulation,
-        },
-        ToolPrototype {
-            id:          REQUIRES_FEEDBACK,
-            description: "Greedy feedback arc set suggestions to break requires cycles.",
-            schema:      schema_for_args::<CyclesArgs>(),
-            parse:       parse_feedback,
-        },
-        ToolPrototype {
-            id:          REQUIRES_SHORTEST_PATH,
-            description: "Dijkstra shortest path (requires-only, unit weights) between two slugs.",
-            schema:      schema_for_args::<ShortestPathArgs>(),
-            parse:       parse_shortest_path,
-        },
+        requires_cycles_meta(),
+        requires_pagerank_meta(),
+        requires_bridges_meta(),
+        requires_articulation_meta(),
+        requires_feedback_meta(),
+        requires_shortest_path_meta(),
     ]
-}
-
-fn parse_cycles(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let args = parse_args_with_builder(REQUIRES_CYCLES, raw, |args: CyclesArgs| Ok(args))?;
-    Ok(Box::new(CyclesTool {
-        args,
-        state: state.clone(),
-    }))
-}
-
-fn parse_pagerank(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let mut args = parse_args_with_builder(REQUIRES_PAGERANK, raw, |args: PageRankArgs| Ok(args))?;
-    if !(0.0..=1.0).contains(&args.damping) {
-        return Err(ToolInputError::InvalidPayload {
-            tool:    REQUIRES_PAGERANK,
-            message: "damping must be between 0 and 1".into(),
-        });
-    }
-    if args.iterations == 0 {
-        args.iterations = default_iterations();
-    }
-    Ok(Box::new(PageRankTool {
-        args,
-        state: state.clone(),
-    }))
-}
-
-fn parse_bridges(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let args = parse_args_with_builder(REQUIRES_BRIDGES, raw, |args: CyclesArgs| Ok(args))?;
-    Ok(Box::new(BridgesTool {
-        args,
-        state: state.clone(),
-    }))
-}
-
-fn parse_articulation(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let args = parse_args_with_builder(REQUIRES_ARTICULATION, raw, |args: CyclesArgs| Ok(args))?;
-    Ok(Box::new(ArticulationTool {
-        args,
-        state: state.clone(),
-    }))
-}
-
-fn parse_feedback(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let args = parse_args_with_builder(REQUIRES_FEEDBACK, raw, |args: CyclesArgs| Ok(args))?;
-    Ok(Box::new(FeedbackTool {
-        args,
-        state: state.clone(),
-    }))
 }
 
 #[derive(Debug, Clone, Builder, Deserialize, JsonSchema)]
@@ -239,15 +224,6 @@ pub struct ShortestPathArgs {
     pub fetch_body: bool,
 }
 
-fn parse_shortest_path(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let args =
-        parse_args_with_builder(REQUIRES_SHORTEST_PATH, raw, |args: ShortestPathArgs| Ok(args))?;
-    Ok(Box::new(ShortestPathTool {
-        args,
-        state: state.clone(),
-    }))
-}
-
 struct CyclesTool {
     args:  CyclesArgs,
     state: CallState,
@@ -256,17 +232,20 @@ struct CyclesTool {
 #[async_trait]
 impl ToolInstance for CyclesTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
+        let mode = ToolPayloadMode::from_fetch_flag(self.args.fetch_body);
         let (graph, graph_version) =
             load_graph_with_version(&self.state.graph, &self.state.analysis_cache).await?;
+        let meta = graph_meta(&self.state.graph).await?;
         let cache_key = AnalysisCacheKey {
             graph_version,
             kind: AnalysisKind::RequiresCycles,
         };
 
-        let cached = self
-            .state
-            .analysis_cache
-            .get_or_try_insert_with_async(cache_key, || {
+        let payload = with_cached_analysis_result(
+            &self.state.analysis_cache,
+            cache_key,
+            graph_version,
+            || {
                 let graph = Arc::clone(&graph);
                 async move {
                     let handle = tokio::task::spawn_blocking(move || -> AnyResult<Value> {
@@ -286,45 +265,55 @@ impl ToolInstance for CyclesTool {
                                 })
                             })
                             .collect();
-                        Ok(json!({
-                            "components": items,
-                        }))
+                        Ok(json!({ "components": items }))
                     });
                     join_blocking_json(handle, REQUIRES_CYCLES).await
                 }
-            })
-            .await?;
-
-        let mut payload = cached.payload.clone();
-        let limit = self.args.limit.unwrap_or(200).min(500);
-        if let Some(arr) = payload["components"].as_array().cloned() {
-            let mut trimmed = arr;
-            if trimmed.len() > limit {
-                trimmed.truncate(limit);
-            }
-            payload["components"] = json!(trimmed);
-        }
-
-        info!(
-            tool = REQUIRES_CYCLES,
-            count = payload["components"]
-                .as_array()
-                .map(|v| v.len())
-                .unwrap_or(0),
-            "graph requires cycles"
-        );
-
-        respond_with_envelope(
-            REQUIRES_CYCLES,
-            json!({
-                "type": "graph_analysis",
-                "tool": REQUIRES_CYCLES,
-                "components": payload["components"].clone(),
-            }),
-            self.args.fetch_body,
-            &self.state,
+            },
         )
-        .await
+        .await?;
+
+        let mut components = payload["components"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let total = components.len();
+        let limit = self.args.limit.unwrap_or(200).min(500);
+        if components.len() > limit {
+            components.truncate(limit);
+        }
+        let has_more = total > limit;
+        let body = json!({
+            "type": "graph_analysis",
+            "tool": REQUIRES_CYCLES,
+            "components": components,
+        });
+        info!(tool = REQUIRES_CYCLES, count = total, limit, has_more, "graph requires cycles");
+
+        let approx = payload_size_bytes(&body);
+        let page = Page {
+            offset: 0,
+            limit,
+            has_more,
+        };
+
+        ToolRunner::new(REQUIRES_CYCLES, &self.state)
+            .with_mode(mode)
+            .with_meta(meta)
+            .hints(vec![
+                "Set fetch_body=true to stream results.".to_string(),
+                "Use limit to bound output volume.".to_string(),
+            ])
+            .run(move |_| async move {
+                Ok(ToolRunPayload {
+                    body,
+                    approx_bytes: Some(approx),
+                    preview: None,
+                    preview_hints: Vec::new(),
+                    page: Some(page),
+                })
+            })
+            .await
     }
 }
 
@@ -336,8 +325,10 @@ struct PageRankTool {
 #[async_trait]
 impl ToolInstance for PageRankTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
+        let mode = ToolPayloadMode::from_fetch_flag(self.args.fetch_body);
         let (graph, graph_version) =
             load_graph_with_version(&self.state.graph, &self.state.analysis_cache).await?;
+        let meta = graph_meta(&self.state.graph).await?;
 
         let cache_key = AnalysisCacheKey {
             graph_version,
@@ -347,10 +338,11 @@ impl ToolInstance for PageRankTool {
             },
         };
 
-        let cached = self
-            .state
-            .analysis_cache
-            .get_or_try_insert_with_async(cache_key, || {
+        let payload = with_cached_analysis_result(
+            &self.state.analysis_cache,
+            cache_key,
+            graph_version,
+            || {
                 let graph = Arc::clone(&graph);
                 let damping = self.args.damping;
                 let iterations = self.args.iterations;
@@ -377,38 +369,60 @@ impl ToolInstance for PageRankTool {
                     });
                     join_blocking_json(handle, REQUIRES_PAGERANK).await
                 }
-            })
-            .await?;
+            },
+        )
+        .await?;
 
-        let mut items = cached
-            .payload
+        let mut items = payload
             .get("items")
             .and_then(|v| v.as_array().cloned())
             .unwrap_or_default();
+        let total = items.len();
         let limit = self.args.limit.unwrap_or(50).min(500);
         if items.len() > limit {
             items.truncate(limit);
         }
+        let has_more = total > limit;
 
         info!(
             tool = REQUIRES_PAGERANK,
-            limit = limit,
+            limit,
             iter = self.args.iterations,
             damping = self.args.damping,
+            total,
+            has_more,
             "graph requires pagerank"
         );
 
-        respond_with_envelope(
-            REQUIRES_PAGERANK,
-            json!({
-                "type": "graph_analysis",
-                "tool": REQUIRES_PAGERANK,
-                "items": items,
-            }),
-            self.args.fetch_body,
-            &self.state,
-        )
-        .await
+        let body = json!({
+            "type": "graph_analysis",
+            "tool": REQUIRES_PAGERANK,
+            "items": items,
+        });
+        let approx = payload_size_bytes(&body);
+        let page = Page {
+            offset: 0,
+            limit,
+            has_more,
+        };
+
+        ToolRunner::new(REQUIRES_PAGERANK, &self.state)
+            .with_mode(mode)
+            .with_meta(meta)
+            .hints(vec![
+                "Set fetch_body=true to stream results.".to_string(),
+                "Use limit to bound output volume.".to_string(),
+            ])
+            .run(move |_| async move {
+                Ok(ToolRunPayload {
+                    body,
+                    approx_bytes: Some(approx),
+                    preview: None,
+                    preview_hints: Vec::new(),
+                    page: Some(page),
+                })
+            })
+            .await
     }
 }
 
@@ -420,17 +434,20 @@ struct BridgesTool {
 #[async_trait]
 impl ToolInstance for BridgesTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
+        let mode = ToolPayloadMode::from_fetch_flag(self.args.fetch_body);
         let (graph, graph_version) =
             load_graph_with_version(&self.state.graph, &self.state.analysis_cache).await?;
+        let meta = graph_meta(&self.state.graph).await?;
         let cache_key = AnalysisCacheKey {
             graph_version,
             kind: AnalysisKind::RequiresBridges,
         };
 
-        let cached = self
-            .state
-            .analysis_cache
-            .get_or_try_insert_with_async(cache_key, || {
+        let payload = with_cached_analysis_result(
+            &self.state.analysis_cache,
+            cache_key,
+            graph_version,
+            || {
                 let graph = Arc::clone(&graph);
                 async move {
                     let handle = tokio::task::spawn_blocking(move || -> AnyResult<Value> {
@@ -472,26 +489,53 @@ impl ToolInstance for BridgesTool {
                     });
                     join_blocking_json(handle, REQUIRES_BRIDGES).await
                 }
-            })
-            .await?;
+            },
+        )
+        .await?;
 
-        let limit = self.args.limit.unwrap_or(200).min(500);
-        let mut edges = cached
-            .payload
+        let mut edges = payload
             .get("edges")
             .and_then(|v| v.as_array().cloned())
             .unwrap_or_default();
+        let total = edges.len();
+        let limit = self.args.limit.unwrap_or(200).min(500);
         if edges.len() > limit {
             edges.truncate(limit);
         }
-        info!(tool = REQUIRES_BRIDGES, count = edges.len(), "graph requires bridges");
-        respond_with_envelope(
-            REQUIRES_BRIDGES,
-            json!({"type": "graph_analysis","tool": REQUIRES_BRIDGES,"edges": edges}),
-            self.args.fetch_body,
-            &self.state,
-        )
-        .await
+        let has_more = total > limit;
+        info!(
+            tool = REQUIRES_BRIDGES,
+            count = total,
+            limit,
+            has_more,
+            "graph requires bridges"
+        );
+
+        let body = json!({"type": "graph_analysis","tool": REQUIRES_BRIDGES,"edges": edges});
+        let approx = payload_size_bytes(&body);
+        let page = Page {
+            offset: 0,
+            limit,
+            has_more,
+        };
+
+        ToolRunner::new(REQUIRES_BRIDGES, &self.state)
+            .with_mode(mode)
+            .with_meta(meta)
+            .hints(vec![
+                "Set fetch_body=true to stream results.".to_string(),
+                "Use limit to bound output volume.".to_string(),
+            ])
+            .run(move |_| async move {
+                Ok(ToolRunPayload {
+                    body,
+                    approx_bytes: Some(approx),
+                    preview: None,
+                    preview_hints: Vec::new(),
+                    page: Some(page),
+                })
+            })
+            .await
     }
 }
 
@@ -503,17 +547,20 @@ struct ArticulationTool {
 #[async_trait]
 impl ToolInstance for ArticulationTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
+        let mode = ToolPayloadMode::from_fetch_flag(self.args.fetch_body);
         let (graph, graph_version) =
             load_graph_with_version(&self.state.graph, &self.state.analysis_cache).await?;
+        let meta = graph_meta(&self.state.graph).await?;
         let cache_key = AnalysisCacheKey {
             graph_version,
             kind: AnalysisKind::RequiresArticulation,
         };
 
-        let cached = self
-            .state
-            .analysis_cache
-            .get_or_try_insert_with_async(cache_key, || {
+        let payload = with_cached_analysis_result(
+            &self.state.analysis_cache,
+            cache_key,
+            graph_version,
+            || {
                 let graph = Arc::clone(&graph);
                 async move {
                     let handle = tokio::task::spawn_blocking(move || -> AnyResult<Value> {
@@ -548,26 +595,53 @@ impl ToolInstance for ArticulationTool {
                     });
                     join_blocking_json(handle, REQUIRES_ARTICULATION).await
                 }
-            })
-            .await?;
+            },
+        )
+        .await?;
 
-        let limit = self.args.limit.unwrap_or(200).min(500);
-        let mut nodes = cached
-            .payload
+        let mut nodes = payload
             .get("nodes")
             .and_then(|v| v.as_array().cloned())
             .unwrap_or_default();
+        let total = nodes.len();
+        let limit = self.args.limit.unwrap_or(200).min(500);
         if nodes.len() > limit {
             nodes.truncate(limit);
         }
-        info!(tool = REQUIRES_ARTICULATION, count = nodes.len(), "graph requires articulation");
-        respond_with_envelope(
-            REQUIRES_ARTICULATION,
-            json!({"type": "graph_analysis","tool": REQUIRES_ARTICULATION,"nodes": nodes}),
-            self.args.fetch_body,
-            &self.state,
-        )
-        .await
+        let has_more = total > limit;
+        info!(
+            tool = REQUIRES_ARTICULATION,
+            count = total,
+            limit,
+            has_more,
+            "graph requires articulation"
+        );
+
+        let body = json!({"type": "graph_analysis","tool": REQUIRES_ARTICULATION,"nodes": nodes});
+        let approx = payload_size_bytes(&body);
+        let page = Page {
+            offset: 0,
+            limit,
+            has_more,
+        };
+
+        ToolRunner::new(REQUIRES_ARTICULATION, &self.state)
+            .with_mode(mode)
+            .with_meta(meta)
+            .hints(vec![
+                "Set fetch_body=true to stream results.".to_string(),
+                "Use limit to bound output volume.".to_string(),
+            ])
+            .run(move |_| async move {
+                Ok(ToolRunPayload {
+                    body,
+                    approx_bytes: Some(approx),
+                    preview: None,
+                    preview_hints: Vec::new(),
+                    page: Some(page),
+                })
+            })
+            .await
     }
 }
 
@@ -579,17 +653,20 @@ struct FeedbackTool {
 #[async_trait]
 impl ToolInstance for FeedbackTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
+        let mode = ToolPayloadMode::from_fetch_flag(self.args.fetch_body);
         let (graph, graph_version) =
             load_graph_with_version(&self.state.graph, &self.state.analysis_cache).await?;
+        let meta = graph_meta(&self.state.graph).await?;
         let cache_key = AnalysisCacheKey {
             graph_version,
             kind: AnalysisKind::RequiresFeedback,
         };
 
-        let cached = self
-            .state
-            .analysis_cache
-            .get_or_try_insert_with_async(cache_key, || {
+        let payload = with_cached_analysis_result(
+            &self.state.analysis_cache,
+            cache_key,
+            graph_version,
+            || {
                 let graph = Arc::clone(&graph);
                 async move {
                     let handle = tokio::task::spawn_blocking(move || -> AnyResult<Value> {
@@ -606,26 +683,53 @@ impl ToolInstance for FeedbackTool {
                     });
                     join_blocking_json(handle, REQUIRES_FEEDBACK).await
                 }
-            })
-            .await?;
+            },
+        )
+        .await?;
 
-        let limit = self.args.limit.unwrap_or(200).min(500);
-        let mut edges = cached
-            .payload
+        let mut edges = payload
             .get("edges")
             .and_then(|v| v.as_array().cloned())
             .unwrap_or_default();
+        let total = edges.len();
+        let limit = self.args.limit.unwrap_or(200).min(500);
         if edges.len() > limit {
             edges.truncate(limit);
         }
-        info!(tool = REQUIRES_FEEDBACK, count = edges.len(), "graph requires feedback arcs");
-        respond_with_envelope(
-            REQUIRES_FEEDBACK,
-            json!({"type": "graph_analysis","tool": REQUIRES_FEEDBACK,"edges": edges}),
-            self.args.fetch_body,
-            &self.state,
-        )
-        .await
+        let has_more = total > limit;
+        info!(
+            tool = REQUIRES_FEEDBACK,
+            count = total,
+            limit,
+            has_more,
+            "graph requires feedback arcs"
+        );
+
+        let body = json!({"type": "graph_analysis","tool": REQUIRES_FEEDBACK,"edges": edges});
+        let approx = payload_size_bytes(&body);
+        let page = Page {
+            offset: 0,
+            limit,
+            has_more,
+        };
+
+        ToolRunner::new(REQUIRES_FEEDBACK, &self.state)
+            .with_mode(mode)
+            .with_meta(meta)
+            .hints(vec![
+                "Set fetch_body=true to stream results.".to_string(),
+                "Use limit to bound output volume.".to_string(),
+            ])
+            .run(move |_| async move {
+                Ok(ToolRunPayload {
+                    body,
+                    approx_bytes: Some(approx),
+                    preview: None,
+                    preview_hints: Vec::new(),
+                    page: Some(page),
+                })
+            })
+            .await
     }
 }
 
@@ -637,8 +741,10 @@ struct ShortestPathTool {
 #[async_trait]
 impl ToolInstance for ShortestPathTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
+        let mode = ToolPayloadMode::from_fetch_flag(self.args.fetch_body);
         let (graph_ref, graph_version) =
             load_graph_with_version(&self.state.graph, &self.state.analysis_cache).await?;
+        let meta = graph_meta(&self.state.graph).await?;
 
         // resolve slugs
         let from = graph_ref
@@ -668,10 +774,11 @@ impl ToolInstance for ShortestPathTool {
             },
         };
 
-        let cached = self
-            .state
-            .analysis_cache
-            .get_or_try_insert_with_async(cache_key, || {
+        let payload = with_cached_analysis_result(
+            &self.state.analysis_cache,
+            cache_key,
+            graph_version,
+            || {
                 let graph_ref = Arc::clone(&graph_ref);
                 async move {
                     let handle = tokio::task::spawn_blocking(move || -> AnyResult<Value> {
@@ -688,15 +795,14 @@ impl ToolInstance for ShortestPathTool {
                     });
                     join_blocking_json(handle, REQUIRES_SHORTEST_PATH).await
                 }
-            })
-            .await?;
+            },
+        )
+        .await?;
 
-        let cost = cached
-            .payload
+        let cost = payload
             .get("cost")
             .and_then(|v| v.as_u64().map(|c| c as usize));
-        let path = cached
-            .payload
+        let path = payload
             .get("path")
             .and_then(|v| v.as_array().cloned())
             .unwrap_or_default();
@@ -709,17 +815,27 @@ impl ToolInstance for ShortestPathTool {
             "graph requires shortest path"
         );
 
-        respond_with_envelope(
-            REQUIRES_SHORTEST_PATH,
-            json!({
-                "type": "graph_analysis",
-                "tool": REQUIRES_SHORTEST_PATH,
-                "cost": cost,
-                "path": path,
-            }),
-            self.args.fetch_body,
-            &self.state,
-        )
-        .await
+        let body = json!({
+            "type": "graph_analysis",
+            "tool": REQUIRES_SHORTEST_PATH,
+            "cost": cost,
+            "path": path,
+        });
+        let approx = payload_size_bytes(&body);
+
+        ToolRunner::new(REQUIRES_SHORTEST_PATH, &self.state)
+            .with_mode(mode)
+            .with_meta(meta)
+            .hints(vec!["Set fetch_body=true to stream results.".to_string()])
+            .run(move |_| async move {
+                Ok(ToolRunPayload {
+                    body,
+                    approx_bytes: Some(approx),
+                    preview: None,
+                    preview_hints: Vec::new(),
+                    page: None,
+                })
+            })
+            .await
     }
 }

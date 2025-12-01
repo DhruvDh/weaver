@@ -284,6 +284,43 @@ impl AnalysisCache {
     }
 }
 
+/// Unified helper to prune to a specific graph version and fetch or compute an
+/// analysis payload asynchronously. Returns only the cached payload to keep
+/// call sites concise.
+pub async fn with_cached_analysis<F, Fut>(
+    cache: &AnalysisCache,
+    key: AnalysisCacheKey,
+    current_version: u64,
+    compute: F,
+) -> serde_json::Value
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = serde_json::Value> + Send + 'static,
+{
+    cache.prune_for_version(current_version);
+    cache
+        .get_or_insert_with_async(key, compute)
+        .await
+        .payload
+        .clone()
+}
+
+/// Variant that propagates compute errors and only caches on success.
+pub async fn with_cached_analysis_result<F, Fut, E>(
+    cache: &AnalysisCache,
+    key: AnalysisCacheKey,
+    current_version: u64,
+    compute: F,
+) -> Result<serde_json::Value, E>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<serde_json::Value, E>> + Send + 'static,
+{
+    cache.prune_for_version(current_version);
+    let value = cache.get_or_try_insert_with_async(key, compute).await?;
+    Ok(value.payload.clone())
+}
+
 // Caching policy (keep in sync when adding tools):
 // - LoBundle (graph_lo_alignment_summary, graph_lo_reachability,
 //   graph_lo_assessments_view, graph_lo_coverage,

@@ -6,19 +6,18 @@ use petgraph::visit::EdgeRef;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tracing::info;
 
 use super::{
     analysis_cache::{AnalysisCache, AnalysisCacheKey, AnalysisKind},
-    common::{ensure_knowledge_type, map_send_err_inf, resolve_slug},
+    common::map_send_err_inf,
 };
 use crate::{
     analysis,
     graph::{CurriculumGraph, NodeId},
-    schema::types::KnowledgeType,
     tools::llm::{
-        RenderPayloadConfig, ToolExecutionError, ToolOutput, ToolPayloadMode, ToolPrototype,
-        graph_tools::common, payload_size_bytes, prepare_payload_estimates, render_payload,
+        ToolExecutionError, ToolPrototype,
+        common::{LearningOutcome, Slug, resolve_typed},
+        graph_tools::common,
     },
 };
 
@@ -49,9 +48,8 @@ pub(super) async fn load_lo_with_graph(
     lo_slug: &str,
     tool: &'static str,
 ) -> Result<(Arc<CurriculumGraph>, u64, NodeId), ToolExecutionError> {
-    let lo = resolve_slug(graph, lo_slug.to_string(), tool).await?;
+    let lo = resolve_typed::<LearningOutcome>(graph, Slug::new(lo_slug.to_string()), tool).await?;
     let (g, version) = load_graph_with_version(graph, cache).await?;
-    ensure_knowledge_type(&g, lo, lo_slug, KnowledgeType::LearningOutcome, tool)?;
     Ok((g, version, lo))
 }
 
@@ -60,12 +58,11 @@ pub(super) async fn load_lo_with_graph_only(
     lo_slug: &str,
     tool: &'static str,
 ) -> Result<(Arc<CurriculumGraph>, NodeId), ToolExecutionError> {
-    let lo = resolve_slug(graph, lo_slug.to_string(), tool).await?;
+    let lo = resolve_typed::<LearningOutcome>(graph, Slug::new(lo_slug.to_string()), tool).await?;
     let g: Arc<CurriculumGraph> = graph
         .ask(crate::graph::commands::GetGraph)
         .await
         .map_err(map_send_err_inf)?;
-    ensure_knowledge_type(&g, lo, lo_slug, KnowledgeType::LearningOutcome, tool)?;
     Ok((g, lo))
 }
 
@@ -123,47 +120,6 @@ pub struct CachedGapBundle {
 pub fn decode_cached<T: for<'de> Deserialize<'de>>(value: &Value) -> Result<T, ToolExecutionError> {
     serde_json::from_value(value.clone())
         .map_err(|err| ToolExecutionError::Internal(anyhow!("cache decode failed: {err}")))
-}
-
-pub struct SummaryContext<'a> {
-    metrics:         &'a crate::tools::llm::GatewayMetrics,
-    model:           &'a str,
-    conversation_id: &'a str,
-    hint_prefix:     &'a str,
-    meta:            &'a crate::graph::manager::GraphMeta,
-}
-
-pub fn finalize_summary_tool(
-    tool: &'static str,
-    payload: serde_json::Value,
-    fetch_body: bool,
-    ctx: SummaryContext<'_>,
-) -> Result<ToolOutput, ToolExecutionError> {
-    let payload_with_meta = common::attach_meta(payload, ctx.meta);
-    let approx_bytes = payload_size_bytes(&payload_with_meta);
-    let estimates = prepare_payload_estimates(ctx.metrics, ctx.model, approx_bytes);
-    let mode = ToolPayloadMode::from_fetch_flag(fetch_body);
-    info!(tool = tool, mode = mode.as_str(), approx_bytes, "graph summary tool");
-
-    let rendered = render_payload(
-        RenderPayloadConfig {
-            mode,
-            tool,
-            approx_bytes,
-            safe_tokens: estimates.safe_tokens,
-            preview_hints: vec![format!(
-                "{hint_prefix} ~{} bytes; set fetch_body=true to retrieve it.",
-                approx_bytes,
-                hint_prefix = ctx.hint_prefix
-            )],
-            metrics: ctx.metrics,
-            model: ctx.model,
-            conversation_id: ctx.conversation_id,
-        },
-        || payload_with_meta,
-    );
-
-    Ok(rendered.output)
 }
 
 pub fn cache_lo_bundle(

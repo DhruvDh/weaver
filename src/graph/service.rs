@@ -39,6 +39,8 @@ struct ValidationIssue {
     promote_in_strict: bool,
 }
 
+type GuardCallback<'a> = Box<dyn FnOnce(&mut GraphService) + 'a>;
+
 bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     struct InvariantFamilies: u16 {
@@ -67,6 +69,28 @@ struct ValidationState {
     dirty: AtomicU16,
 }
 
+#[allow(dead_code)]
+pub mod test_support {
+    use std::sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    };
+
+    static TEST_VALIDATION_DELAY_MS: OnceLock<AtomicU64> = OnceLock::new();
+
+    pub fn set_test_validation_delay_ms(delay: u64) -> u64 {
+        TEST_VALIDATION_DELAY_MS
+            .get_or_init(|| AtomicU64::new(0))
+            .swap(delay, Ordering::Relaxed)
+    }
+
+    pub fn test_validation_delay_ms() -> u64 {
+        TEST_VALIDATION_DELAY_MS
+            .get_or_init(|| AtomicU64::new(0))
+            .load(Ordering::Relaxed)
+    }
+}
+
 impl ValidationState {
     fn new_empty() -> Self {
         Self {
@@ -91,6 +115,112 @@ struct ValidationContext {
     expected_revision:     Option<String>,
     rubric_prev:           HashMap<String, u64>,
     include_rubric_update: bool,
+}
+
+/// Lightweight helper for provenance checks to keep error text consistent.
+struct Provenance<'a> {
+    expected: Option<&'a str>,
+}
+
+impl<'a> Provenance<'a> {
+    fn new(expected: Option<&'a str>) -> Self {
+        Self { expected }
+    }
+
+    fn check(&self, spans: &[SourceRef], label: &str) -> Result<(), GraphError> {
+        let Some(expected) = self.expected else {
+            return Ok(());
+        };
+        for span in spans {
+            if span.revision != expected {
+                return Err(GraphError::Schema(format!(
+                    "{label} source_ref revision `{}` must equal course_commit `{}`",
+                    span.revision, expected
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// RAII helper to mark invariant families as dirty, run validations, and roll
+/// back on error. Intended to reduce repetition across mutation handlers.
+struct ValidationGuard<'a> {
+    svc:        &'a mut GraphService,
+    scope:      ValidationScope,
+    rollback:   Option<GuardCallback<'a>>,
+    on_success: Option<GuardCallback<'a>>,
+    committed:  bool,
+}
+
+impl<'a> ValidationGuard<'a> {
+    fn new(
+        svc: &'a mut GraphService,
+        families: InvariantFamilies,
+        scope: ValidationScope,
+        rollback: impl FnOnce(&mut GraphService) + 'a,
+    ) -> Self {
+        svc.mark_dirty(families);
+        Self {
+            svc,
+            scope,
+            rollback: Some(Box::new(rollback)),
+            on_success: None,
+            committed: false,
+        }
+    }
+
+    fn on_success(mut self, f: impl FnOnce(&mut GraphService) + 'a) -> Self {
+        self.on_success = Some(Box::new(f));
+        self
+    }
+
+    fn commit(mut self) -> Result<(), GraphError> {
+        let result = match &self.scope {
+            ValidationScope::Full => {
+                let families = self.svc.planned_families(InvariantFamilies::ALL);
+                self.svc
+                    .validate_invariants(ValidationScope::Full, families)
+            }
+            ValidationScope::Targeted {
+                coverage_los,
+                skip_requires_dag,
+                skip_fadeability,
+            } => self.svc.validate_targeted_invariants(
+                coverage_los.clone(),
+                *skip_requires_dag,
+                *skip_fadeability,
+            ),
+        };
+
+        match result {
+            Ok(_) => {
+                if let Some(cb) = self.on_success.take() {
+                    cb(self.svc);
+                }
+                self.svc.bump_version();
+                self.committed = true;
+                Ok(())
+            }
+            Err(err) => {
+                if let Some(rb) = self.rollback.take() {
+                    rb(self.svc);
+                }
+                self.committed = true;
+                Err(err)
+            }
+        }
+    }
+}
+
+impl<'a> Drop for ValidationGuard<'a> {
+    fn drop(&mut self) {
+        if !self.committed
+            && let Some(rb) = self.rollback.take()
+        {
+            rb(self.svc);
+        }
+    }
 }
 
 /// Core graph owner with slug lookup and optional strict quality mode.
@@ -310,7 +440,6 @@ impl GraphService {
         if payload.knowledge_type.is_assessment_item() {
             dirty.insert(InvariantFamilies::PURITY);
         }
-        self.mark_dirty(dirty);
         let logical_id = Uuid::new_v4();
         let node = NodePayload {
             logical_id,
@@ -326,13 +455,21 @@ impl GraphService {
             }
             _ => Vec::new(),
         };
-        if let Err(err) = self.validate_targeted_invariants(coverage_los, true, true) {
-            self.graph_mut().remove_node(id);
-            self.slug_to_node.remove(&slug);
-            return Err(err);
-        }
-        self.refresh_rubric_hashes();
-        self.bump_version();
+        let guard = ValidationGuard::new(
+            self,
+            dirty,
+            ValidationScope::Targeted {
+                coverage_los,
+                skip_requires_dag: true,
+                skip_fadeability: true,
+            },
+            move |svc| {
+                svc.graph_mut().remove_node(id);
+                svc.slug_to_node.remove(&slug);
+            },
+        )
+        .on_success(|svc| svc.refresh_rubric_hashes());
+        guard.commit()?;
         Ok(id)
     }
 
@@ -394,7 +531,6 @@ impl GraphService {
         if needs_purity {
             dirty.insert(InvariantFamilies::PURITY);
         }
-        self.mark_dirty(dirty);
 
         // apply tentative change
         self.graph_mut()[id].kind = NodeKind::Knowledge(payload);
@@ -434,14 +570,21 @@ impl GraphService {
             .into_iter()
             .collect();
 
-        if let Err(err) = self.validate_targeted_invariants(coverage_los, true, true) {
-            // rollback
-            self.graph_mut()[id].kind = old_kind;
-            self.graph_mut()[id].tags = old_tags;
-            return Err(err);
-        }
-        self.refresh_rubric_hashes();
-        self.bump_version();
+        let guard = ValidationGuard::new(
+            self,
+            dirty,
+            ValidationScope::Targeted {
+                coverage_los,
+                skip_requires_dag: true,
+                skip_fadeability: true,
+            },
+            move |svc| {
+                svc.graph_mut()[id].kind = old_kind;
+                svc.graph_mut()[id].tags = old_tags;
+            },
+        )
+        .on_success(|svc| svc.refresh_rubric_hashes());
+        guard.commit()?;
         Ok(id)
     }
 
@@ -495,24 +638,48 @@ impl GraphService {
         }
 
         let id = self.node_by_slug(old_slug)?;
-        self.slug_to_node.remove(old_slug);
-        self.slug_to_node.insert(new_slug.clone(), id);
-        self.graph_mut()[id].slug = new_slug.clone();
-
-        // keep denormalized claims in sync for assesses edges targeting this node
+        let old_index = self.slug_to_node.clone();
+        let old_rubric = self
+            .rubric_hashes
+            .read()
+            .expect("rubric_hashes lock")
+            .clone();
         let incoming: Vec<_> = self
             .graph()
             .edges_directed(id, Direction::Incoming)
             .map(|e| e.id())
             .collect();
+        let incoming_for_rollback = incoming.clone();
+
+        self.slug_to_node.remove(old_slug);
+        self.slug_to_node.insert(new_slug.clone(), id);
+        self.graph_mut()[id].slug = new_slug.clone();
+
+        // keep denormalized claims in sync for assesses edges targeting this node
         for edge_id in incoming {
             if let EdgeKind::Assesses(attrs) = &mut self.graph_mut()[edge_id].kind {
                 attrs.evidence_link.claim = new_slug.clone();
             }
         }
-        self.refresh_rubric_hashes();
-        self.bump_version();
-        Ok(())
+
+        let guard = ValidationGuard::new(self, InvariantFamilies::ALL, ValidationScope::Full, {
+            let old_slug = old_slug.to_string();
+            let old_index = old_index.clone();
+            let old_rubric = old_rubric.clone();
+            let incoming = incoming_for_rollback.clone();
+            move |svc| {
+                svc.slug_to_node = old_index;
+                svc.graph_mut()[id].slug = old_slug.clone();
+                for edge_id in incoming.iter().copied() {
+                    if let EdgeKind::Assesses(attrs) = &mut svc.graph_mut()[edge_id].kind {
+                        attrs.evidence_link.claim = old_slug.clone();
+                    }
+                }
+                *svc.rubric_hashes.write().expect("rubric_hashes lock") = old_rubric;
+            }
+        })
+        .on_success(|svc| svc.refresh_rubric_hashes());
+        guard.commit()
     }
 
     pub fn remove_node(&mut self, slug: &str) -> Result<(), GraphError> {
@@ -527,22 +694,19 @@ impl GraphService {
             .read()
             .expect("rubric_hashes lock")
             .clone();
-        self.mark_dirty(InvariantFamilies::ALL);
 
         self.slug_to_node.remove(slug);
         self.graph_mut().remove_node(id);
 
-        if let Err(err) = self.validate_global_invariants() {
-            // rollback
-            self.graph = old_graph;
-            self.slug_to_node = old_index;
-            self.graph_version = old_version;
-            *self.rubric_hashes.write().expect("rubric_hashes lock") = old_rubric;
-            return Err(err);
-        }
-
-        self.refresh_rubric_hashes();
-        self.bump_version();
+        let guard =
+            ValidationGuard::new(self, InvariantFamilies::ALL, ValidationScope::Full, move |svc| {
+                svc.graph = old_graph;
+                svc.slug_to_node = old_index;
+                svc.graph_version = old_version;
+                *svc.rubric_hashes.write().expect("rubric_hashes lock") = old_rubric;
+            })
+            .on_success(|svc| svc.refresh_rubric_hashes());
+        guard.commit()?;
         Ok(())
     }
 
@@ -633,11 +797,6 @@ impl GraphService {
         }
         validate_source_refs(&payload.source_refs)?;
         self.validate_revision(&payload.source_refs, "teaching_step")?;
-        self.mark_dirty(
-            InvariantFamilies::STATEMENTS
-                | InvariantFamilies::PROVENANCE
-                | InvariantFamilies::DISCOURSE,
-        );
         let logical_id = Uuid::new_v4();
         let node = NodePayload {
             logical_id,
@@ -647,13 +806,23 @@ impl GraphService {
         };
         let id = self.graph_mut().add_node(node);
         self.upsert_slug(slug.clone(), id);
-        if let Err(err) = self.validate_targeted_invariants(Vec::new(), true, true) {
-            self.graph_mut().remove_node(id);
-            self.slug_to_node.remove(&slug);
-            return Err(err);
-        }
-        self.refresh_rubric_hashes();
-        self.bump_version();
+        let guard = ValidationGuard::new(
+            self,
+            InvariantFamilies::STATEMENTS
+                | InvariantFamilies::PROVENANCE
+                | InvariantFamilies::DISCOURSE,
+            ValidationScope::Targeted {
+                coverage_los:      Vec::new(),
+                skip_requires_dag: true,
+                skip_fadeability:  true,
+            },
+            move |svc| {
+                svc.graph_mut().remove_node(id);
+                svc.slug_to_node.remove(&slug);
+            },
+        )
+        .on_success(|svc| svc.refresh_rubric_hashes());
+        guard.commit()?;
         Ok(id)
     }
 
@@ -684,11 +853,6 @@ impl GraphService {
         }
         validate_source_refs(&payload.source_refs)?;
         self.validate_revision(&payload.source_refs, "teaching_step")?;
-        self.mark_dirty(
-            InvariantFamilies::STATEMENTS
-                | InvariantFamilies::PROVENANCE
-                | InvariantFamilies::DISCOURSE,
-        );
         self.graph_mut()[id].kind = NodeKind::TeachingStep(payload);
 
         if let Err(err) = self.validate_incident_edges(id) {
@@ -696,13 +860,23 @@ impl GraphService {
             return Err(err);
         }
         self.graph_mut()[id].tags = tags;
-        if let Err(err) = self.validate_targeted_invariants(Vec::new(), true, true) {
-            self.graph_mut()[id].kind = old_kind;
-            self.graph_mut()[id].tags = old_tags;
-            return Err(err);
-        }
-        self.refresh_rubric_hashes();
-        self.bump_version();
+        let guard = ValidationGuard::new(
+            self,
+            InvariantFamilies::STATEMENTS
+                | InvariantFamilies::PROVENANCE
+                | InvariantFamilies::DISCOURSE,
+            ValidationScope::Targeted {
+                coverage_los:      Vec::new(),
+                skip_requires_dag: true,
+                skip_fadeability:  true,
+            },
+            move |svc| {
+                svc.graph_mut()[id].kind = old_kind;
+                svc.graph_mut()[id].tags = old_tags;
+            },
+        )
+        .on_success(|svc| svc.refresh_rubric_hashes());
+        guard.commit()?;
         Ok(id)
     }
 
@@ -766,17 +940,19 @@ impl GraphService {
         if !coverage_los.is_empty() {
             dirty.insert(InvariantFamilies::COVERAGE);
         }
-        self.mark_dirty(dirty);
-
-        if let Err(err) =
-            self.validate_targeted_invariants(coverage_los, skip_requires_dag, skip_fadeability)
-        {
-            // rollback
-            self.graph_mut().remove_edge(edge_id);
-            return Err(err);
-        }
-
-        self.bump_version();
+        let guard = ValidationGuard::new(
+            self,
+            dirty,
+            ValidationScope::Targeted {
+                coverage_los,
+                skip_requires_dag,
+                skip_fadeability,
+            },
+            move |svc| {
+                svc.graph_mut().remove_edge(edge_id);
+            },
+        );
+        guard.commit()?;
         Ok(edge_id)
     }
 
@@ -787,17 +963,7 @@ impl GraphService {
     }
 
     fn validate_revision(&self, spans: &[SourceRef], label: &str) -> Result<(), GraphError> {
-        if let Some(expected) = &self.expected_revision {
-            for span in spans {
-                if span.revision != *expected {
-                    return Err(GraphError::Schema(format!(
-                        "{label} source_ref revision `{}` must equal course_commit `{}`",
-                        span.revision, expected
-                    )));
-                }
-            }
-        }
-        Ok(())
+        Provenance::new(self.expected_revision.as_deref()).check(spans, label)
     }
 
     fn refresh_rubric_hashes(&self) {
@@ -926,8 +1092,14 @@ impl GraphService {
                 .clone(),
             include_rubric_update: true,
         };
-        let handle =
-            task::spawn_blocking(move || run_invariants_for_graph(&graph, scope, &ctx, effective));
+        let handle = task::spawn_blocking(move || {
+            let delay_ms = crate::graph::service::test_support::test_validation_delay_ms();
+            if delay_ms > 0 {
+                std::thread::sleep(Duration::from_millis(delay_ms));
+            }
+
+            run_invariants_for_graph(&graph, scope, &ctx, effective)
+        });
         let join_result = match timeout(timeout_ms, handle).await {
             Ok(res) => res,
             Err(_) => {

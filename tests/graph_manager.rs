@@ -1,5 +1,6 @@
 use std::{fs, path::PathBuf};
 
+use kameo::{actor::Spawn, error::SendError, prelude::*};
 use kameo_persistence::PersistentActor;
 use url::Url;
 use uuid::Uuid;
@@ -29,6 +30,23 @@ fn mk_kn(title: &str, kt: KnowledgeType) -> KnowledgeNode {
         grain_level: None,
         intrinsic_load: None,
         introduction_scope: weaver::graph::IntroductionScope::InCourse,
+    }
+}
+
+struct ValidationDelayGuard {
+    prev_ms: u64,
+}
+
+impl ValidationDelayGuard {
+    fn set(delay_ms: u64) -> Self {
+        let prev_ms = weaver::graph::service::test_support::set_test_validation_delay_ms(delay_ms);
+        Self { prev_ms }
+    }
+}
+
+impl Drop for ValidationDelayGuard {
+    fn drop(&mut self) {
+        let _ = weaver::graph::service::test_support::set_test_validation_delay_ms(self.prev_ms);
     }
 }
 
@@ -82,6 +100,71 @@ async fn graph_manager_persists_and_restores_state() -> anyhow::Result<()> {
         .await
         .expect("stop restored graph manager");
     restored.wait_for_shutdown().await;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn apply_runtime_config_honors_validation_timeout() -> anyhow::Result<()> {
+    let _delay_guard = ValidationDelayGuard::set(50);
+
+    let evidence = SourceRef {
+        path:       "dummy".into(),
+        start_line: 1,
+        end_line:   1,
+        revision:   "deadbeef".into(),
+    };
+
+    let mut svc = GraphService::new();
+    svc.add_knowledge_node("k1".into(), mk_kn("k1", KnowledgeType::Conceptual), vec![])?;
+    svc.add_knowledge_node("k2".into(), mk_kn("k2", KnowledgeType::Procedural), vec![])?;
+    let from = svc.node_by_slug("k1")?;
+    let to = svc.node_by_slug("k2")?;
+    let attrs = weaver::graph::RequiresAttrs {
+        strength:      weaver::schema::types::Strength::Necessary,
+        rationale:     "seq".into(),
+        evidence_refs: vec![evidence.clone()],
+    };
+    svc.add_edge::<weaver::graph::RequiresSpec>(from, to, attrs, 1.0)?;
+
+    let state = GraphManagerState::new(
+        svc.snapshot_graph(),
+        String::new(),
+        false,
+        svc.graph_version(),
+        2_000,
+    );
+
+    let actor: ActorRef<GraphManager> = GraphManager::spawn(state);
+
+    match actor
+        .ask(weaver::graph::manager::ApplyRuntimeConfig {
+            course_commit:         String::new(),
+            strict_quality:        false,
+            validation_timeout_ms: 1,
+        })
+        .await
+    {
+        Ok(()) => panic!("expected validation timeout, got success"),
+        Err(SendError::HandlerError(err)) => {
+            let graph_err = err
+                .downcast_ref::<weaver::graph::GraphError>()
+                .expect("graph error");
+            match graph_err {
+                weaver::graph::GraphError::InvariantTimeout { timeout_ms } => {
+                    assert_eq!(*timeout_ms, 1)
+                }
+                other => panic!("unexpected error {other:?}"),
+            }
+        }
+        Err(send_err) => panic!("unexpected send error: {send_err:?}"),
+    }
+
+    actor
+        .stop_gracefully()
+        .await
+        .expect("stop graph manager actor");
+    actor.wait_for_shutdown().await;
 
     Ok(())
 }

@@ -26,6 +26,7 @@ use crate::{
     llm_gateway::{GatewayMetrics, LLMGateway},
 };
 
+mod common;
 mod delegate_tasks;
 pub mod graph_tools;
 mod list_directory;
@@ -216,67 +217,6 @@ pub fn apply_preview_cost(
         cost.insert("preview_tokens".to_string(), json!(preview_tokens));
         cost.insert("remaining_tokens".to_string(), json!(remaining));
         cost.insert("remaining_ratio".to_string(), json!(ratio));
-    }
-}
-
-pub struct RenderedPayload {
-    pub output:        ToolOutput,
-    pub payload_bytes: u64,
-}
-
-pub struct RenderPayloadConfig<'a> {
-    pub mode:            ToolPayloadMode,
-    pub tool:            &'static str,
-    pub approx_bytes:    u64,
-    pub safe_tokens:     Option<u64>,
-    pub preview_hints:   Vec<String>,
-    pub metrics:         &'a GatewayMetrics,
-    pub model:           &'a str,
-    pub conversation_id: &'a str,
-}
-
-pub fn render_payload<B>(config: RenderPayloadConfig<'_>, body_fn: B) -> RenderedPayload
-where
-    B: FnOnce() -> Value,
-{
-    let RenderPayloadConfig {
-        mode,
-        tool,
-        approx_bytes,
-        safe_tokens,
-        preview_hints,
-        metrics,
-        model,
-        conversation_id,
-    } = config;
-
-    match mode {
-        ToolPayloadMode::Preview => {
-            let mut preview = build_cost_preview(tool, approx_bytes, safe_tokens, preview_hints);
-            let payload_bytes = payload_size_bytes(&preview);
-            let preview_tokens = estimate_tokens_from_characters(payload_bytes as usize);
-            apply_preview_cost(
-                &mut preview,
-                metrics,
-                model,
-                conversation_id,
-                preview_tokens,
-                safe_tokens,
-            );
-
-            RenderedPayload {
-                output: ToolOutput::with_byte_hint(preview, payload_bytes),
-                payload_bytes,
-            }
-        }
-        ToolPayloadMode::Body => {
-            let body = body_fn();
-            let payload_bytes = payload_size_bytes(&body);
-            RenderedPayload {
-                output: ToolOutput::with_byte_hint(body, payload_bytes),
-                payload_bytes,
-            }
-        }
     }
 }
 

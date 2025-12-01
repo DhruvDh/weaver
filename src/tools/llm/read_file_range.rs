@@ -1,20 +1,18 @@
-use std::{path::PathBuf, sync::Arc};
-
 use anyhow::Context;
 use async_trait::async_trait;
 use bon::Builder;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::json;
 use tracing::info;
 
 use super::{
-    CallState, RenderPayloadConfig, ToolExecutionError, ToolInputError, ToolInputResult,
-    ToolInstance, ToolOutput, ToolPayloadMode, ToolPrototype, ensure_ordering,
-    prepare_payload_estimates, render_payload, render_relative_path, resolve_workspace_path,
-    schema_for_args,
+    CallState, ToolExecutionError, ToolInputError, ToolInputResult, ToolInstance, ToolOutput,
+    ToolPayloadMode,
+    common::{ToolRunPayload, ToolRunner},
+    ensure_ordering, render_relative_path, resolve_workspace_path,
 };
-use crate::{llm_gateway::GatewayMetrics, tools::filesystem};
+use crate::tools::filesystem;
 
 const IDENTIFIER: &str = "read_file_range";
 const DESCRIPTION: &str = "Read a specific inclusive line range from a UTF-8 text file.";
@@ -57,55 +55,48 @@ struct ReadFileRangePayload {
     fetch_body: bool,
 }
 
-pub(super) fn read_file_range_meta() -> ToolPrototype {
-    ToolPrototype {
-        id:          IDENTIFIER,
-        description: DESCRIPTION,
-        schema:      schema_for_args::<ReadFileRangeArgs>(),
-        parse:       parse_read_file_range,
-    }
-}
+crate::basic_tool!(
+    read_file_range_meta,
+    id: IDENTIFIER,
+    description: DESCRIPTION,
+    args: ReadFileRangeArgs,
+    prepare: |raw, _state: &CallState| {
+        let payload: ReadFileRangePayload =
+            serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
+                tool:    IDENTIFIER,
+                message: err.to_string(),
+            })?;
 
-fn parse_read_file_range(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn ToolInstance>> {
-    let payload: ReadFileRangePayload =
-        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-            tool:    IDENTIFIER,
-            message: err.to_string(),
-        })?;
+        let args = ReadFileRangeArgs::builder()
+            .path(payload.path)?
+            .start_line(payload.start_line)?
+            .end_line(payload.end_line)?
+            .fetch_body(payload.fetch_body)
+            .build();
 
-    let args = ReadFileRangeArgs::builder()
-        .path(payload.path)?
-        .start_line(payload.start_line)?
-        .end_line(payload.end_line)?
-        .fetch_body(payload.fetch_body)
-        .build();
+        ensure_ordering(args.start_line, args.end_line, IDENTIFIER, "start_line", "end_line")?;
 
-    ensure_ordering(args.start_line, args.end_line, IDENTIFIER, "start_line", "end_line")?;
-
-    Ok(Box::new(ReadFileRangeTool {
+        Ok(args)
+    },
+    runner: |args: ReadFileRangeArgs, state: &CallState| ReadFileRangeTool {
         args,
-        depth: state.depth,
-        workspace_root: Arc::clone(&state.workspace_root),
-        metrics: Arc::clone(&state.metrics),
-        model: Arc::clone(&state.model),
-        conversation_id: Arc::clone(&state.conversation_id),
-    }))
-}
+        state: state.clone(),
+    }
+);
 
 struct ReadFileRangeTool {
-    args:            ReadFileRangeArgs,
-    depth:           usize,
-    workspace_root:  Arc<PathBuf>,
-    metrics:         Arc<GatewayMetrics>,
-    model:           Arc<String>,
-    conversation_id: Arc<String>,
+    args:  ReadFileRangeArgs,
+    state: CallState,
 }
 
 #[async_trait]
 impl ToolInstance for ReadFileRangeTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
-        let resolved =
-            resolve_workspace_path(self.workspace_root.as_ref(), &self.args.path, IDENTIFIER)?;
+        let resolved = resolve_workspace_path(
+            self.state.workspace_root.as_ref(),
+            &self.args.path,
+            IDENTIFIER,
+        )?;
         let range =
             filesystem::read_file_range(&resolved, self.args.start_line, self.args.end_line)
                 .await
@@ -120,68 +111,61 @@ impl ToolInstance for ReadFileRangeTool {
 
         let line_count = range.end_line.saturating_sub(range.start_line) + 1;
         let range_bytes = range.text.len() as u64;
-        let token_estimates =
-            prepare_payload_estimates(&self.metrics, self.model.as_str(), range_bytes);
-        let safe_tokens = token_estimates.safe_tokens;
         let mode = ToolPayloadMode::from_fetch_flag(self.args.fetch_body);
-        let hints = vec![
-            format!("Path: {}", render_relative_path(self.workspace_root.as_ref(), &resolved)),
-            format!("Span covers {} lines ({}-{}).", line_count, range.start_line, range.end_line),
-            "Re-run read_file_range with fetch_body=true to retrieve this span.".to_string(),
-            "Narrow the start/end lines to stay within budget.".to_string(),
-        ];
+        let path_hint = render_relative_path(self.state.workspace_root.as_ref(), &resolved);
+        let body_path = render_relative_path(self.state.workspace_root.as_ref(), &range.path);
+        let start_line = range.start_line;
+        let end_line = range.end_line;
+        let range_text = range.text.clone();
 
-        let rendered = render_payload(
-            RenderPayloadConfig {
-                mode,
-                tool: IDENTIFIER,
-                approx_bytes: range_bytes,
-                safe_tokens,
-                preview_hints: hints,
-                metrics: &self.metrics,
-                model: self.model.as_str(),
-                conversation_id: self.conversation_id.as_str(),
-            },
-            || {
-                json!({
-                    "type": "data",
-                    "mode": "body",
-                    "path": render_relative_path(self.workspace_root.as_ref(), &range.path),
-                    "start_line": range.start_line,
-                    "end_line": range.end_line,
-                    "content": range.text,
-                    "line_count": line_count,
-                    "bytes": range_bytes,
-                    "approx_tokens": safe_tokens,
-                })
-            },
+        let runner = ToolRunner::new(IDENTIFIER, &self.state)
+            .with_mode(mode)
+            .hints(vec![
+                format!("Path: {path_hint}"),
+                format!("Span covers {} lines ({}-{}).", line_count, start_line, end_line),
+                "Re-run read_file_range with fetch_body=true to retrieve this span.".to_string(),
+                "Narrow the start/end lines to stay within budget.".to_string(),
+            ]);
+
+        info!(
+            mode = ?mode,
+            depth = self.state.depth,
+            range_bytes,
+            start_line,
+            end_line,
+            "tool_call read_file_range",
         );
 
-        match mode {
-            ToolPayloadMode::Preview => {
-                info!(
-                    mode = %mode.as_str(),
-                    depth = self.depth,
-                    preview_bytes = rendered.payload_bytes,
-                    range_bytes,
-                    start_line = range.start_line,
-                    end_line = range.end_line,
-                    "tool_call read_file_range preview",
-                );
-            }
-            ToolPayloadMode::Body => {
-                info!(
-                    mode = %mode.as_str(),
-                    depth = self.depth,
-                    payload_bytes = rendered.payload_bytes,
-                    range_bytes,
-                    start_line = range.start_line,
-                    end_line = range.end_line,
-                    "tool_call read_file_range body",
-                );
-            }
-        }
+        let preview_path = path_hint.clone();
 
-        Ok(rendered.output)
+        runner
+            .run(move |_mode| async move {
+                Ok(ToolRunPayload {
+                    body:          json!({
+                        "type": "data",
+                        "mode": "body",
+                        "path": body_path,
+                        "start_line": start_line,
+                        "end_line": end_line,
+                        "content": range_text,
+                        "line_count": line_count,
+                        "bytes": range_bytes,
+                    }),
+                    approx_bytes:  Some(range_bytes),
+                    preview:       Some(json!({
+                        "type": "data",
+                        "tool": IDENTIFIER,
+                        "mode": "preview",
+                        "path": preview_path,
+                        "start_line": start_line,
+                        "end_line": end_line,
+                        "bytes": range_bytes,
+                        "line_count": line_count,
+                    })),
+                    preview_hints: Vec::new(),
+                    page:          None,
+                })
+            })
+            .await
     }
 }
