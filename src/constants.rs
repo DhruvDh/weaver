@@ -89,3 +89,15 @@ pub const MAX_DELEGATED_TASK_LEN: usize = 512;
 
 /// Maximum regex pattern length accepted by search tools.
 pub const MAX_SEARCH_PATTERN_LEN: usize = 256;
+
+/// Maximum normalized slug name length (excluding kind prefix).
+pub const MAX_SLUG_NAME_LEN: usize = 64;
+
+/// Simhash Hamming distance tolerated for insert-time duplicate detection.
+pub const DEDUP_INSERT_SIMHASH_DISTANCE: u32 = 3;
+
+/// Simhash distance threshold used for background clustering.
+pub const DEDUP_CLUSTER_DISTANCE: u32 = 6;
+
+/// Title similarity threshold for duplicate warnings.
+pub const DEDUP_TITLE_SIMILARITY: f64 = 0.85;

@@ -53,24 +53,30 @@ fn assesses(claim: &str) -> weaver::graph::AssessesAttrs {
 #[test]
 fn graph_lifecycle_validates_and_versions() -> Result<(), GraphError> {
     let mut svc = GraphService::new();
+    let concept_slug =
+        weaver::graph::slug::Slug::generate(KnowledgeType::Conceptual, "concept_alpha");
+    let lo_slug =
+        weaver::graph::slug::Slug::generate(KnowledgeType::LearningOutcome, "outcome_alpha");
+    let assessment_slug =
+        weaver::graph::slug::Slug::generate(KnowledgeType::AssessmentItem, "assessment_alpha");
     let concept = svc.add_knowledge_node(
-        "concept.alpha".into(),
+        concept_slug.to_string(),
         mk_kn("Concept Alpha", KnowledgeType::Conceptual),
         vec![],
     )?;
     let lo = svc.add_knowledge_node(
-        "lo.alpha".into(),
+        lo_slug.to_string(),
         mk_kn("Outcome Alpha", KnowledgeType::LearningOutcome),
         vec![],
     )?;
     let assessment = svc.add_knowledge_node(
-        "assessment.alpha".into(),
+        assessment_slug.to_string(),
         mk_kn("Assessment Alpha", KnowledgeType::AssessmentItem),
         vec![],
     )?;
 
     svc.add_edge::<RequiresSpec>(concept, assessment, requires(), 1.0)?;
-    svc.add_edge::<AssessesSpec>(assessment, lo, assesses("lo.alpha"), 1.0)?;
+    svc.add_edge::<AssessesSpec>(assessment, lo, assesses(lo_slug.as_str()), 1.0)?;
 
     svc.validate_global_invariants()?;
     assert!(svc.graph_version() > 0);

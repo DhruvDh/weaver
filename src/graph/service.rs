@@ -2,6 +2,7 @@
 //! keeping derived caches in sync.
 use std::{
     collections::{HashMap, HashSet},
+    hash::Hash,
     sync::{
         Arc, RwLock,
         atomic::{AtomicU16, Ordering},
@@ -18,7 +19,9 @@ use crate::{
     analysis,
     graph::{
         audit::{self, MutationKind},
+        dedup::{DuplicateCheck, NodeDeduplicator},
         model::*,
+        slug::{Slug, SlugError},
         specs::{AnchorsSpec, AssessesSpec, EdgeSpec, PrecedesSpec, RequiresSpec, SupportsSpec},
         traversal,
         validation::{
@@ -208,30 +211,30 @@ impl<'a> Drop for ValidationGuard<'a> {
 
 /// Core graph owner with slug lookup and optional strict quality mode.
 pub struct GraphService {
-    graph:             Arc<CurriculumGraph>,
-    slug_to_node:      HashMap<String, NodeId>,
-    strict_quality:    bool,
-    graph_version:     u64,
-    expected_revision: Option<String>,
-    rubric_hashes:     RwLock<HashMap<String, u64>>,
-    validation_state:  ValidationState,
-    fade_cache:        RwLock<Option<(u64, analysis::FadeabilityContext)>>,
-    audit_sink:        audit::SharedMutationSink,
+    graph:                Arc<CurriculumGraph>,
+    slug_to_node:         HashMap<String, NodeId>,
+    strict_quality:       bool,
+    graph_version:        u64,
+    expected_revision:    Option<String>,
+    rubric_hashes:        RwLock<HashMap<String, u64>>,
+    validation_state:     ValidationState,
+    fade_cache:           RwLock<Option<(u64, analysis::FadeabilityContext)>>,
+    audit_sink:           audit::SharedMutationSink,
+    dedup:                NodeDeduplicator,
+    skip_dedup_on_insert: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct MergeSummary {
+    pub merged_from:      String,
+    pub merged_into:      String,
+    pub edges_redirected: usize,
 }
 
 impl GraphService {
     pub fn new() -> Self {
-        Self {
-            graph:             Arc::new(CurriculumGraph::default()),
-            slug_to_node:      HashMap::new(),
-            strict_quality:    false,
-            graph_version:     0,
-            expected_revision: None,
-            rubric_hashes:     RwLock::new(HashMap::new()),
-            validation_state:  ValidationState::new_empty(),
-            fade_cache:        RwLock::new(None),
-            audit_sink:        Arc::new(audit::NoopMutationSink),
-        }
+        Self::from_parts(CurriculumGraph::default(), false, 0, None, false)
+            .expect("graph provided to from_graph must have unique slugs and valid invariants")
     }
 
     pub fn with_strict(mut self, strict: bool) -> Self {
@@ -248,7 +251,7 @@ impl GraphService {
     }
 
     pub fn from_graph(graph: CurriculumGraph) -> Self {
-        Self::from_parts(graph, false, 0, None)
+        Self::from_parts(graph, false, 0, None, false)
             .expect("graph provided to from_graph must have unique slugs and valid invariants")
     }
 
@@ -257,6 +260,7 @@ impl GraphService {
         strict_quality: bool,
         graph_version: u64,
         expected_revision: Option<String>,
+        skip_dedup_on_insert: bool,
     ) -> Result<Self, GraphError> {
         normalize_assesses_claims_graph(&mut graph);
         let rubric_hashes = RwLock::new(compute_rubric_hashes(&graph));
@@ -271,8 +275,11 @@ impl GraphService {
             validation_state: ValidationState::new_empty(),
             fade_cache: RwLock::new(None),
             audit_sink: Arc::new(audit::NoopMutationSink),
+            dedup: NodeDeduplicator::new(),
+            skip_dedup_on_insert,
         };
         svc.rebuild_slug_index()?;
+        svc.rebuild_dedup();
         svc.validate_global_invariants()?;
         Ok(svc)
     }
@@ -335,6 +342,11 @@ impl GraphService {
         }
     }
 
+    fn rebuild_dedup(&mut self) {
+        let graph = self.graph.clone();
+        self.dedup.rebuild(graph.as_ref());
+    }
+
     fn ensure_node_capacity(&self) -> Result<(), GraphError> {
         if self.graph.node_count() >= crate::constants::MAX_GRAPH_NODES {
             return Err(GraphError::Schema(format!(
@@ -376,12 +388,20 @@ impl GraphService {
         self.strict_quality
     }
 
+    pub fn skip_dedup_on_insert(&self) -> bool {
+        self.skip_dedup_on_insert
+    }
+
     pub fn expected_revision(&self) -> Option<&str> {
         self.expected_revision.as_deref()
     }
 
     pub fn set_expected_revision(&mut self, revision: Option<String>) {
         self.expected_revision = revision.filter(|s| !s.is_empty());
+    }
+
+    pub fn set_skip_dedup_on_insert(&mut self, skip: bool) {
+        self.skip_dedup_on_insert = skip;
     }
 
     pub fn set_strict_quality(&mut self, strict: bool) -> Result<(), GraphError> {
@@ -414,11 +434,98 @@ impl GraphService {
         self.slug_to_node.insert(slug, id);
     }
 
+    fn normalize_knowledge_slug(
+        &self,
+        slug: &str,
+        knowledge_type: KnowledgeType,
+    ) -> Result<Slug, GraphError> {
+        let parsed = match Slug::parse(slug) {
+            Ok(parsed) => parsed,
+            Err(SlugError::MissingKindPrefix) => Slug::generate(knowledge_type, slug),
+            Err(err) => return Err(GraphError::Schema(err.to_string())),
+        };
+        if parsed.kind() != knowledge_type {
+            return Err(GraphError::Schema(format!(
+                "slug `{}` kind `{}` must match knowledge_type `{}`",
+                slug,
+                parsed.as_str().split('.').next().unwrap_or_default(),
+                knowledge_type
+            )));
+        }
+        Ok(parsed)
+    }
+
+    fn enforce_unique_knowledge(
+        &self,
+        exclude: Option<NodeId>,
+        payload: &KnowledgeNode,
+    ) -> Result<(), GraphError> {
+        if self.skip_dedup_on_insert {
+            return Ok(());
+        }
+        match self.dedup.check(
+            &payload.title,
+            &payload.statement,
+            payload.knowledge_type,
+            self.graph(),
+            exclude,
+        ) {
+            DuplicateCheck::Unique => Ok(()),
+            DuplicateCheck::Exact { existing } => Err(GraphError::Schema(format!(
+                "node statement identical to existing `{}`; reuse or differentiate",
+                self.graph()[existing].slug
+            ))),
+            DuplicateCheck::HighSimilarity { candidates } => {
+                let similar: Vec<String> = candidates
+                    .into_iter()
+                    .map(|(id, score)| format!("{} ({:.0}%)", self.graph()[id].slug, score * 100.0))
+                    .collect();
+                Err(GraphError::Schema(format!(
+                    "statement is highly similar to existing nodes: {}",
+                    similar.join(", ")
+                )))
+            }
+            DuplicateCheck::SimilarTitle {
+                existing,
+                similarity,
+            } => Err(GraphError::Schema(format!(
+                "title {:.0}% similar to existing `{}`; confirm distinct intent or reuse",
+                similarity * 100.0,
+                self.graph()[existing].slug
+            ))),
+        }
+    }
+
     pub fn node_by_slug(&self, slug: &str) -> Result<NodeId, GraphError> {
-        self.slug_to_node
-            .get(slug)
-            .copied()
-            .ok_or_else(|| GraphError::MissingSlug(slug.to_string()))
+        if let Some(id) = self.slug_to_node.get(slug) {
+            return Ok(*id);
+        }
+        if let Ok(parsed) = Slug::parse(slug) {
+            if let Some(id) = self.slug_to_node.get(parsed.as_str()) {
+                return Ok(*id);
+            }
+        }
+        if !slug.contains('.') {
+            let mut found = None;
+            for kind in [
+                KnowledgeType::Factual,
+                KnowledgeType::Conceptual,
+                KnowledgeType::Procedural,
+                KnowledgeType::Metacognitive,
+                KnowledgeType::LearningOutcome,
+                KnowledgeType::AssessmentItem,
+            ] {
+                let generated = Slug::generate(kind, slug);
+                if let Some(id) = self.slug_to_node.get(generated.as_str()) {
+                    found = Some(*id);
+                    break;
+                }
+            }
+            if let Some(id) = found {
+                return Ok(id);
+            }
+        }
+        Err(GraphError::MissingSlug(slug.to_string()))
     }
 
     pub fn add_knowledge_node(
@@ -428,6 +535,8 @@ impl GraphService {
         tags: Vec<String>,
     ) -> Result<NodeId, GraphError> {
         self.ensure_node_capacity()?;
+        let parsed_slug = self.normalize_knowledge_slug(&slug, payload.knowledge_type)?;
+        let slug = parsed_slug.as_str().to_string();
         if self.slug_to_node.contains_key(&slug) {
             return Err(GraphError::Schema(format!(
                 "slug `{}` already exists; use update_knowledge_node",
@@ -444,6 +553,7 @@ impl GraphService {
                 "knowledge nodes must include at least one source_ref".to_string(),
             ));
         }
+        self.enforce_unique_knowledge(None, &payload)?;
         validate_source_refs(&payload.source_refs)?;
         self.validate_revision(&payload.source_refs, "knowledge")?;
         let mut dirty = InvariantFamilies::STATEMENTS
@@ -489,6 +599,10 @@ impl GraphService {
         .on_success(|svc| svc.refresh_rubric_hashes());
         guard.commit()?;
         if let NodeKind::Knowledge(k) = &self.graph()[id].kind {
+            let snapshot = k.clone();
+            self.dedup.record(id, &snapshot);
+        }
+        if let NodeKind::Knowledge(k) = &self.graph()[id].kind {
             self.record_mutation(
                 MutationKind::InsertKnowledge,
                 json!({
@@ -528,6 +642,9 @@ impl GraphService {
                 "knowledge nodes must include at least one source_ref".to_string(),
             ));
         }
+        // Ensure slug prefix stays aligned with the knowledge_type.
+        let _ = self.normalize_knowledge_slug(&self.graph()[id].slug, payload.knowledge_type)?;
+        self.enforce_unique_knowledge(Some(id), &payload)?;
         validate_source_refs(&payload.source_refs)?;
         self.validate_revision(&payload.source_refs, "knowledge")?;
         let mut dirty = InvariantFamilies::STATEMENTS
@@ -614,6 +731,11 @@ impl GraphService {
         )
         .on_success(|svc| svc.refresh_rubric_hashes());
         guard.commit()?;
+        self.dedup.remove(id);
+        if let NodeKind::Knowledge(k) = &self.graph()[id].kind {
+            let snapshot = k.clone();
+            self.dedup.record(id, &snapshot);
+        }
         if let NodeKind::Knowledge(k) = &self.graph()[id].kind {
             self.record_mutation(
                 MutationKind::UpdateKnowledge,
@@ -672,11 +794,18 @@ impl GraphService {
     }
 
     pub fn rename_node(&mut self, old_slug: &str, new_slug: String) -> Result<(), GraphError> {
-        if self.slug_to_node.contains_key(&new_slug) {
-            return Err(GraphError::Schema(format!("slug `{}` already exists", new_slug)));
-        }
-
         let id = self.node_by_slug(old_slug)?;
+        let target_slug = match &self.graph()[id].kind {
+            NodeKind::Knowledge(k) => self
+                .normalize_knowledge_slug(&new_slug, k.knowledge_type)?
+                .as_str()
+                .to_string(),
+            _ => new_slug.clone(),
+        };
+        if self.slug_to_node.contains_key(&target_slug) {
+            return Err(GraphError::Schema(format!("slug `{}` already exists", target_slug)));
+        }
+        let stored_slug = self.graph()[id].slug.clone();
         let old_index = self.slug_to_node.clone();
         let old_rubric = self
             .rubric_hashes
@@ -690,14 +819,14 @@ impl GraphService {
             .collect();
         let incoming_for_rollback = incoming.clone();
 
-        self.slug_to_node.remove(old_slug);
-        self.slug_to_node.insert(new_slug.clone(), id);
-        self.graph_mut()[id].slug = new_slug.clone();
+        self.slug_to_node.remove(&stored_slug);
+        self.slug_to_node.insert(target_slug.clone(), id);
+        self.graph_mut()[id].slug = target_slug.clone();
 
         // keep denormalized claims in sync for assesses edges targeting this node
         for edge_id in incoming {
             if let EdgeKind::Assesses(attrs) = &mut self.graph_mut()[edge_id].kind {
-                attrs.evidence_link.claim = new_slug.clone();
+                attrs.evidence_link.claim = target_slug.clone();
             }
         }
 
@@ -723,10 +852,158 @@ impl GraphService {
             MutationKind::RenameNode,
             json!({
                 "from": old_slug,
-                "to": new_slug,
+                "to": target_slug,
             }),
         );
         Ok(())
+    }
+
+    pub fn merge_nodes(
+        &mut self,
+        canonical_slug: &str,
+        duplicate_slug: &str,
+    ) -> Result<MergeSummary, GraphError> {
+        let canonical = self.node_by_slug(canonical_slug)?;
+        let duplicate = self.node_by_slug(duplicate_slug)?;
+        if canonical == duplicate {
+            return Err(GraphError::Schema("cannot merge a node into itself".to_string()));
+        }
+        let (canonical_payload, duplicate_payload) =
+            match (&self.graph()[canonical].kind, &self.graph()[duplicate].kind) {
+                (NodeKind::Knowledge(canon), NodeKind::Knowledge(dup)) => {
+                    (canon.clone(), dup.clone())
+                }
+                _ => {
+                    return Err(GraphError::Schema(
+                        "merges are only supported for knowledge nodes".to_string(),
+                    ));
+                }
+            };
+        if canonical_payload.knowledge_type != duplicate_payload.knowledge_type {
+            return Err(GraphError::Schema(
+                "cannot merge nodes with different knowledge_type".to_string(),
+            ));
+        }
+        if canonical_payload.knowledge_type.is_learning_outcome()
+            || canonical_payload.knowledge_type.is_assessment_item()
+        {
+            return Err(GraphError::Schema(
+                "cannot auto-merge learning_outcome or assessment_item nodes".to_string(),
+            ));
+        }
+        let duplicate_has_assesses = self
+            .graph()
+            .edges_directed(duplicate, Direction::Incoming)
+            .chain(self.graph().edges_directed(duplicate, Direction::Outgoing))
+            .any(|edge| matches!(edge.weight().kind, EdgeKind::Assesses(_)));
+        if duplicate_has_assesses {
+            return Err(GraphError::Schema(
+                "cannot auto-merge nodes that participate in assesses edges".to_string(),
+            ));
+        }
+
+        let old_graph = self.graph.clone();
+        let old_index = self.slug_to_node.clone();
+        let old_version = self.graph_version;
+        let old_rubric = self
+            .rubric_hashes
+            .read()
+            .expect("rubric_hashes lock")
+            .clone();
+        let old_dirty = self.validation_state.dirty.load(Ordering::Relaxed);
+
+        let incoming: Vec<(NodeId, EdgePayload)> = self
+            .graph()
+            .edges_directed(duplicate, Direction::Incoming)
+            .map(|e| (e.source(), e.weight().clone()))
+            .collect();
+        let outgoing: Vec<(NodeId, EdgePayload)> = self
+            .graph()
+            .edges_directed(duplicate, Direction::Outgoing)
+            .map(|e| (e.target(), e.weight().clone()))
+            .collect();
+
+        let merged_slug_into = self.graph()[canonical].slug.clone();
+        let merged_slug_from = self.graph()[duplicate].slug.clone();
+
+        let merged_tags =
+            union_vecs(self.graph()[canonical].tags.clone(), self.graph()[duplicate].tags.clone());
+        let merged_refs =
+            union_source_refs(&canonical_payload.source_refs, &duplicate_payload.source_refs);
+        let merged_confidence = canonical_payload
+            .confidence
+            .max(duplicate_payload.confidence);
+        let merged_statement = if canonical_payload.statement.trim()
+            == duplicate_payload.statement.trim()
+        {
+            canonical_payload.statement.clone()
+        } else {
+            format!("{}\n\nMerged: {}", canonical_payload.statement, duplicate_payload.statement)
+        };
+        let mut merged_payload = canonical_payload.clone();
+        merged_payload.source_refs = merged_refs;
+        merged_payload.confidence = merged_confidence;
+        merged_payload.statement = merged_statement;
+        merged_payload.construct_irrelevant_demands = union_vecs(
+            merged_payload.construct_irrelevant_demands.clone(),
+            duplicate_payload.construct_irrelevant_demands.clone(),
+        );
+
+        self.graph_mut()[canonical].kind = NodeKind::Knowledge(merged_payload);
+        self.graph_mut()[canonical].tags = merged_tags;
+        self.dedup.remove(duplicate);
+        self.slug_to_node.remove(&merged_slug_from);
+        self.graph_mut().remove_node(duplicate);
+
+        let mut edges_redirected = 0usize;
+        for (from, payload) in incoming {
+            if from == canonical {
+                continue;
+            }
+            if self.has_edge_of_kind(from, canonical, |k| edge_variant_eq(k, &payload.kind)) {
+                continue;
+            }
+            self.graph_mut().add_edge(from, canonical, payload);
+            edges_redirected = edges_redirected.saturating_add(1);
+        }
+        for (target, payload) in outgoing {
+            if target == canonical {
+                continue;
+            }
+            if self.has_edge_of_kind(canonical, target, |k| edge_variant_eq(k, &payload.kind)) {
+                continue;
+            }
+            self.graph_mut().add_edge(canonical, target, payload);
+            edges_redirected = edges_redirected.saturating_add(1);
+        }
+
+        self.mark_dirty(InvariantFamilies::ALL);
+        self.bump_version();
+        if let Err(err) = self.validate_global_invariants() {
+            self.graph = old_graph;
+            self.slug_to_node = old_index;
+            self.graph_version = old_version;
+            *self.rubric_hashes.write().expect("rubric_hashes lock") = old_rubric;
+            self.rebuild_dedup();
+            self.validation_state
+                .dirty
+                .store(old_dirty, Ordering::Relaxed);
+            return Err(err);
+        }
+        self.rebuild_dedup();
+        self.record_mutation(
+            MutationKind::MergeNodes,
+            json!({
+                "into": merged_slug_into,
+                "from": merged_slug_from,
+                "edges_redirected": edges_redirected,
+            }),
+        );
+        Ok(MergeSummary {
+            merged_from: merged_slug_from,
+            merged_into: merged_slug_into,
+            edges_redirected,
+        })
     }
 
     pub fn remove_node(&mut self, slug: &str) -> Result<(), GraphError> {
@@ -751,8 +1028,12 @@ impl GraphService {
             .read()
             .expect("rubric_hashes lock")
             .clone();
+        let stored_slug = self.graph()[id].slug.clone();
 
-        self.slug_to_node.remove(slug);
+        if matches!(self.graph()[id].kind, NodeKind::Knowledge(_)) {
+            self.dedup.remove(id);
+        }
+        self.slug_to_node.remove(&stored_slug);
         self.graph_mut().remove_node(id);
 
         let guard =
@@ -761,9 +1042,11 @@ impl GraphService {
                 svc.slug_to_node = old_index;
                 svc.graph_version = old_version;
                 *svc.rubric_hashes.write().expect("rubric_hashes lock") = old_rubric;
+                svc.rebuild_dedup();
             })
             .on_success(|svc| svc.refresh_rubric_hashes());
         guard.commit()?;
+        self.rebuild_dedup();
         self.record_mutation(
             MutationKind::RemoveNode,
             json!({
@@ -815,6 +1098,7 @@ impl GraphService {
         self.slug_to_node = index;
         self.graph_version = graph_version;
         self.rubric_hashes = RwLock::new(compute_rubric_hashes(self.graph.as_ref()));
+        self.rebuild_dedup();
         self.mark_dirty(InvariantFamilies::ALL);
         if let Err(err) = self.validate_global_invariants() {
             // rollback on failure
@@ -822,6 +1106,7 @@ impl GraphService {
             self.slug_to_node = old_index;
             self.graph_version = old_version;
             self.rubric_hashes = RwLock::new(compute_rubric_hashes(self.graph.as_ref()));
+            self.rebuild_dedup();
             return Err(err);
         }
         self.record_mutation(
@@ -1315,6 +1600,43 @@ impl GraphService {
         }
         los.into_iter().collect()
     }
+}
+
+fn union_vecs<T>(a: Vec<T>, b: Vec<T>) -> Vec<T>
+where
+    T: Eq + Hash + Clone,
+{
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for item in a.into_iter().chain(b.into_iter()) {
+        if seen.insert(item.clone()) {
+            out.push(item);
+        }
+    }
+    out
+}
+
+fn union_source_refs(a: &[SourceRef], b: &[SourceRef]) -> Vec<SourceRef> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for span in a.iter().chain(b.iter()) {
+        let key = (&span.path, span.start_line, span.end_line, &span.revision);
+        if seen.insert(key) {
+            out.push(span.clone());
+        }
+    }
+    out
+}
+
+fn edge_variant_eq(a: &EdgeKind, b: &EdgeKind) -> bool {
+    matches!(
+        (a, b),
+        (EdgeKind::Requires(_), EdgeKind::Requires(_))
+            | (EdgeKind::Supports(_), EdgeKind::Supports(_))
+            | (EdgeKind::Assesses(_), EdgeKind::Assesses(_))
+            | (EdgeKind::Precedes(_), EdgeKind::Precedes(_))
+            | (EdgeKind::Anchors(_), EdgeKind::Anchors(_))
+    )
 }
 
 impl Default for GraphService {

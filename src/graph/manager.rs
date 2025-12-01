@@ -27,6 +27,8 @@ pub struct GraphManagerState {
     pub graph_version:         u64,
     #[serde(default = "default_validation_timeout_ms")]
     pub validation_timeout_ms: u64,
+    #[serde(default)]
+    pub skip_dedup_on_insert:  bool,
 }
 
 const fn default_validation_timeout_ms() -> u64 {
@@ -48,6 +50,7 @@ impl GraphManagerState {
         strict_quality: bool,
         graph_version: u64,
         validation_timeout_ms: u64,
+        skip_dedup_on_insert: bool,
     ) -> Self {
         Self {
             graph,
@@ -55,6 +58,7 @@ impl GraphManagerState {
             strict_quality,
             graph_version,
             validation_timeout_ms,
+            skip_dedup_on_insert,
         }
     }
 }
@@ -68,6 +72,7 @@ struct QuarantinedSnapshot {
     validation_timeout_ms: u64,
     saved_at_sec:          u64,
     graph:                 CurriculumGraph,
+    skip_dedup_on_insert:  bool,
 }
 
 pub struct GraphManager {
@@ -129,6 +134,7 @@ impl GraphManager {
             validation_timeout_ms: state.validation_timeout_ms,
             saved_at_sec:          saved_at,
             graph:                 state.graph.clone(),
+            skip_dedup_on_insert:  state.skip_dedup_on_insert,
         };
 
         let payload = serde_json::to_vec_pretty(&envelope)?;
@@ -147,6 +153,7 @@ impl From<&GraphManager> for GraphManagerState {
             strict_quality:        manager.service.strict_quality(),
             graph_version:         manager.service.graph_version(),
             validation_timeout_ms: manager.validation_timeout_ms,
+            skip_dedup_on_insert:  manager.service.skip_dedup_on_insert(),
         }
     }
 }
@@ -167,6 +174,7 @@ impl Actor for GraphManager {
             strict,
             state.graph_version,
             expected_revision,
+            state.skip_dedup_on_insert,
         ) {
             Ok(svc) => svc,
             Err(err) => {
@@ -621,6 +629,26 @@ impl Message<RemoveNode> for GraphManager {
         let res = self.service.remove_node(&slug);
         if res.is_ok() {
             GraphManager::log_write_latency("remove_node", start);
+        }
+        res
+    }
+}
+
+impl Message<MergeNodes> for GraphManager {
+    type Reply = Result<crate::graph::MergeSummary, GraphError>;
+
+    async fn handle(
+        &mut self,
+        MergeNodes {
+            canonical,
+            duplicate,
+        }: MergeNodes,
+        _ctx: &mut MsgContext<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let start = Instant::now();
+        let res = self.service.merge_nodes(&canonical, &duplicate);
+        if res.is_ok() {
+            GraphManager::log_write_latency("merge_nodes", start);
         }
         res
     }

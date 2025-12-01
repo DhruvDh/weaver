@@ -18,6 +18,7 @@ use tracing_subscriber::EnvFilter;
 use url::Url;
 
 use crate::{
+    agents::deduplication::{DeduplicationAgent, RunDeduplication},
     constants::PRETEXT_SUBDIR,
     file_reader::{FileReader, FileReaderQuery},
     graph::{
@@ -360,6 +361,9 @@ pub struct Cli {
     pub graph_prune_requires_s:      Option<u64>,
     pub skip_demo:                   bool,
     pub graph_validation_timeout_ms: u64,
+    pub dedup_interval_secs:         u64,
+    pub dedup_auto_merge_threshold:  f64,
+    pub skip_dedup_on_insert:        bool,
 }
 
 #[derive(Clone)]
@@ -472,6 +476,17 @@ pub fn cli() -> OptionParser<Cli> {
         .help("Optional interval (seconds) to prune redundant requires edges; omit to disable")
         .argument::<u64>("secs")
         .optional();
+    let dedup_interval_secs = long("dedup-interval-secs")
+        .help("Interval in seconds for background deduplication (set 0 to disable)")
+        .argument::<u64>("secs")
+        .fallback(3_600);
+    let dedup_auto_merge_threshold = long("dedup-auto-merge-threshold")
+        .help("Similarity threshold (0.0-1.0) for auto-merging duplicates (default 0.95)")
+        .argument::<f64>("threshold")
+        .fallback(0.95);
+    let skip_dedup_on_insert = long("skip-dedup-on-insert")
+        .help("Skip insert-time duplicate checks (useful for bulk imports)")
+        .switch();
     let skip_demo = long("skip-demo")
         .help("Skip the startup FileReader demo (useful for tests or headless runs)")
         .switch();
@@ -488,6 +503,9 @@ pub fn cli() -> OptionParser<Cli> {
             graph_prune_requires_s,
             skip_demo,
             graph_validation_timeout_ms,
+            dedup_interval_secs,
+            dedup_auto_merge_threshold,
+            skip_dedup_on_insert,
         }
     }
     .to_options()
@@ -647,6 +665,7 @@ pub async fn run_app(cli: Cli, runtime: RuntimeOptions) -> Result<()> {
         autosave_secs:         effective_autosave_secs,
         strict_quality:        cli.graph_strict_quality,
         validation_timeout_ms: cli.graph_validation_timeout_ms,
+        skip_dedup_on_insert:  cli.skip_dedup_on_insert,
     };
 
     let snapshot_path: PathBuf = graph_config.autosave_path.clone();
@@ -704,6 +723,7 @@ pub async fn run_app(cli: Cli, runtime: RuntimeOptions) -> Result<()> {
                             graph_config.strict_quality,
                             snapshot.graph_version,
                             graph_config.validation_timeout_ms,
+                            graph_config.skip_dedup_on_insert,
                         )
                     }
                     Err(err) => {
@@ -723,6 +743,7 @@ pub async fn run_app(cli: Cli, runtime: RuntimeOptions) -> Result<()> {
                             graph_config.strict_quality,
                             0,
                             graph_config.validation_timeout_ms,
+                            graph_config.skip_dedup_on_insert,
                         )
                     }
                 }
@@ -738,6 +759,7 @@ pub async fn run_app(cli: Cli, runtime: RuntimeOptions) -> Result<()> {
                     graph_config.strict_quality,
                     0,
                     graph_config.validation_timeout_ms,
+                    graph_config.skip_dedup_on_insert,
                 )
             };
             GraphManager::spawn_persistent(graph_state_url.clone(), state).await?
@@ -802,6 +824,22 @@ pub async fn run_app(cli: Cli, runtime: RuntimeOptions) -> Result<()> {
             SetInterval::new(prune_ref.downgrade(), Duration::from_secs(prune_secs), PruneTick);
         scheduler
             .tell(prune_interval)
+            .await
+            .expect("scheduler actor not running");
+    }
+
+    if cli.dedup_interval_secs > 0 {
+        let dedup = DeduplicationAgent::spawn(DeduplicationAgent::new(graph_actor.clone()));
+        let dedup_task = SetInterval::new(
+            dedup.downgrade(),
+            Duration::from_secs(cli.dedup_interval_secs),
+            RunDeduplication {
+                auto_merge_threshold: cli.dedup_auto_merge_threshold,
+                dry_run:              false,
+            },
+        );
+        scheduler
+            .tell(dedup_task)
             .await
             .expect("scheduler actor not running");
     }

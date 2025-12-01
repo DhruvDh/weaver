@@ -68,6 +68,7 @@ async fn graph_manager_persists_and_restores_state() -> anyhow::Result<()> {
         false,
         base_version,
         2_000,
+        false,
     );
 
     let actor = GraphManager::spawn_persistent(state_url.clone(), state).await?;
@@ -140,6 +141,7 @@ async fn apply_runtime_config_honors_validation_timeout() -> anyhow::Result<()> 
         false,
         svc.graph_version(),
         2_000,
+        false,
     );
 
     let actor: ActorRef<GraphManager> = GraphManager::spawn(state);

@@ -1,3 +1,4 @@
+pub mod agents;
 pub mod analysis;
 pub mod app;
 pub mod constants;

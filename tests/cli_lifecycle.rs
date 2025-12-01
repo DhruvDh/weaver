@@ -74,6 +74,9 @@ fn base_cli(root: &Path, snapshot: &Path, commit: &str, autosave_secs: u64) -> C
         graph_prune_requires_s:      None,
         skip_demo:                   true,
         graph_validation_timeout_ms: 2_000,
+        dedup_interval_secs:         0,
+        dedup_auto_merge_threshold:  0.95,
+        skip_dedup_on_insert:        false,
     }
 }
 
@@ -114,10 +117,11 @@ async fn cli_persists_snapshot_and_hook_mutation() -> anyhow::Result<()> {
 
     assert!(snapshot.exists(), "snapshot should be written after run");
     let loaded = persist::load_graph(&snapshot).await?;
+    let expected_slug = weaver::graph::slug::Slug::generate(KnowledgeType::Conceptual, "k1");
     let has_k1 = loaded
         .graph
         .node_indices()
-        .any(|n| loaded.graph[n].slug == "k1");
+        .any(|n| loaded.graph[n].slug == expected_slug.as_str());
     assert!(has_k1, "graph snapshot should include inserted node");
     Ok(())
 }
@@ -232,7 +236,7 @@ async fn apply_runtime_config_respects_timeout() -> anyhow::Result<()> {
         );
     }
 
-    let state = GraphManagerState::new(graph, String::new(), false, 0, 2_000);
+    let state = GraphManagerState::new(graph, String::new(), false, 0, 2_000, false);
     let actor = GraphManager::spawn_persistent(state_url, state).await?;
 
     let result = actor

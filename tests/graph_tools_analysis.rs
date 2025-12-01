@@ -58,12 +58,13 @@ fn build_minimal_graph() -> (Arc<weaver::graph::CurriculumGraph>, u64, NodeId) {
     let assess = svc
         .add_knowledge_node("a1".into(), mk_assessment_node(), vec![])
         .unwrap();
+    let lo_slug = svc.graph()[lo].slug.clone();
     svc.add_edge::<weaver::graph::AssessesSpec>(
         assess,
         lo,
         weaver::graph::AssessesAttrs {
             evidence_link: EvidenceLink {
-                claim:                "lo".into(),
+                claim:                lo_slug.clone(),
                 observation_features: vec!["crit1".into()],
                 scope:                AssessmentScope::Target,
             },

@@ -26,6 +26,7 @@ pub enum MutationKind {
     InstallGraph,
     PruneRequires,
     SetStrictQuality { strict: bool },
+    MergeNodes,
 }
 
 impl MutationKind {
@@ -42,6 +43,7 @@ impl MutationKind {
             MutationKind::InstallGraph => Cow::Borrowed("install_graph"),
             MutationKind::PruneRequires => Cow::Borrowed("prune_requires"),
             MutationKind::SetStrictQuality { .. } => Cow::Borrowed("set_strict_quality"),
+            MutationKind::MergeNodes => Cow::Borrowed("merge_nodes"),
         }
     }
 }

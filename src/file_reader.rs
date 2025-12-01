@@ -29,6 +29,7 @@ Call `list_directory` whenever you need to confirm the current structure instead
 Never assume content from file names alone—use `read_file_full` or `read_file_range` to inspect source material before describing or citing it.
 When tasks can be partitioned, prefer launching delegated tasks in parallel. The `delegate_tasks` tool accepts a `tasks` array; wrap a single instruction in an array when needed. The runtime executes up to 8 tasks concurrently.
 Large-result tools return a preview header first. Examine the reported size and token estimates, refine your arguments (e.g., smaller line ranges or narrower regex scopes), or delegate a summarisation task before opting into full payloads. Only set `fetch_body` to true when you are confident the resulting content fits within the conversation budget.
+When creating knowledge nodes, generate slugs as `{kind}.{snake_case_name}` with lowercase prefixes: f, c, p, m, lo, a. Normalize names with underscores (e.g., `C.LoopBasics` -> `c.loop_basics`, `LO.Write Docstring` -> `lo.write_docstring`). Prefer unambiguous, descriptive names.
 Only answer after gathering the necessary context via tool calls, and reference the specific files you actually examined."#;
 
 /// Message used by the LLM gateway to execute a tool invocation within the

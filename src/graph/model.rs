@@ -20,6 +20,7 @@ pub struct GraphConfig {
     pub autosave_secs:         u64,
     pub strict_quality:        bool,
     pub validation_timeout_ms: u64,
+    pub skip_dedup_on_insert:  bool,
 }
 
 /// Primary graph type alias (stable indices survive deletions).

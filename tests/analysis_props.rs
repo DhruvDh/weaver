@@ -43,6 +43,7 @@ proptest! {
     #[test]
     fn requires_dag_guard_prevents_cycle(size in 2_usize..15) {
         let mut svc = GraphService::new();
+        svc.set_skip_dedup_on_insert(true);
         let nodes = add_nodes(&mut svc, size);
 
         // chain edges n0->n1->...->n{k}
@@ -71,6 +72,7 @@ proptest! {
         extra_edges in prop::collection::vec((0_usize..20, 0_usize..20), 0..15)
     ) {
         let mut svc = GraphService::new();
+        svc.set_skip_dedup_on_insert(true);
         let nodes = add_nodes(&mut svc, size);
 
         for (a,b) in extra_edges {

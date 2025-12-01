@@ -115,6 +115,11 @@ pub struct RemoveNode {
     pub slug: String,
 }
 
+pub struct MergeNodes {
+    pub canonical: String,
+    pub duplicate: String,
+}
+
 pub struct ResolveSlug {
     pub slug: String,
 }

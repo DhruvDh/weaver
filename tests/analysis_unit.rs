@@ -33,6 +33,10 @@ fn mk_kn(title: &str, kt: KnowledgeType) -> KnowledgeNode {
     }
 }
 
+fn canonical_slug(title: &str, kt: KnowledgeType) -> String {
+    weaver::graph::slug::Slug::generate(kt, title).to_string()
+}
+
 fn add_support(
     svc: &mut GraphService,
     from: NodeId,
@@ -88,9 +92,10 @@ mod supports_examples {
             vec!["trace".into()],
         );
         let gaps = analysis::example_gaps(svc.graph());
+        let expected_slug = canonical_slug("proc", KnowledgeType::Procedural);
         let proc_gap = gaps
             .into_iter()
-            .find(|g| svc.graph()[g.node].slug == "proc")
+            .find(|g| svc.graph()[g.node].slug == expected_slug)
             .expect("procedural gap present");
         assert!(proc_gap.description.contains("worked examples"));
     }
@@ -185,13 +190,14 @@ mod practice_alignment {
         let lo = svc
             .add_knowledge_node("lo".into(), lo_node, vec![])
             .unwrap();
+        let lo_slug = svc.graph()[lo].slug.clone();
         svc.add_edge::<graph::AssessesSpec>(
             assess,
             lo,
             graph::AssessesAttrs {
                 evidence_link: weaver::schema::types::EvidenceLink {
                     scope:                weaver::schema::types::AssessmentScope::Target,
-                    claim:                "lo".into(),
+                    claim:                lo_slug.clone(),
                     observation_features: vec!["feat".into()],
                 },
             },
@@ -201,7 +207,10 @@ mod practice_alignment {
 
         let gaps = analysis::procedural_practice_gaps(svc.graph());
         assert_eq!(gaps.len(), 1);
-        assert_eq!(svc.graph()[gaps[0].node].slug, "proc");
+        assert_eq!(
+            svc.graph()[gaps[0].node].slug,
+            canonical_slug("proc", KnowledgeType::Procedural)
+        );
     }
 
     #[test]
@@ -279,6 +288,7 @@ mod practice_alignment {
         let lo = svc
             .add_knowledge_node("lo".into(), lo_node, vec![])
             .unwrap();
+        let lo_slug = svc.graph()[lo].slug.clone();
         svc.add_edge::<graph::RequiresSpec>(
             concept,
             assess,
@@ -301,7 +311,7 @@ mod practice_alignment {
             graph::AssessesAttrs {
                 evidence_link: weaver::schema::types::EvidenceLink {
                     scope:                weaver::schema::types::AssessmentScope::Target,
-                    claim:                "lo".into(),
+                    claim:                lo_slug.clone(),
                     observation_features: vec!["criterion_a".into()],
                 },
             },
@@ -337,6 +347,7 @@ mod practice_alignment {
         let lo = svc
             .add_knowledge_node("lo".into(), lo_node, vec![])
             .unwrap();
+        let lo_slug = svc.graph()[lo].slug.clone();
         svc.add_edge::<graph::RequiresSpec>(
             concept,
             assess,
@@ -359,7 +370,7 @@ mod practice_alignment {
             graph::AssessesAttrs {
                 evidence_link: weaver::schema::types::EvidenceLink {
                     scope:                weaver::schema::types::AssessmentScope::Target,
-                    claim:                "lo".into(),
+                    claim:                lo_slug.clone(),
                     observation_features: vec!["a".into()],
                 },
             },
@@ -412,6 +423,7 @@ mod purity {
         let lo = svc
             .add_knowledge_node("lo".into(), mk_kn("lo", KnowledgeType::LearningOutcome), vec![])
             .unwrap();
+        let lo_slug = svc.graph()[lo].slug.clone();
         let ts = svc
             .add_teaching_step(
                 "ts".into(),
@@ -489,7 +501,7 @@ mod purity {
                 graph::AssessesAttrs {
                     evidence_link: weaver::schema::types::EvidenceLink {
                         scope:                weaver::schema::types::AssessmentScope::Target,
-                        claim:                "lo".into(),
+                        claim:                lo_slug.clone(),
                         observation_features: vec!["feat".into()],
                     },
                 },
@@ -847,6 +859,7 @@ mod persistence_topology {
             false,
             version,
             2_000,
+            false,
         );
         let data = postcard::to_stdvec(&state).expect("serialize state");
         let decoded: GraphManagerState = postcard::from_bytes(&data).expect("deserialize state");
@@ -855,6 +868,7 @@ mod persistence_topology {
             decoded.strict_quality,
             decoded.graph_version,
             None,
+            decoded.skip_dedup_on_insert,
         )
         .expect("restored graph should validate");
         assert_eq!(restored.graph_version(), version);
@@ -1006,6 +1020,7 @@ mod persistence_topology {
     #[test]
     fn invariant_validation_latency_is_bounded_under_mutation_load() {
         let mut svc = GraphService::new();
+        svc.set_skip_dedup_on_insert(true);
 
         let evidence = SourceRef {
             path:       "dummy".into(),
@@ -1038,6 +1053,7 @@ mod persistence_topology {
             let lo_id = svc
                 .add_knowledge_node(lo_slug.clone(), lo, vec![])
                 .expect("add lo");
+            let lo_slug_canonical = svc.graph()[lo_id].slug.clone();
 
             let assess_slug = format!("assess-{i}");
             let assess = mk_kn(&assess_slug, KnowledgeType::AssessmentItem);
@@ -1050,7 +1066,7 @@ mod persistence_topology {
                 lo_id,
                 graph::AssessesAttrs {
                     evidence_link: EvidenceLink {
-                        claim:                lo_slug,
+                        claim:                lo_slug_canonical,
                         observation_features: vec![crit],
                         scope:                AssessmentScope::Target,
                     },
