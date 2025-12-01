@@ -1,6 +1,5 @@
 /// Default temperature applied to LLM requests.
-// TODO: Change to 0.7 before final run.
-pub const DEFAULT_TEMPERATURE: f32 = 1.0;
+pub const DEFAULT_TEMPERATURE: f32 = 0.7;
 
 /// Default nucleus sampling value applied to LLM requests.
 pub const DEFAULT_TOP_P: f32 = 1.0;
@@ -23,6 +22,36 @@ pub const LLM_MAX_CONCURRENT_REQUESTS: usize = 256;
 
 /// Maximum number of retry attempts for a single OpenAI request.
 pub const LLM_MAX_RETRIES: usize = 5;
+
+/// Maximum number of models tracked in GatewayMetrics (estimators, context).
+pub const GATEWAY_METRICS_MAX_MODELS: usize = 128;
+
+/// Maximum number of conversations tracked in GatewayMetrics.
+pub const GATEWAY_METRICS_MAX_CONVERSATIONS: usize = 512;
+
+/// Maximum nodes permitted in the graph to prevent runaway growth.
+pub const MAX_GRAPH_NODES: usize = 50_000;
+
+/// Maximum edges permitted in the graph to prevent runaway growth.
+pub const MAX_GRAPH_EDGES: usize = 200_000;
+
+/// Maximum milliseconds allowed for filesystem search tasks to run.
+pub const SEARCH_TASK_TIMEOUT_MS: u64 = 5_000;
+
+/// Sentence threshold for over-bundling detection.
+pub const GRAIN_OVERBUNDLED_SENTENCE_THRESHOLD: usize = 2;
+
+/// Requires in-degree threshold for over-bundling/intrinsic load warnings.
+pub const GRAIN_OVERBUNDLED_REQUIRES_THRESHOLD: usize = 4;
+
+/// Token threshold for fragment detection.
+pub const GRAIN_FRAGMENT_TOKEN_THRESHOLD: usize = 15;
+
+/// Requires in-degree threshold for intrinsic load mismatch.
+pub const INTRINSIC_COMPLEXITY_REQUIRES_THRESHOLD: usize = 4;
+
+/// Minimum supports required for high intrinsic load nodes.
+pub const HIGH_INTRINSIC_MIN_SUPPORTS: usize = 2;
 
 /// Timeout applied to each chat-completion request (seconds).
 pub const REQUEST_TIMEOUT_SECS: u64 = 300;

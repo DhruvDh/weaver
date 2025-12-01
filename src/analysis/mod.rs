@@ -13,7 +13,10 @@
 //! orphans, and alignment gaps. All functions operate on an immutable graph
 //! snapshot and do not mutate state.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::{
+    cmp::Ordering,
+    collections::{HashMap, HashSet, VecDeque},
+};
 
 use petgraph::{
     Direction,
@@ -124,6 +127,25 @@ pub struct CoverageReport {
 }
 
 pub fn coverage_report(g: &CurriculumGraph, lo: NodeId) -> CoverageReport {
+    fn canonical_feature(raw: &str) -> Option<String> {
+        let filtered: String = raw
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() {
+                    c.to_ascii_lowercase()
+                } else {
+                    ' '
+                }
+            })
+            .collect();
+        let normalized = filtered.split_whitespace().collect::<Vec<_>>().join(" ");
+        if normalized.is_empty() {
+            None
+        } else {
+            Some(normalized)
+        }
+    }
+
     let (rubric, mut observations) = match &g[lo].kind {
         NodeKind::Knowledge(k) if k.knowledge_type == KnowledgeType::LearningOutcome => {
             (k.rubric_criteria.clone(), Vec::new())
@@ -139,18 +161,36 @@ pub fn coverage_report(g: &CurriculumGraph, lo: NodeId) -> CoverageReport {
         }
     }
 
-    let rubric_set: HashSet<String> = rubric.iter().cloned().collect();
-    let obs_set: HashSet<String> = observations.iter().cloned().collect();
+    let rubric_norm: HashMap<String, String> = rubric
+        .into_iter()
+        .filter_map(|item| canonical_feature(&item).map(|canon| (canon, item)))
+        .collect();
+    let obs_norm: HashMap<String, String> = observations
+        .into_iter()
+        .filter_map(|item| canonical_feature(&item).map(|canon| (canon, item)))
+        .collect();
 
-    let covered: Vec<String> = rubric_set.intersection(&obs_set).cloned().collect();
-    let missing: Vec<String> = rubric_set.difference(&obs_set).cloned().collect();
-    let unused: Vec<String> = obs_set.difference(&rubric_set).cloned().collect();
+    let covered: HashSet<String> = rubric_norm
+        .keys()
+        .filter(|k| obs_norm.contains_key(*k))
+        .filter_map(|k| rubric_norm.get(k).cloned())
+        .collect();
+    let missing: HashSet<String> = rubric_norm
+        .iter()
+        .filter(|(canon, _)| !obs_norm.contains_key(*canon))
+        .map(|(_, original)| original.clone())
+        .collect();
+    let unused: HashSet<String> = obs_norm
+        .iter()
+        .filter(|(canon, _)| !rubric_norm.contains_key(*canon))
+        .map(|(_, original)| original.clone())
+        .collect();
 
     CoverageReport {
         lo,
-        covered_criteria: covered,
-        missing_criteria: missing,
-        unused_observation_features: unused,
+        covered_criteria: covered.into_iter().collect(),
+        missing_criteria: missing.into_iter().collect(),
+        unused_observation_features: unused.into_iter().collect(),
     }
 }
 
@@ -187,18 +227,18 @@ pub fn intended_knowledge_from_anchors(g: &CurriculumGraph, lo: NodeId) -> HashS
     intended
 }
 
-/// Approximate keystone score: |in_reach| * |out_reach| over requires layer.
+/// Betweenness-inspired keystone score over the requires DAG; higher scores
+/// indicate nodes that sit on many shortest prerequisite paths.
 pub struct KeystoneScore {
     pub node:      NodeId,
-    pub score:     usize,
+    pub score:     f64,
     pub in_reach:  usize,
     pub out_reach: usize,
 }
 
 pub fn keystone_scores(g: &CurriculumGraph) -> Vec<KeystoneScore> {
     let (in_map, out_map) = requires_reach_counts_all(g);
-
-    let mut scores: Vec<_> = g
+    let nodes: Vec<NodeId> = g
         .node_indices()
         .filter(|&n| {
             matches!(
@@ -206,19 +246,72 @@ pub fn keystone_scores(g: &CurriculumGraph) -> Vec<KeystoneScore> {
                 NodeKind::Knowledge(k) if k.knowledge_type.is_instructional_knowledge()
             )
         })
-        .map(|n| {
+        .collect();
+    let index: HashMap<NodeId, usize> = nodes.iter().enumerate().map(|(i, &n)| (n, i)).collect();
+    let mut neighbors: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
+
+    for edge in g.edge_indices() {
+        if let EdgeKind::Requires(_) = &g[edge].kind
+            && let Some((u, v)) = g.edge_endpoints(edge)
+            && let (Some(&ui), Some(&vi)) = (index.get(&u), index.get(&v))
+        {
+            neighbors[ui].push(vi);
+        }
+    }
+
+    let mut centrality = vec![0.0f64; nodes.len()];
+    for s in 0..nodes.len() {
+        let mut stack = Vec::new();
+        let mut pred = vec![Vec::<usize>::new(); nodes.len()];
+        let mut sigma = vec![0.0f64; nodes.len()];
+        let mut dist = vec![usize::MAX; nodes.len()];
+        sigma[s] = 1.0;
+        dist[s] = 0;
+        let mut queue = VecDeque::new();
+        queue.push_back(s);
+        while let Some(v) = queue.pop_front() {
+            stack.push(v);
+            let dv = dist[v];
+            for &w in &neighbors[v] {
+                if dist[w] == usize::MAX {
+                    dist[w] = dv + 1;
+                    queue.push_back(w);
+                }
+                if dist[w] == dv + 1 {
+                    sigma[w] += sigma[v];
+                    pred[w].push(v);
+                }
+            }
+        }
+        let mut delta = vec![0.0f64; nodes.len()];
+        while let Some(w) = stack.pop() {
+            for &v in &pred[w] {
+                if sigma[w] > 0.0 {
+                    delta[v] += (sigma[v] / sigma[w]) * (1.0 + delta[w]);
+                }
+            }
+            if w != s {
+                centrality[w] += delta[w];
+            }
+        }
+    }
+
+    let mut scores: Vec<_> = nodes
+        .iter()
+        .enumerate()
+        .map(|(idx, &n)| {
             let in_reach = *in_map.get(&n).unwrap_or(&0);
             let out_reach = *out_map.get(&n).unwrap_or(&0);
             KeystoneScore {
                 node: n,
-                score: in_reach * out_reach,
+                score: centrality[idx],
                 in_reach,
                 out_reach,
             }
         })
         .collect();
 
-    scores.sort_by(|a, b| b.score.cmp(&a.score));
+    scores.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
     scores
 }
 

@@ -35,6 +35,89 @@ struct ValidationState {
     dirty: AtomicU16,
 }
 
+struct GraphValidator<'a> {
+    strict_quality:    bool,
+    expected_revision: Option<String>,
+    rubric_hashes:     &'a RwLock<HashMap<String, u64>>,
+}
+
+impl<'a> GraphValidator<'a> {
+    fn new(
+        strict_quality: bool,
+        expected_revision: Option<String>,
+        rubric_hashes: &'a RwLock<HashMap<String, u64>>,
+    ) -> Self {
+        Self {
+            strict_quality,
+            expected_revision,
+            rubric_hashes,
+        }
+    }
+
+    fn context(&self, include_rubric_update: bool) -> ValidationContext {
+        ValidationContext {
+            strict: self.strict_quality,
+            expected_revision: self.expected_revision.clone(),
+            rubric_prev: self
+                .rubric_hashes
+                .read()
+                .expect("rubric_hashes lock")
+                .clone(),
+            include_rubric_update,
+        }
+    }
+
+    fn run(
+        &self,
+        graph: &CurriculumGraph,
+        scope: ValidationScope,
+        families: InvariantFamilies,
+    ) -> Result<Option<HashMap<String, u64>>, GraphError> {
+        let ctx = self.context(true);
+        validation::run_invariants_for_graph(graph, scope, &ctx, families)
+    }
+
+    async fn run_blocking(
+        &self,
+        graph: Arc<CurriculumGraph>,
+        scope: ValidationScope,
+        families: InvariantFamilies,
+        timeout_ms: Duration,
+    ) -> Result<Option<HashMap<String, u64>>, GraphError> {
+        let ctx = self.context(true);
+        let handle = task::spawn_blocking(move || {
+            let delay_ms = crate::graph::service::test_support::test_validation_delay_ms();
+            if delay_ms > 0 {
+                std::thread::sleep(Duration::from_millis(delay_ms));
+            }
+
+            validation::run_invariants_for_graph(&graph, scope, &ctx, families)
+        });
+        match timeout(timeout_ms, handle).await {
+            Ok(res) => res.map_err(|join_err| {
+                GraphError::Operational(GraphOperationalError::InvariantTaskFailed {
+                    message: format!("graph invariant validation task failed: {join_err}"),
+                })
+            })?,
+            Err(_) => {
+                let timeout_ms = timeout_ms.as_millis() as u64;
+                tracing::warn!(
+                    target: "weaver.graph.validation",
+                    code = "validation_timeout",
+                    timeout_ms
+                );
+                Err(GraphOperationalError::InvariantTimeout { timeout_ms }.into())
+            }
+        }
+    }
+
+    fn update_rubric(&self, rubric_current: Option<HashMap<String, u64>>) {
+        if let Some(rubric) = rubric_current {
+            *self.rubric_hashes.write().expect("rubric_hashes lock") = rubric;
+        }
+    }
+}
+
 impl ValidationState {
     fn new_empty() -> Self {
         Self {
@@ -156,6 +239,14 @@ impl GraphService {
         self
     }
 
+    fn validator(&self) -> GraphValidator<'_> {
+        GraphValidator::new(
+            self.strict_quality,
+            self.expected_revision.clone(),
+            &self.rubric_hashes,
+        )
+    }
+
     pub fn from_graph(graph: CurriculumGraph) -> Self {
         Self::from_parts(graph, false, 0, None)
             .expect("graph provided to from_graph must have unique slugs and valid invariants")
@@ -244,6 +335,26 @@ impl GraphService {
         }
     }
 
+    fn ensure_node_capacity(&self) -> Result<(), GraphError> {
+        if self.graph.node_count() >= crate::constants::MAX_GRAPH_NODES {
+            return Err(GraphError::Schema(format!(
+                "graph node cap {} reached",
+                crate::constants::MAX_GRAPH_NODES
+            )));
+        }
+        Ok(())
+    }
+
+    fn ensure_edge_capacity(&self) -> Result<(), GraphError> {
+        if self.graph.edge_count() >= crate::constants::MAX_GRAPH_EDGES {
+            return Err(GraphError::Schema(format!(
+                "graph edge cap {} reached",
+                crate::constants::MAX_GRAPH_EDGES
+            )));
+        }
+        Ok(())
+    }
+
     fn planned_families(&self, required: InvariantFamilies) -> InvariantFamilies {
         let dirty = InvariantFamilies::from_bits_truncate(
             self.validation_state.dirty.load(Ordering::Relaxed),
@@ -316,6 +427,7 @@ impl GraphService {
         payload: KnowledgeNode,
         tags: Vec<String>,
     ) -> Result<NodeId, GraphError> {
+        self.ensure_node_capacity()?;
         if self.slug_to_node.contains_key(&slug) {
             return Err(GraphError::Schema(format!(
                 "slug `{}` already exists; use update_knowledge_node",
@@ -337,6 +449,7 @@ impl GraphService {
         let mut dirty = InvariantFamilies::STATEMENTS
             | InvariantFamilies::PROVENANCE
             | InvariantFamilies::SUPPORTS;
+        dirty.insert(InvariantFamilies::STRUCTURE);
         if payload.knowledge_type == KnowledgeType::LearningOutcome
             || payload.knowledge_type.is_assessment_item()
         {
@@ -420,6 +533,7 @@ impl GraphService {
         let mut dirty = InvariantFamilies::STATEMENTS
             | InvariantFamilies::PROVENANCE
             | InvariantFamilies::SUPPORTS;
+        dirty.insert(InvariantFamilies::STRUCTURE);
         let mut needs_coverage = false;
         let mut needs_purity = false;
         if let NodeKind::Knowledge(k) = &old_kind {
@@ -676,6 +790,18 @@ impl GraphService {
         graph_version: u64,
     ) -> Result<(), GraphError> {
         normalize_assesses_claims_graph(&mut graph);
+        if graph.node_count() > crate::constants::MAX_GRAPH_NODES {
+            return Err(GraphError::Schema(format!(
+                "graph node cap {} exceeded in snapshot",
+                crate::constants::MAX_GRAPH_NODES
+            )));
+        }
+        if graph.edge_count() > crate::constants::MAX_GRAPH_EDGES {
+            return Err(GraphError::Schema(format!(
+                "graph edge cap {} exceeded in snapshot",
+                crate::constants::MAX_GRAPH_EDGES
+            )));
+        }
 
         // Build slug index first; only commit if it succeeds.
         let candidate = Arc::new(graph);
@@ -741,6 +867,7 @@ impl GraphService {
         payload: TeachingStepNode,
         tags: Vec<String>,
     ) -> Result<NodeId, GraphError> {
+        self.ensure_node_capacity()?;
         if self.slug_to_node.contains_key(&slug) {
             return Err(GraphError::Schema(format!(
                 "slug `{}` already exists; use update_teaching_step",
@@ -864,6 +991,7 @@ impl GraphService {
         attrs: S::Attrs,
         confidence: f32,
     ) -> Result<EdgeId, GraphError> {
+        self.ensure_edge_capacity()?;
         // Duplicate edge guard runs only for new insertions; validation passes
         // during node updates should not trigger it.
         let duplicate = match S::NAME {
@@ -906,8 +1034,13 @@ impl GraphService {
                 InvariantFamilies::REQUIRES_DAG
                     | InvariantFamilies::FADEABILITY
                     | InvariantFamilies::PURITY
+                    | InvariantFamilies::STRUCTURE
             }
-            "supports" => InvariantFamilies::FADEABILITY | InvariantFamilies::SUPPORTS,
+            "supports" => {
+                InvariantFamilies::FADEABILITY
+                    | InvariantFamilies::SUPPORTS
+                    | InvariantFamilies::STRUCTURE
+            }
             "assesses" => InvariantFamilies::PURITY,
             "precedes" => InvariantFamilies::DISCOURSE,
             "anchors" => InvariantFamilies::DISCOURSE | InvariantFamilies::INTRODUCTIONS,
@@ -1041,7 +1174,8 @@ impl GraphService {
                 InvariantFamilies::REQUIRES_DAG
                     | InvariantFamilies::FADEABILITY
                     | InvariantFamilies::COVERAGE
-                    | InvariantFamilies::PURITY,
+                    | InvariantFamilies::PURITY
+                    | InvariantFamilies::STRUCTURE,
             );
             self.bump_version();
             self.record_mutation(
@@ -1072,53 +1206,11 @@ impl GraphService {
         if effective.is_empty() {
             return Ok(());
         }
-        let graph = self.graph.clone();
-        let ctx = ValidationContext {
-            strict:                self.strict_quality,
-            expected_revision:     self.expected_revision.clone(),
-            rubric_prev:           self
-                .rubric_hashes
-                .read()
-                .expect("rubric_hashes lock")
-                .clone(),
-            include_rubric_update: true,
-        };
-        let handle = task::spawn_blocking(move || {
-            let delay_ms = crate::graph::service::test_support::test_validation_delay_ms();
-            if delay_ms > 0 {
-                std::thread::sleep(Duration::from_millis(delay_ms));
-            }
-
-            validation::run_invariants_for_graph(&graph, scope, &ctx, effective)
-        });
-        let join_result = match timeout(timeout_ms, handle).await {
-            Ok(res) => res,
-            Err(_) => {
-                let timeout_ms = timeout_ms.as_millis() as u64;
-                tracing::warn!(
-                    target: "weaver.graph.validation",
-                    code = "validation_timeout",
-                    timeout_ms
-                );
-                return Err(GraphError::InvariantTimeout { timeout_ms });
-            }
-        };
-        let rubric_current = match join_result {
-            Ok(inner) => inner?,
-            Err(join_err) => {
-                tracing::warn!(
-                    target: "weaver.graph.validation",
-                    code = "validation_task_failed",
-                    error = %join_err
-                );
-                return Err(GraphError::InvariantTaskFailed {
-                    message: format!("graph invariant validation task failed: {join_err}"),
-                });
-            }
-        };
-        if let Some(rubric) = rubric_current {
-            *self.rubric_hashes.write().expect("rubric_hashes lock") = rubric;
-        }
+        let result = self
+            .validator()
+            .run_blocking(self.graph.clone(), scope, effective, timeout_ms)
+            .await?;
+        self.validator().update_rubric(result);
         self.clear_validated_families(effective);
         Ok(())
     }
@@ -1128,24 +1220,12 @@ impl GraphService {
         scope: ValidationScope,
         families: InvariantFamilies,
     ) -> Result<(), GraphError> {
-        let ctx = ValidationContext {
-            strict:                self.strict_quality,
-            expected_revision:     self.expected_revision.clone(),
-            rubric_prev:           self
-                .rubric_hashes
-                .read()
-                .expect("rubric_hashes lock")
-                .clone(),
-            include_rubric_update: true,
-        };
         let effective = validation::families_for_scope(families, &scope);
         if effective.is_empty() {
             return Ok(());
         }
-        let result = validation::run_invariants_for_graph(self.graph(), scope, &ctx, effective)?;
-        if let Some(rubric) = result {
-            *self.rubric_hashes.write().expect("rubric_hashes lock") = rubric;
-        }
+        let result = self.validator().run(self.graph(), scope, effective)?;
+        self.validator().update_rubric(result);
         self.clear_validated_families(effective);
         Ok(())
     }

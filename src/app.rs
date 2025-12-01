@@ -22,9 +22,10 @@ use crate::{
     file_reader::{FileReader, FileReaderQuery},
     graph::{
         CurriculumGraph, GraphConfig,
+        audit::RerunMutationSink,
         manager::{
             ApplyRuntimeConfig, AuditInvariants, GetCourseCommit, GraphManager, GraphManagerState,
-            PersistSnapshot, RedundantRequires, SaveSnapshot,
+            PersistSnapshot, RedundantRequires, SaveSnapshot, SetAuditSink,
         },
         persist,
     },
@@ -120,6 +121,21 @@ impl IntoAnyhow for Arc<anyhow::Error> {
 impl IntoAnyhow for anyhow::Error {
     fn into_anyhow(self) -> anyhow::Error {
         self
+    }
+}
+
+impl IntoAnyhow for Arc<crate::graph::manager::GraphManagerError> {
+    fn into_anyhow(self) -> anyhow::Error {
+        match Arc::try_unwrap(self) {
+            Ok(err) => err.into_anyhow(),
+            Err(shared) => anyhow::Error::msg(shared.to_string()),
+        }
+    }
+}
+
+impl IntoAnyhow for crate::graph::manager::GraphManagerError {
+    fn into_anyhow(self) -> anyhow::Error {
+        anyhow::Error::new(self)
     }
 }
 
@@ -753,6 +769,11 @@ pub async fn run_app(cli: Cli, runtime: RuntimeOptions) -> Result<()> {
     } else {
         Some(RerunSink::spawn(rerun_targets))
     };
+    if let Some(rerun) = &rerun_actor {
+        let sink: crate::graph::audit::SharedMutationSink =
+            Arc::new(RerunMutationSink::new(rerun.clone()));
+        let _ = graph_actor.tell(SetAuditSink { sink }).await;
+    }
 
     let autosave_worker = AutosaveWorker {
         graph:         graph_actor.clone(),

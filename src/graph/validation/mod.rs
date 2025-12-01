@@ -11,7 +11,7 @@ use petgraph::Direction;
 use tracing::warn;
 
 use crate::{
-    analysis,
+    analysis, constants,
     graph::{
         AnchorImpact, CurriculumGraph, EdgeKind, GraphError, InvariantCode, NodeId, NodeKind,
         TeachingPurpose,
@@ -45,6 +45,7 @@ bitflags! {
         const PURITY        = 1 << 6;
         const DISCOURSE     = 1 << 7;
         const INTRODUCTIONS = 1 << 8;
+        const STRUCTURE     = 1 << 9;
         const ALL           = Self::STATEMENTS.bits()
             | Self::PROVENANCE.bits()
             | Self::REQUIRES_DAG.bits()
@@ -53,7 +54,8 @@ bitflags! {
             | Self::SUPPORTS.bits()
             | Self::PURITY.bits()
             | Self::DISCOURSE.bits()
-            | Self::INTRODUCTIONS.bits();
+            | Self::INTRODUCTIONS.bits()
+            | Self::STRUCTURE.bits();
     }
 }
 
@@ -201,6 +203,9 @@ pub fn run_invariants_for_graph(
             &rubric_prev,
             &rubric_current,
         ));
+    }
+    if families.contains(InvariantFamilies::STRUCTURE) {
+        issues.extend(granularity::validate(g));
     }
     if families.contains(InvariantFamilies::SUPPORTS) {
         issues.extend(supports::validate(g));
@@ -533,6 +538,127 @@ mod coverage {
             }
         }
         out
+    }
+}
+
+mod granularity {
+    use super::*;
+
+    fn sentence_count(statement: &str) -> usize {
+        let count = statement
+            .split(['.', '!', '?'])
+            .filter(|s| s.split_whitespace().next().is_some())
+            .count();
+        count.max(1)
+    }
+
+    fn token_count(statement: &str) -> usize {
+        statement.split_whitespace().count()
+    }
+
+    pub(super) fn validate(g: &CurriculumGraph) -> Vec<ValidationIssue> {
+        let mut issues = Vec::new();
+        for n in g.node_indices() {
+            let NodeKind::Knowledge(k) = &g[n].kind else {
+                continue;
+            };
+            if k.knowledge_type.is_assessment_item() {
+                continue;
+            }
+            let requires_in = g
+                .edges_directed(n, Direction::Incoming)
+                .filter(|e| matches!(e.weight().kind, EdgeKind::Requires(_)))
+                .count();
+            let supports: Vec<_> = g
+                .edges_directed(n, Direction::Incoming)
+                .filter_map(|e| match &e.weight().kind {
+                    EdgeKind::Supports(attrs) => Some(attrs.clone()),
+                    _ => None,
+                })
+                .collect();
+            let support_count = supports.len();
+            let support_has_coverage = supports.iter().any(|s| !s.coverage_tags.is_empty());
+            let has_assesses = g
+                .edges_directed(n, Direction::Incoming)
+                .any(|e| matches!(e.weight().kind, EdgeKind::Assesses(_)));
+            let sentences = sentence_count(&k.statement);
+            let tokens = token_count(&k.statement);
+
+            if sentences > constants::GRAIN_OVERBUNDLED_SENTENCE_THRESHOLD
+                && requires_in >= constants::GRAIN_OVERBUNDLED_REQUIRES_THRESHOLD
+            {
+                issues.push(make_issue(
+                    InvariantCode::GrainOverbundled,
+                    ValidationSeverity::Warning,
+                    true,
+                    format!(
+                        "knowledge `{}` appears over-bundled ({} sentences, {} requires); \
+                         consider splitting or marking grain_level=macro",
+                        g[n].slug, sentences, requires_in
+                    ),
+                ));
+            }
+
+            if tokens < constants::GRAIN_FRAGMENT_TOKEN_THRESHOLD
+                && support_count == 0
+                && !has_assesses
+            {
+                issues.push(make_issue(
+                    InvariantCode::GrainFragment,
+                    ValidationSeverity::Warning,
+                    true,
+                    format!(
+                        "knowledge `{}` looks fragmentary ({} tokens, no supports/assesses); \
+                         consider folding into an example and tagging grain_level=micro",
+                        g[n].slug, tokens
+                    ),
+                ));
+            }
+
+            if requires_in >= constants::INTRINSIC_COMPLEXITY_REQUIRES_THRESHOLD
+                && !matches!(k.intrinsic_load, Some(crate::graph::IntrinsicLoad::High))
+            {
+                issues.push(make_issue(
+                    InvariantCode::IntrinsicLoadMismatch,
+                    ValidationSeverity::Warning,
+                    true,
+                    format!(
+                        "knowledge `{}` has {} requires edges; mark intrinsic_load=high or split \
+                         to reduce cognitive load",
+                        g[n].slug, requires_in
+                    ),
+                ));
+            }
+
+            if matches!(k.intrinsic_load, Some(crate::graph::IntrinsicLoad::High)) {
+                if support_count < constants::HIGH_INTRINSIC_MIN_SUPPORTS {
+                    issues.push(make_issue(
+                        InvariantCode::IntrinsicLoadSupport,
+                        ValidationSeverity::Warning,
+                        true,
+                        format!(
+                            "knowledge `{}` tagged intrinsic_load=high needs >= {} supports; \
+                             found {}",
+                            g[n].slug,
+                            constants::HIGH_INTRINSIC_MIN_SUPPORTS,
+                            support_count
+                        ),
+                    ));
+                } else if !support_has_coverage {
+                    issues.push(make_issue(
+                        InvariantCode::IntrinsicLoadSupport,
+                        ValidationSeverity::Warning,
+                        true,
+                        format!(
+                            "knowledge `{}` tagged intrinsic_load=high should include \
+                             coverage_tags on supports to target constraints",
+                            g[n].slug
+                        ),
+                    ));
+                }
+            }
+        }
+        issues
     }
 }
 

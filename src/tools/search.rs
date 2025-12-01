@@ -4,10 +4,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use grep_regex::RegexMatcher;
 use grep_searcher::{BinaryDetection, SearcherBuilder, sinks::Lossy};
 use ignore::WalkBuilder;
+use tokio::time::{Duration, timeout};
 use tracing::{debug, trace};
 
 /// Directories skipped by default during recursive search to cut noise and
@@ -58,7 +59,7 @@ pub async fn search_recursive(
     let max_matches = opts.max_matches.unwrap_or(usize::MAX);
     let max_bytes = opts.max_bytes.unwrap_or(u64::MAX);
 
-    let result = tokio::task::spawn_blocking(move || -> Result<SearchResult> {
+    let search_future = tokio::task::spawn_blocking(move || -> Result<SearchResult> {
         let matcher = RegexMatcher::new_line_matcher(&pattern)
             .with_context(|| format!("failed to compile search pattern `{pattern}`"))?;
         let mut searcher = SearcherBuilder::new()
@@ -153,9 +154,14 @@ pub async fn search_recursive(
             total_matches,
             total_bytes,
         })
-    })
-    .await
-    .context("blocking regex search task panicked")??;
+    });
+    let result =
+        timeout(Duration::from_millis(crate::constants::SEARCH_TASK_TIMEOUT_MS), search_future)
+            .await
+            .map_err(|_| {
+                anyhow!("search timed out after {} ms", crate::constants::SEARCH_TASK_TIMEOUT_MS)
+            })?
+            .context("blocking regex search task panicked")??;
 
     Ok(result)
 }

@@ -9,12 +9,13 @@ use kameo::{error::Infallible, message::Context as MsgContext, prelude::*};
 use kameo_persistence::{BiHashMap, PersistentActor};
 use petgraph::{Direction, visit::EdgeRef};
 use serde::Serialize;
+use thiserror::Error;
 use tracing::error;
 use url::Url;
 
 use crate::graph::{
-    CurriculumGraph, EdgeKind, GraphConfig, GraphError, GraphService, NodeId, NodePayload,
-    commands::*, persist,
+    CurriculumGraph, EdgeKind, GraphConfig, GraphError, GraphOperationalError, GraphService,
+    NodeId, NodePayload, commands::*, persist,
 };
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -30,6 +31,14 @@ pub struct GraphManagerState {
 
 const fn default_validation_timeout_ms() -> u64 {
     crate::constants::GRAPH_VALIDATION_TIMEOUT_MS
+}
+
+#[derive(Debug, Error)]
+pub enum GraphManagerError {
+    #[error(transparent)]
+    Domain(#[from] GraphError),
+    #[error("graph manager operational error: {0}")]
+    Operational(#[from] anyhow::Error),
 }
 
 impl GraphManagerState {
@@ -144,7 +153,7 @@ impl From<&GraphManager> for GraphManagerState {
 
 impl Actor for GraphManager {
     type Args = GraphManagerState;
-    type Error = Arc<anyhow::Error>;
+    type Error = Arc<GraphManagerError>;
 
     async fn on_start(state: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         let strict = state.strict_quality;
@@ -161,8 +170,16 @@ impl Actor for GraphManager {
         ) {
             Ok(svc) => svc,
             Err(err) => {
-                let quarantine_path =
-                    GraphManager::quarantine_rejected_snapshot(&state, &actor_ref, &err).await?;
+                let quarantine_path = match GraphManager::quarantine_rejected_snapshot(
+                    &state, &actor_ref, &err,
+                )
+                .await
+                {
+                    Ok(path) => path,
+                    Err(qerr) => {
+                        return Err(Arc::new(GraphManagerError::Operational(qerr)));
+                    }
+                };
                 error!(
                     target: "weaver.graph.restore_failed",
                     error = %err,
@@ -171,7 +188,7 @@ impl Actor for GraphManager {
                     quarantine_path = %quarantine_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "<none>".into()),
                     "refusing to start with invalid persisted graph"
                 );
-                return Err(Arc::new(anyhow::anyhow!(err)));
+                return Err(Arc::new(GraphManagerError::Domain(err)));
             }
         };
 
@@ -659,6 +676,10 @@ pub struct ApplyRuntimeConfig {
     pub validation_timeout_ms: u64,
 }
 
+pub struct SetAuditSink {
+    pub sink: crate::graph::audit::SharedMutationSink,
+}
+
 impl Message<SaveSnapshot> for GraphManager {
     type Reply = Result<()>;
 
@@ -700,7 +721,10 @@ impl Message<AuditInvariants> for GraphManager {
             .validate_global_invariants_off_thread(timeout)
             .await;
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-        if let Err(GraphError::InvariantTimeout { timeout_ms }) = res.as_ref() {
+        if let Err(GraphError::Operational(GraphOperationalError::InvariantTimeout {
+            timeout_ms,
+        })) = res.as_ref()
+        {
             tracing::warn!(
                 target: "weaver.graph.validation.audit",
                 code = "validation_timeout",
@@ -844,6 +868,19 @@ impl Message<ApplyRuntimeConfig> for GraphManager {
             return Err(err.into());
         }
 
+        Ok(())
+    }
+}
+
+impl Message<SetAuditSink> for GraphManager {
+    type Reply = std::result::Result<(), Infallible>;
+
+    async fn handle(
+        &mut self,
+        SetAuditSink { sink }: SetAuditSink,
+        _ctx: &mut MsgContext<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.service.set_audit_sink(sink);
         Ok(())
     }
 }

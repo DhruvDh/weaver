@@ -40,12 +40,14 @@ pub(crate) fn map_graph_err(err: GraphError, tool: &'static str) -> ToolExecutio
                 ),
             })
         }
-        GraphError::InvariantTimeout { timeout_ms } => ToolExecutionError::Internal(anyhow!(
+        GraphError::Operational(crate::graph::GraphOperationalError::InvariantTimeout {
+            timeout_ms,
+        }) => ToolExecutionError::Internal(anyhow!(
             "graph invariant validation timed out after {timeout_ms} ms"
         )),
-        GraphError::InvariantTaskFailed { message } => {
-            ToolExecutionError::Internal(anyhow!(message))
-        }
+        GraphError::Operational(crate::graph::GraphOperationalError::InvariantTaskFailed {
+            message,
+        }) => ToolExecutionError::Internal(anyhow!(message)),
         GraphError::InvariantViolation { violations } => {
             let joined = violations
                 .iter()

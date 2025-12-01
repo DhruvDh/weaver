@@ -5,7 +5,10 @@ use std::{
 };
 
 use kameo::prelude::*;
-use rerun::{RecordingStream, RecordingStreamBuilder, TimeCell, archetypes::Scalars};
+use rerun::{
+    RecordingStream, RecordingStreamBuilder, TimeCell,
+    archetypes::{Scalars, TextLog},
+};
 use tokio::task;
 use tracing::debug;
 
@@ -75,6 +78,13 @@ pub struct LogScalar {
     pub time_ns: Option<i64>,
 }
 
+#[derive(Clone)]
+pub struct LogText {
+    pub path:    String,
+    pub value:   String,
+    pub time_ns: Option<i64>,
+}
+
 impl Actor for RerunSink {
     type Args = Vec<RerunTarget>;
     type Error = Infallible;
@@ -126,4 +136,31 @@ fn now_timecell() -> Option<TimeCell> {
     i64::try_from(nanos)
         .ok()
         .map(TimeCell::from_timestamp_nanos_since_epoch)
+}
+
+impl Message<LogText> for RerunSink {
+    type Reply = ();
+
+    async fn handle(&mut self, msg: LogText, _ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
+        self.ensure_streams();
+        if self.recs.is_empty() {
+            return;
+        }
+        let time_cell = msg
+            .time_ns
+            .map(TimeCell::from_timestamp_nanos_since_epoch)
+            .or_else(now_timecell)
+            .unwrap_or_else(|| TimeCell::from_timestamp_nanos_since_epoch(0));
+        let recs = self.recs.clone();
+        let path = msg.path;
+        let value = msg.value;
+        task::spawn(async move {
+            for rec in recs {
+                rec.set_time("time", time_cell);
+                if let Err(err) = rec.log(path.clone(), &TextLog::new(value.clone())) {
+                    debug!(error = ?err, "rerun log failed");
+                }
+            }
+        });
+    }
 }

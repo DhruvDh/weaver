@@ -191,6 +191,10 @@ pub enum InvariantCode {
     DiscourseOrphan,
     TeachingStepAnchorOrRationale,
     IntroduceAnchor,
+    GrainOverbundled,
+    GrainFragment,
+    IntrinsicLoadMismatch,
+    IntrinsicLoadSupport,
 }
 
 impl InvariantCode {
@@ -213,6 +217,10 @@ impl InvariantCode {
             InvariantCode::DiscourseOrphan => "discourse_orphan",
             InvariantCode::TeachingStepAnchorOrRationale => "teaching_step_anchor_or_rationale",
             InvariantCode::IntroduceAnchor => "introduce_anchor",
+            InvariantCode::GrainOverbundled => "grain_overbundled",
+            InvariantCode::GrainFragment => "grain_fragment",
+            InvariantCode::IntrinsicLoadMismatch => "intrinsic_load_mismatch",
+            InvariantCode::IntrinsicLoadSupport => "intrinsic_load_support",
         }
     }
 }
@@ -221,6 +229,14 @@ impl InvariantCode {
 pub struct InvariantViolation {
     pub code:    InvariantCode,
     pub message: String,
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum GraphOperationalError {
+    #[error("graph invariant validation timed out after {timeout_ms} ms")]
+    InvariantTimeout { timeout_ms: u64 },
+    #[error("graph invariant validation task failed: {message}")]
+    InvariantTaskFailed { message: String },
 }
 
 /// Errors returned by GraphService.
@@ -238,10 +254,8 @@ pub enum GraphError {
     RequiresCycle { cycle_slugs: Vec<String> },
     #[error("validator error: {0}")]
     Schema(String),
-    #[error("graph invariant validation timed out after {timeout_ms} ms")]
-    InvariantTimeout { timeout_ms: u64 },
-    #[error("graph invariant validation task failed: {message}")]
-    InvariantTaskFailed { message: String },
+    #[error(transparent)]
+    Operational(#[from] GraphOperationalError),
     #[error("graph invariant violation(s): {violations:?}")]
     InvariantViolation { violations: Vec<InvariantViolation> },
 }

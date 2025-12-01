@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     convert::Infallible,
     env,
     sync::{
@@ -25,7 +25,7 @@ use dashmap::DashMap;
 use kameo::{error::SendError, prelude::*, reply::DelegatedReply};
 use kameo_persistence::{BiHashMap, PersistentActor};
 use once_cell::sync::Lazy;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rand::{Rng, rng};
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
@@ -39,8 +39,9 @@ use url::Url;
 
 use crate::{
     constants::{
-        LLM_MAX_CONCURRENT_REQUESTS, LLM_MAX_RETRIES, REQUEST_TIMEOUT_SECS, RETRY_BASE_DELAY_MS,
-        RETRY_MAX_BACKOFF_MS, RETRY_MAX_EXP,
+        GATEWAY_METRICS_MAX_CONVERSATIONS, GATEWAY_METRICS_MAX_MODELS, LLM_MAX_CONCURRENT_REQUESTS,
+        LLM_MAX_RETRIES, REQUEST_TIMEOUT_SECS, RETRY_BASE_DELAY_MS, RETRY_MAX_BACKOFF_MS,
+        RETRY_MAX_EXP,
     },
     file_reader::{ExecuteTool, FileReader},
     rerun_sink::{LogScalar, RerunSink},
@@ -146,6 +147,10 @@ pub struct GatewayMetrics {
     conversation_stats:         DashMap<String, ConversationAccumulator>,
     conversation_prompt_tokens: DashMap<String, u64>,
     context_limits:             DashMap<String, u32>,
+    estimator_order:            Mutex<VecDeque<String>>,
+    conversation_order:         Mutex<VecDeque<String>>,
+    prompt_order:               Mutex<VecDeque<String>>,
+    context_order:              Mutex<VecDeque<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,6 +169,47 @@ pub struct GatewayMetricsState {
 }
 
 impl GatewayMetrics {
+    fn drop_from_order(order: &Mutex<VecDeque<String>>, key: &str) {
+        let mut guard = order.lock();
+        if let Some(pos) = guard.iter().position(|k| k == key) {
+            guard.remove(pos);
+        }
+    }
+
+    fn touch_with_cap<V>(
+        &self,
+        order: &Mutex<VecDeque<String>>,
+        map: &DashMap<String, V>,
+        key: &str,
+        cap: usize,
+    ) {
+        if cap == 0 {
+            return;
+        }
+        let mut guard = order.lock();
+        if let Some(pos) = guard.iter().position(|k| k == key) {
+            guard.remove(pos);
+        }
+        guard.push_back(key.to_string());
+        while guard.len() > cap {
+            if let Some(old) = guard.pop_front() {
+                map.remove(&old);
+            }
+        }
+    }
+
+    fn prune_with_cap<V>(map: &DashMap<String, V>, order: &Mutex<VecDeque<String>>, cap: usize) {
+        if cap == 0 {
+            return;
+        }
+        let mut guard = order.lock();
+        while guard.len() > cap {
+            if let Some(old) = guard.pop_front() {
+                map.remove(&old);
+            }
+        }
+    }
+
     fn record_completion(&self, prompt: u32, completion: u32, total: u32, latency: Duration) {
         self.total_calls.fetch_add(1, Ordering::Relaxed);
         self.prompt_tokens
@@ -193,11 +239,18 @@ impl GatewayMetrics {
 
     pub fn reset_conversation_prompt_tokens(&self, conversation: &str) {
         self.conversation_prompt_tokens.remove(conversation);
+        Self::drop_from_order(&self.prompt_order, conversation);
     }
 
     pub fn record_conversation_prompt_tokens(&self, conversation: &str, tokens: u64) {
         self.conversation_prompt_tokens
             .insert(conversation.to_string(), tokens);
+        self.touch_with_cap(
+            &self.prompt_order,
+            &self.conversation_prompt_tokens,
+            conversation,
+            GATEWAY_METRICS_MAX_CONVERSATIONS,
+        );
     }
 
     pub fn latest_prompt_tokens_for_conversation(&self, conversation: &str) -> Option<u64> {
@@ -211,8 +264,16 @@ impl GatewayMetrics {
         if bytes == 0 || prompt_delta == 0 {
             return;
         }
-        let mut estimator = self.estimators.entry(model.to_string()).or_default();
-        estimator.update(bytes, prompt_delta);
+        {
+            let mut estimator = self.estimators.entry(model.to_string()).or_default();
+            estimator.update(bytes, prompt_delta);
+        }
+        self.touch_with_cap(
+            &self.estimator_order,
+            &self.estimators,
+            model,
+            GATEWAY_METRICS_MAX_MODELS,
+        );
     }
 
     pub fn estimate_tokens(&self, model: &str, bytes: u64) -> Option<u64> {
@@ -231,6 +292,12 @@ impl GatewayMetrics {
             .or_default();
         entry.total_tokens = entry.total_tokens.saturating_add(tokens);
         entry.count = entry.count.saturating_add(1);
+        self.touch_with_cap(
+            &self.conversation_order,
+            &self.conversation_stats,
+            actor,
+            GATEWAY_METRICS_MAX_CONVERSATIONS,
+        );
     }
 
     pub fn log_summary(&self) {
@@ -260,6 +327,18 @@ impl GatewayMetrics {
     }
 
     pub fn to_state(&self) -> GatewayMetricsState {
+        Self::prune_with_cap(&self.estimators, &self.estimator_order, GATEWAY_METRICS_MAX_MODELS);
+        Self::prune_with_cap(
+            &self.conversation_stats,
+            &self.conversation_order,
+            GATEWAY_METRICS_MAX_CONVERSATIONS,
+        );
+        Self::prune_with_cap(
+            &self.conversation_prompt_tokens,
+            &self.prompt_order,
+            GATEWAY_METRICS_MAX_CONVERSATIONS,
+        );
+        Self::prune_with_cap(&self.context_limits, &self.context_order, GATEWAY_METRICS_MAX_MODELS);
         GatewayMetricsState {
             total_calls:                self.total_calls.load(Ordering::Relaxed),
             total_tokens:               self.total_tokens.load(Ordering::Relaxed),
@@ -292,7 +371,7 @@ impl GatewayMetrics {
     }
 
     pub fn from_state(state: GatewayMetricsState) -> Self {
-        Self {
+        let metrics = Self {
             total_calls:                AtomicU64::new(state.total_calls),
             total_tokens:               AtomicU64::new(state.total_tokens),
             prompt_tokens:              AtomicU64::new(state.prompt_tokens),
@@ -300,19 +379,87 @@ impl GatewayMetrics {
             last_latency_ms:            AtomicU64::new(state.last_latency_ms),
             last_prompt_tokens:         AtomicU64::new(state.last_prompt_tokens),
             last_completion_tokens:     AtomicU64::new(state.last_completion_tokens),
-            estimators:                 DashMap::from_iter(state.estimators),
-            conversation_stats:         DashMap::from_iter(state.conversation_stats),
-            conversation_prompt_tokens: DashMap::from_iter(state.conversation_prompt_tokens),
-            context_limits:             DashMap::from_iter(state.context_limits),
+            estimators:                 DashMap::new(),
+            conversation_stats:         DashMap::new(),
+            conversation_prompt_tokens: DashMap::new(),
+            context_limits:             DashMap::new(),
+            estimator_order:            Mutex::new(VecDeque::new()),
+            conversation_order:         Mutex::new(VecDeque::new()),
+            prompt_order:               Mutex::new(VecDeque::new()),
+            context_order:              Mutex::new(VecDeque::new()),
+        };
+
+        for (model, est) in state
+            .estimators
+            .into_iter()
+            .take(GATEWAY_METRICS_MAX_MODELS)
+        {
+            metrics.estimators.insert(model.clone(), est);
+            metrics.touch_with_cap(
+                &metrics.estimator_order,
+                &metrics.estimators,
+                &model,
+                GATEWAY_METRICS_MAX_MODELS,
+            );
         }
+        for (actor, acc) in state
+            .conversation_stats
+            .into_iter()
+            .take(GATEWAY_METRICS_MAX_CONVERSATIONS)
+        {
+            metrics.conversation_stats.insert(actor.clone(), acc);
+            metrics.touch_with_cap(
+                &metrics.conversation_order,
+                &metrics.conversation_stats,
+                &actor,
+                GATEWAY_METRICS_MAX_CONVERSATIONS,
+            );
+        }
+        for (conversation, tokens) in state
+            .conversation_prompt_tokens
+            .into_iter()
+            .take(GATEWAY_METRICS_MAX_CONVERSATIONS)
+        {
+            metrics
+                .conversation_prompt_tokens
+                .insert(conversation.clone(), tokens);
+            metrics.touch_with_cap(
+                &metrics.prompt_order,
+                &metrics.conversation_prompt_tokens,
+                &conversation,
+                GATEWAY_METRICS_MAX_CONVERSATIONS,
+            );
+        }
+        for (model, limit) in state
+            .context_limits
+            .into_iter()
+            .take(GATEWAY_METRICS_MAX_MODELS)
+        {
+            metrics.context_limits.insert(model.clone(), limit);
+            metrics.touch_with_cap(
+                &metrics.context_order,
+                &metrics.context_limits,
+                &model,
+                GATEWAY_METRICS_MAX_MODELS,
+            );
+        }
+
+        metrics
     }
 
     pub fn context_limit(&self, model: &str) -> u32 {
         let fallback = *DEFAULT_CONTEXT_LIMIT;
-        *self
+        let limit = *self
             .context_limits
             .entry(model.to_string())
-            .or_insert(fallback)
+            .or_insert(fallback);
+        self.touch_with_cap(
+            &self.context_order,
+            &self.context_limits,
+            model,
+            GATEWAY_METRICS_MAX_MODELS,
+        );
+        limit
     }
 }
 
@@ -450,6 +597,94 @@ impl From<LLMGatewayState> for LLMGateway {
             config: GatewayConfig::default(),
             metrics: Arc::new(GatewayMetrics::from_state(state.metrics)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gateway_metrics_evict_and_restore() {
+        let metrics = GatewayMetrics::default();
+
+        for i in 0..(GATEWAY_METRICS_MAX_MODELS + 5) {
+            let model = format!("model-{i}");
+            metrics.observe_payload_bytes(&model, 128, 16);
+            metrics.context_limit(&model);
+        }
+
+        for i in 0..(GATEWAY_METRICS_MAX_CONVERSATIONS + 5) {
+            let convo = format!("convo-{i}");
+            metrics.record_conversation_tokens(&convo, 42);
+            metrics.record_conversation_prompt_tokens(&convo, i as u64);
+        }
+
+        let state = metrics.to_state();
+        assert_eq!(state.estimators.len(), GATEWAY_METRICS_MAX_MODELS);
+        assert_eq!(state.context_limits.len(), GATEWAY_METRICS_MAX_MODELS);
+        assert_eq!(state.conversation_prompt_tokens.len(), GATEWAY_METRICS_MAX_CONVERSATIONS);
+        assert_eq!(state.conversation_stats.len(), GATEWAY_METRICS_MAX_CONVERSATIONS);
+        assert!(
+            !state.estimators.contains_key("model-0"),
+            "LRU eviction should drop oldest estimator"
+        );
+        assert!(
+            !state.conversation_prompt_tokens.contains_key("convo-0"),
+            "LRU eviction should drop oldest conversation prompt tokens"
+        );
+
+        let mut inflated = GatewayMetricsState {
+            total_calls:                0,
+            total_tokens:               0,
+            prompt_tokens:              0,
+            completion_tokens:          0,
+            last_latency_ms:            0,
+            last_prompt_tokens:         0,
+            last_completion_tokens:     0,
+            estimators:                 HashMap::new(),
+            conversation_stats:         HashMap::new(),
+            conversation_prompt_tokens: HashMap::new(),
+            context_limits:             HashMap::new(),
+        };
+
+        for i in 0..(GATEWAY_METRICS_MAX_MODELS + 20) {
+            inflated.estimators.insert(
+                format!("model-{i}"),
+                TokenEstimator {
+                    observed_bytes:  i as u64 + 1,
+                    observed_tokens: i as u64 + 2,
+                },
+            );
+            inflated
+                .context_limits
+                .insert(format!("model-{i}"), 100_000);
+        }
+        for i in 0..(GATEWAY_METRICS_MAX_CONVERSATIONS + 20) {
+            inflated
+                .conversation_prompt_tokens
+                .insert(format!("convo-{i}"), i as u64);
+            inflated.conversation_stats.insert(
+                format!("convo-{i}"),
+                ConversationAccumulator {
+                    total_tokens: i as u64,
+                    count:        i as u64,
+                },
+            );
+        }
+
+        let restored = GatewayMetrics::from_state(inflated);
+        let restored_state = restored.to_state();
+        assert_eq!(restored_state.estimators.len(), GATEWAY_METRICS_MAX_MODELS);
+        assert!(
+            restored_state.estimators.len() < GATEWAY_METRICS_MAX_MODELS + 10,
+            "restoration should clamp estimator count"
+        );
+        assert_eq!(restored_state.context_limits.len(), GATEWAY_METRICS_MAX_MODELS);
+        assert_eq!(
+            restored_state.conversation_prompt_tokens.len(),
+            GATEWAY_METRICS_MAX_CONVERSATIONS
+        );
     }
 }
 
@@ -1015,7 +1250,6 @@ impl LLMGateway {
         ))
     }
 }
-
 pub struct GetGatewayMetrics;
 
 impl Message<GetGatewayMetrics> for LLMGateway {

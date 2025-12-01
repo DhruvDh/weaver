@@ -158,9 +158,9 @@ async fn apply_runtime_config_honors_validation_timeout() -> anyhow::Result<()> 
                 .downcast_ref::<weaver::graph::GraphError>()
                 .expect("graph error");
             match graph_err {
-                weaver::graph::GraphError::InvariantTimeout { timeout_ms } => {
-                    assert_eq!(*timeout_ms, 1)
-                }
+                weaver::graph::GraphError::Operational(
+                    weaver::graph::GraphOperationalError::InvariantTimeout { timeout_ms },
+                ) => assert_eq!(*timeout_ms, 1),
                 other => panic!("unexpected error {other:?}"),
             }
         }

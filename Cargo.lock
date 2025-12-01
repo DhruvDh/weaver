@@ -11274,6 +11274,7 @@ dependencies = [
  "serde",
  "serde_json",
  "state",
+ "strsim 0.11.1",
  "thiserror 2.0.17",
  "tokio",
  "tracing",

@@ -250,10 +250,11 @@ async fn apply_runtime_config_respects_timeout() -> anyhow::Result<()> {
     let graph_err = err
         .downcast_ref::<weaver::graph::GraphError>()
         .expect("error should be GraphError");
-    if let weaver::graph::GraphError::InvariantTimeout { timeout_ms } = graph_err {
-        assert_eq!(*timeout_ms, 1, "timeout should propagate configured limit");
-    } else {
-        panic!("expected invariant timeout, got {graph_err:?}");
+    match graph_err {
+        weaver::graph::GraphError::Operational(
+            weaver::graph::GraphOperationalError::InvariantTimeout { timeout_ms },
+        ) => assert_eq!(*timeout_ms, 1, "timeout should propagate configured limit"),
+        other => panic!("expected invariant timeout, got {other:?}"),
     }
 
     actor.stop_gracefully().await.expect("stop graph manager");

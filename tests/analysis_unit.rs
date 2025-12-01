@@ -1087,3 +1087,109 @@ mod persistence_topology {
         );
     }
 }
+
+mod granularity {
+    use super::*;
+
+    fn requires_attrs() -> graph::RequiresAttrs {
+        graph::RequiresAttrs {
+            strength:      Strength::Necessary,
+            rationale:     "prereq".into(),
+            evidence_refs: vec![SourceRef {
+                path:       "dummy".into(),
+                start_line: 1,
+                end_line:   2,
+                revision:   "deadbeef".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn overbundled_nodes_flagged_in_strict_mode() {
+        let mut svc = GraphService::new();
+        let mut target = mk_kn("bundle", KnowledgeType::Conceptual);
+        target.statement = "First sentence. Second sentence. Third sentence.".into();
+        let target_id = svc
+            .add_knowledge_node("bundle".into(), target, vec![])
+            .unwrap();
+        for idx in 0..4 {
+            let prereq = svc
+                .add_knowledge_node(
+                    format!("p{idx}"),
+                    mk_kn(&format!("p{idx}"), KnowledgeType::Conceptual),
+                    vec![],
+                )
+                .unwrap();
+            svc.add_edge::<graph::RequiresSpec>(prereq, target_id, requires_attrs(), 1.0)
+                .unwrap();
+        }
+
+        let err = svc
+            .set_strict_quality(true)
+            .expect_err("should fail granularity audit");
+        let violations = match err {
+            graph::GraphError::InvariantViolation { violations } => violations,
+            other => panic!("unexpected error {other:?}"),
+        };
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v.code, graph::InvariantCode::GrainOverbundled)),
+            "expected GrainOverbundled violation"
+        );
+    }
+
+    #[test]
+    fn high_intrinsic_load_requires_supports() {
+        let mut svc = GraphService::new();
+        let mut target = mk_kn("dense", KnowledgeType::Procedural);
+        target.intrinsic_load = Some(graph::IntrinsicLoad::High);
+        target.statement =
+            "This is a dense procedural node that should not be treated as a fragment.".into();
+        let target_id = svc
+            .add_knowledge_node("dense".into(), target, vec![])
+            .unwrap();
+        let prereq = svc
+            .add_knowledge_node("p0".into(), mk_kn("p0", KnowledgeType::Conceptual), vec![])
+            .unwrap();
+        svc.add_edge::<graph::RequiresSpec>(prereq, target_id, requires_attrs(), 1.0)
+            .unwrap();
+
+        let err = svc
+            .set_strict_quality(true)
+            .expect_err("high intrinsic load should require supports");
+        let violations = match err {
+            graph::GraphError::InvariantViolation { violations } => violations,
+            other => panic!("unexpected error {other:?}"),
+        };
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v.code, graph::InvariantCode::IntrinsicLoadSupport)),
+            "expected IntrinsicLoadSupport violation"
+        );
+    }
+
+    #[test]
+    fn fragmented_nodes_detected() {
+        let mut svc = GraphService::new();
+        let mut target = mk_kn("frag", KnowledgeType::Conceptual);
+        target.statement = "too small".into();
+        svc.add_knowledge_node("frag".into(), target, vec![])
+            .unwrap();
+
+        let err = svc
+            .set_strict_quality(true)
+            .expect_err("fragmented node should fail strict validation");
+        let violations = match err {
+            graph::GraphError::InvariantViolation { violations } => violations,
+            other => panic!("unexpected error {other:?}"),
+        };
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v.code, graph::InvariantCode::GrainFragment)),
+            "expected GrainFragment violation"
+        );
+    }
+}

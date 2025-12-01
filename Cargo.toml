@@ -50,6 +50,7 @@ foyer = { version = "0.20.1", features = ["tracing", "serde", "nightly"] }
 url = "2.5"
 state = "0.6.0"
 dashmap = "6.1.0"
+strsim = "0.11.1"
 
 [dev-dependencies]
 proptest = "1.5"
