@@ -34,7 +34,70 @@ mod read_file_full;
 mod read_file_range;
 mod search_text;
 
+pub use delegate_tasks::DelegateTasksArgs;
 pub use graph_tools::analysis_cache;
+
+// Base tool identifiers; kept in a const slice so we can run compile-time
+// uniqueness checks.
+const BASE_TOOL_IDS: &[&str] = &[
+    "list_directory",
+    "read_file_full",
+    "read_file_range",
+    "search_text",
+    "delegate_tasks",
+];
+
+pub const fn assert_unique_tool_ids(ids: &[&str]) {
+    let mut i = 0;
+    while i < ids.len() {
+        let mut j = i + 1;
+        while j < ids.len() {
+            if str_eq(ids[i], ids[j]) {
+                panic!("duplicate tool id detected at compile time");
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+}
+
+pub const fn assert_tool_sets_disjoint(a: &[&str], b: &[&str]) {
+    let mut i = 0;
+    while i < a.len() {
+        let mut j = 0;
+        while j < b.len() {
+            if str_eq(a[i], b[j]) {
+                panic!("tool identifiers overlap between sets");
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+}
+
+const fn str_eq(a: &str, b: &str) -> bool {
+    let left = a.as_bytes();
+    let right = b.as_bytes();
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut idx = 0;
+    while idx < left.len() {
+        if left[idx] != right[idx] {
+            return false;
+        }
+        idx += 1;
+    }
+    true
+}
+
+const _: () = {
+    assert_unique_tool_ids(BASE_TOOL_IDS);
+    assert_unique_tool_ids(graph_tools::CURATED_TOOL_IDS);
+    assert_unique_tool_ids(graph_tools::algorithms::ALGORITHM_TOOL_IDS);
+    assert_tool_sets_disjoint(BASE_TOOL_IDS, graph_tools::CURATED_TOOL_IDS);
+    assert_tool_sets_disjoint(BASE_TOOL_IDS, graph_tools::algorithms::ALGORITHM_TOOL_IDS);
+};
 
 const MASKED_PATH: &str = "<path-unavailable>";
 
@@ -105,6 +168,19 @@ pub struct ToolPrototype {
     pub description: &'static str,
     pub schema:      Value,
     pub parse:       ToolParser,
+}
+
+#[derive(Debug, Error, Clone)]
+pub enum ToolRegistryError {
+    #[error(
+        "duplicate tool identifier `{id}` detected (existing description: `{existing}`, new \
+         description: `{new}`)"
+    )]
+    DuplicateId {
+        id:       &'static str,
+        existing: &'static str,
+        new:      &'static str,
+    },
 }
 
 /// Mode selected for a tool payload.
@@ -220,7 +296,7 @@ pub fn apply_preview_cost(
     }
 }
 
-static TOOL_PROTOTYPES: Lazy<Vec<ToolPrototype>> = Lazy::new(|| {
+fn build_tool_prototypes() -> Result<Vec<ToolPrototype>, ToolRegistryError> {
     let mut metas = vec![
         list_directory_meta(),
         read_file_full_meta(),
@@ -234,19 +310,44 @@ static TOOL_PROTOTYPES: Lazy<Vec<ToolPrototype>> = Lazy::new(|| {
     let mut seen = HashMap::new();
     for meta in &metas {
         if let Some(existing) = seen.insert(meta.id, meta.description) {
-            panic!(
-                "duplicate tool identifier `{}` detected (existing description: `{}`, new \
-                 description: `{}`)",
-                meta.id, existing, meta.description,
-            );
+            return Err(ToolRegistryError::DuplicateId {
+                id: meta.id,
+                existing,
+                new: meta.description,
+            });
         }
     }
 
-    metas
-});
+    Ok(metas)
+}
 
-static TOOL_PROTOTYPE_INDEX: Lazy<HashMap<&'static str, &'static ToolPrototype>> =
-    Lazy::new(|| TOOL_PROTOTYPES.iter().map(|meta| (meta.id, meta)).collect());
+fn build_tool_index() -> Result<HashMap<&'static str, &'static ToolPrototype>, ToolRegistryError> {
+    let protos = TOOL_PROTOTYPES.as_ref().map_err(Clone::clone)?;
+    let mut map = HashMap::new();
+    for meta in protos {
+        map.insert(meta.id, meta);
+    }
+    Ok(map)
+}
+
+static TOOL_PROTOTYPES: Lazy<Result<Vec<ToolPrototype>, ToolRegistryError>> =
+    Lazy::new(build_tool_prototypes);
+
+static TOOL_PROTOTYPE_INDEX: Lazy<
+    Result<HashMap<&'static str, &'static ToolPrototype>, ToolRegistryError>,
+> = Lazy::new(build_tool_index);
+
+fn prototypes() -> Result<&'static [ToolPrototype], ToolRegistryError> {
+    TOOL_PROTOTYPES
+        .as_ref()
+        .map(|vec| vec.as_slice())
+        .map_err(Clone::clone)
+}
+
+fn prototype_index()
+-> Result<&'static HashMap<&'static str, &'static ToolPrototype>, ToolRegistryError> {
+    TOOL_PROTOTYPE_INDEX.as_ref().map_err(Clone::clone)
+}
 
 #[derive(Clone)]
 pub struct CallState {
@@ -267,21 +368,21 @@ pub const fn default_false() -> bool {
     false
 }
 
-pub fn all_tools() -> &'static [ToolPrototype] {
-    &TOOL_PROTOTYPES
+pub fn all_tools() -> Result<&'static [ToolPrototype], ToolRegistryError> {
+    prototypes()
 }
 
-pub fn lookup_tool(id: &str) -> Option<&'static ToolPrototype> {
-    TOOL_PROTOTYPE_INDEX.get(id).copied()
+pub fn lookup_tool(id: &str) -> Result<Option<&'static ToolPrototype>, ToolRegistryError> {
+    Ok(prototype_index()?.get(id).copied())
 }
 
 pub fn tool_specs(ids: &[&str]) -> Result<Vec<ChatCompletionTool>> {
     let metas: Vec<&ToolPrototype> = if ids.is_empty() {
-        TOOL_PROTOTYPES.iter().collect()
+        all_tools()?.iter().collect()
     } else {
         let mut selected = Vec::with_capacity(ids.len());
         for id in ids {
-            match lookup_tool(id) {
+            match lookup_tool(id)? {
                 Some(meta) => selected.push(meta),
                 None => warn!(tool = *id, "tool identifier not registered; skipping"),
             }
@@ -476,6 +577,21 @@ fn ensure_range(
             lower: start,
             upper_field: end_field,
             upper: end,
+        });
+    }
+    Ok(())
+}
+
+fn ensure_max_len(
+    value: &str,
+    max: usize,
+    tool: &'static str,
+    field: &'static str,
+) -> ToolInputResult<()> {
+    if value.len() > max {
+        return Err(ToolInputError::InvalidPayload {
+            tool,
+            message: format!("{field} exceeds max length {max}"),
         });
     }
     Ok(())

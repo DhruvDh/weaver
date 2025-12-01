@@ -634,7 +634,29 @@ impl LLMGateway {
                 }
             };
 
-            if llm::lookup_tool(tool_name.as_str()).is_none() {
+            let registry_entry = match llm::lookup_tool(tool_name.as_str()) {
+                Ok(entry) => entry,
+                Err(err) => {
+                    warn!(
+                        iteration,
+                        tool = tool_name.as_str(),
+                        error = %err,
+                        "tool registry unavailable"
+                    );
+                    Self::send_tool_error(
+                        messages,
+                        state,
+                        &call_id,
+                        &tool_name,
+                        "registry_error",
+                        parsed_args.clone(),
+                        format!("tool registry error: {err}"),
+                    )?;
+                    continue;
+                }
+            };
+
+            if registry_entry.is_none() {
                 warn!(iteration, tool = tool_name.as_str(), "tool identifier not registered");
                 Self::send_tool_error(
                     messages,

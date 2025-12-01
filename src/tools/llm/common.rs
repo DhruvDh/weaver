@@ -33,7 +33,6 @@ pub struct ToolRunPayload {
     pub page:          Option<Page>,
 }
 
-#[allow(dead_code)]
 impl ToolRunPayload {
     pub fn new(body: Value) -> Self {
         Self {
@@ -43,21 +42,6 @@ impl ToolRunPayload {
             preview_hints: Vec::new(),
             page: None,
         }
-    }
-
-    pub fn with_preview(mut self, preview: Value) -> Self {
-        self.preview = Some(preview);
-        self
-    }
-
-    pub fn with_hints(mut self, hints: impl Into<Vec<String>>) -> Self {
-        self.preview_hints = hints.into();
-        self
-    }
-
-    pub fn with_page(mut self, page: Page) -> Self {
-        self.page = Some(page);
-        self
     }
 }
 
@@ -233,29 +217,13 @@ fn ensure_cost_block(
     }
 }
 
-/// Map graph errors into tool-facing errors.
-#[allow(dead_code)]
-pub fn map_graph_err(err: crate::graph::GraphError, tool: &'static str) -> ToolExecutionError {
-    super::graph_tools::common::map_graph_err(err, tool)
-}
-
-#[allow(dead_code)]
-pub fn map_send_err<M>(
-    err: SendError<M, crate::graph::GraphError>,
-    tool: &'static str,
-) -> ToolExecutionError {
-    super::graph_tools::common::map_send_err(err, tool)
-}
-
 /// Typed slug helper that encodes expected knowledge type at compile time.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct Slug<T> {
     raw:      String,
     _phantom: PhantomData<T>,
 }
 
-#[allow(dead_code)]
 impl<T> Slug<T> {
     pub fn new<S: Into<String>>(raw: S) -> Self {
         Self {
@@ -282,7 +250,6 @@ impl<T> Clone for Slug<T> {
     }
 }
 
-#[allow(dead_code)]
 pub trait SlugKind {
     fn validate(
         graph: &crate::graph::CurriculumGraph,
@@ -292,15 +259,9 @@ pub trait SlugKind {
     ) -> Result<(), ToolExecutionError>;
 }
 
-#[allow(dead_code)]
 pub struct LearningOutcome;
-#[allow(dead_code)]
 pub struct AssessmentItem;
-#[allow(dead_code)]
-pub struct Instructional;
-#[allow(dead_code)]
 pub struct AnyKnowledge;
-#[allow(dead_code)]
 pub struct TeachingStep;
 
 impl SlugKind for LearningOutcome {
@@ -337,17 +298,6 @@ impl SlugKind for AssessmentItem {
     }
 }
 
-impl SlugKind for Instructional {
-    fn validate(
-        graph: &crate::graph::CurriculumGraph,
-        id: crate::graph::NodeId,
-        slug: &str,
-        tool: &'static str,
-    ) -> Result<(), ToolExecutionError> {
-        super::graph_tools::common::ensure_instructional_knowledge(graph, id, slug, tool)
-    }
-}
-
 impl SlugKind for AnyKnowledge {
     fn validate(
         graph: &crate::graph::CurriculumGraph,
@@ -370,7 +320,6 @@ impl SlugKind for TeachingStep {
     }
 }
 
-#[allow(dead_code)]
 pub async fn resolve_typed<K: SlugKind>(
     graph: &ActorRef<GraphManager>,
     slug: Slug<K>,
@@ -524,7 +473,6 @@ where
 }
 
 /// Parse raw JSON args into a strongly typed args struct.
-#[allow(dead_code)]
 pub fn parse_args<T>(tool: &'static str, raw: Value) -> ToolInputResult<T>
 where
     T: DeserializeOwned,
@@ -620,6 +568,9 @@ macro_rules! tool_ids {
         $vis const $name: &[&str] = &[
             $($const_name,)+
         ];
+        const _: () = {
+            $crate::tools::llm::assert_unique_tool_ids($name);
+        };
     };
 }
 

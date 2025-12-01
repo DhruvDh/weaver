@@ -144,8 +144,8 @@ impl FileReader {
         self.root.as_ref()
     }
 
-    pub fn tool_identifiers() -> Vec<&'static str> {
-        llm::all_tools().iter().map(|meta| meta.id).collect()
+    pub fn tool_identifiers() -> Result<Vec<&'static str>> {
+        Ok(llm::all_tools()?.iter().map(|meta| meta.id).collect())
     }
 }
 
@@ -244,7 +244,6 @@ impl Message<FileReaderQuery> for FileReader {
         let gateway = self.gateway.clone();
         let system_prompt = self.system_prompt();
         let model = self.model.clone();
-        let tool_ids = Self::tool_identifiers();
         let actor_name = (*self.actor_name).clone();
         let conversation_id = (*self.conversation_id).clone();
         let rerun = self.rerun.clone();
@@ -265,7 +264,7 @@ impl Message<FileReaderQuery> for FileReader {
                 messages: vec![system_msg, user_msg],
                 temperature: DEFAULT_TEMPERATURE,
                 top_p: DEFAULT_TOP_P,
-                tool_ids,
+                tool_ids: Self::tool_identifiers()?,
                 max_iterations: MAX_TOOL_ITERATIONS,
                 tool_host,
                 actor_name,
@@ -290,7 +289,9 @@ impl Message<ExecuteTool> for FileReader {
         }: ExecuteTool,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let meta = match llm::lookup_tool(&identifier) {
+        let meta = match llm::lookup_tool(&identifier)
+            .map_err(|err| ToolExecutionError::system(err.into()))?
+        {
             Some(meta) => meta,
             None => return Err(llm::unsupported_tool(&identifier).into()),
         };

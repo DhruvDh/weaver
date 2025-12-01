@@ -7,6 +7,7 @@ use std::any;
 use std::fmt::Debug;
 #[cfg(feature = "tracing")]
 use tracing::{debug, trace, warn};
+use tokio::fs;
 use url::Url;
 
 // todo Make deriving macro for this trait
@@ -140,11 +141,11 @@ pub trait PersistentActor: Actor {
                         .to_file_path()
                         .map_err(|_| anyhow!("Failed to convert Url to file path"))?;
 
-                    if !path.exists() {
+                    if !fs::try_exists(&path).await? {
                         anyhow::bail!("persistence key does not exist: {path:?}");
                     }
 
-                    Ok(std::fs::read(&path.join("index.bin"))?)
+                    Ok(fs::read(&path.join("index.bin")).await?)
                 }
                 // todo Support http(s), Ws(s), S3, etc.
                 _ => Err(anyhow!(
@@ -175,13 +176,13 @@ pub trait PersistentActor: Actor {
                         .to_file_path()
                         .map_err(|_| anyhow!("Failed to convert Url to file path"))?;
 
-                    if !path.exists() {
-                        std::fs::create_dir_all(&path)?;
-                    } else if !path.is_dir() {
+                    if !fs::try_exists(&path).await? {
+                        fs::create_dir_all(&path).await?;
+                    } else if !fs::metadata(&path).await?.is_dir() {
                         anyhow::bail!("persistence key exists but is not a directory: {:?}", path);
                     }
 
-                    std::fs::write(&path.join("index.bin"), data)?;
+                    fs::write(&path.join("index.bin"), data).await?;
 
                     Ok(())
                 }

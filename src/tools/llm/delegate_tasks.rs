@@ -13,7 +13,10 @@ use super::{
     common::{ToolRunPayload, ToolRunner},
     depth_exceeded, payload_size_bytes, trim_optional,
 };
-use crate::{constants::MAX_PARALLEL_DELEGATIONS, file_reader::run_delegate_batch_with_state};
+use crate::{
+    constants::{MAX_DELEGATED_TASK_LEN, MAX_DELEGATED_TASKS, MAX_PARALLEL_DELEGATIONS},
+    file_reader::run_delegate_batch_with_state,
+};
 
 const IDENTIFIER: &str = "delegate_tasks";
 const DESCRIPTION: &str = "Delegate one or more tasks to child FileReader agents via the `tasks` \
@@ -23,7 +26,7 @@ const DESCRIPTION: &str = "Delegate one or more tasks to child FileReader agents
 #[serde(deny_unknown_fields)]
 pub struct DelegateTasksArgs {
     #[schemars(
-        length(min = 1),
+        length(min = 1, max = MAX_DELEGATED_TASKS),
         description = "Precise, educational description with motivation and acceptance criteria \
                        of tasks to delegate in parallel."
     )]
@@ -37,7 +40,18 @@ pub struct DelegateTasksArgs {
                 tool: IDENTIFIER,
                 item: "task",
             })
+        } else if tasks.len() > MAX_DELEGATED_TASKS {
+            Err(ToolInputError::InvalidPayload {
+                tool:    IDENTIFIER,
+                message: format!(
+                    "tasks exceeds max count {MAX_DELEGATED_TASKS} (received {})",
+                    tasks.len()
+                ),
+            })
         } else {
+            for task in &tasks {
+                super::ensure_max_len(task, MAX_DELEGATED_TASK_LEN, IDENTIFIER, "task")?;
+            }
             Ok(tasks)
         }
     })]

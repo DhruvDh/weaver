@@ -36,3 +36,27 @@ pub const RETRY_MAX_EXP: u32 = 6;
 
 /// Hard cap for exponential backoff waits (milliseconds).
 pub const RETRY_MAX_BACKOFF_MS: u64 = 60_000;
+
+/// Maximum number of cached analysis entries retained at once.
+pub const ANALYSIS_CACHE_MAX_ENTRIES: usize = 256;
+
+/// Retention window for cached analyses (seconds).
+pub const ANALYSIS_CACHE_TTL_SECS: u64 = 1_800;
+
+/// Maximum historical versions kept per analysis kind.
+pub const ANALYSIS_CACHE_VERSIONS_PER_KIND: usize = 2;
+
+/// Default validation timeout applied to invariant checks (milliseconds).
+pub const GRAPH_VALIDATION_TIMEOUT_MS: u64 = 2_000;
+
+/// Maximum user-supplied path length accepted by LLM tools.
+pub const MAX_TOOL_PATH_LEN: usize = 4_096;
+
+/// Maximum number of delegated tasks accepted per call.
+pub const MAX_DELEGATED_TASKS: usize = 24;
+
+/// Maximum length of a delegated task description.
+pub const MAX_DELEGATED_TASK_LEN: usize = 512;
+
+/// Maximum regex pattern length accepted by search tools.
+pub const MAX_SEARCH_PATTERN_LEN: usize = 256;

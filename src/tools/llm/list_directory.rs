@@ -12,7 +12,7 @@ use super::{
     common::{ToolRunPayload, ToolRunner},
     render_relative_path, resolve_workspace_path, trim_optional,
 };
-use crate::tools::filesystem;
+use crate::{constants::MAX_TOOL_PATH_LEN, tools::filesystem};
 
 const IDENTIFIER: &str = "list_directory";
 const DESCRIPTION: &str = "List the entries of a directory relative to the workspace root.";
@@ -21,9 +21,14 @@ const DESCRIPTION: &str = "List the entries of a directory relative to the works
 #[serde(deny_unknown_fields)]
 pub struct ListDirectoryArgs {
     #[serde(default)]
-    #[schemars(description = "Directory path relative to workspace root. Defaults to \".\".")]
+    #[schemars(
+        length(min = 1, max = MAX_TOOL_PATH_LEN),
+        description = "Directory path relative to workspace root. Defaults to \".\"."
+    )]
     #[builder(with = |value: String| -> ToolInputResult<_> {
-        super::require_string(value, IDENTIFIER, "path")
+        let path = super::require_string(value, IDENTIFIER, "path")?;
+        super::ensure_max_len(&path, MAX_TOOL_PATH_LEN, IDENTIFIER, "path")?;
+        Ok(path)
     })]
     pub path: Option<String>,
 }

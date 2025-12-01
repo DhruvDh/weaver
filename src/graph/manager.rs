@@ -29,7 +29,7 @@ pub struct GraphManagerState {
 }
 
 const fn default_validation_timeout_ms() -> u64 {
-    2_000
+    crate::constants::GRAPH_VALIDATION_TIMEOUT_MS
 }
 
 impl GraphManagerState {
@@ -133,7 +133,7 @@ impl GraphManager {
 impl From<&GraphManager> for GraphManagerState {
     fn from(manager: &GraphManager) -> Self {
         GraphManagerState {
-            graph:                 manager.service.snapshot_graph(),
+            graph:                 manager.service.snapshot_graph_owned(),
             course_commit:         manager.course_commit.clone(),
             strict_quality:        manager.service.strict_quality(),
             graph_version:         manager.service.graph_version(),

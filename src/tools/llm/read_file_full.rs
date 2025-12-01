@@ -12,7 +12,7 @@ use super::{
     common::{ToolRunPayload, ToolRunner},
     render_relative_path, resolve_workspace_path,
 };
-use crate::tools::filesystem;
+use crate::{constants::MAX_TOOL_PATH_LEN, tools::filesystem};
 
 const IDENTIFIER: &str = "read_file_full";
 const DESCRIPTION: &str = "Read the full contents of a UTF-8 text file.";
@@ -20,9 +20,14 @@ const DESCRIPTION: &str = "Read the full contents of a UTF-8 text file.";
 #[derive(Debug, Clone, Builder, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReadFileFullArgs {
-    #[schemars(length(min = 1), description = "File path relative to workspace root.")]
+    #[schemars(
+        length(min = 1, max = MAX_TOOL_PATH_LEN),
+        description = "File path relative to workspace root."
+    )]
     #[builder(with = |value: String| -> ToolInputResult<_> {
-        super::require_string(value, IDENTIFIER, "path")
+        let path = super::require_string(value, IDENTIFIER, "path")?;
+        super::ensure_max_len(&path, MAX_TOOL_PATH_LEN, IDENTIFIER, "path")?;
+        Ok(path)
     })]
     pub path:       String,
     #[serde(default)]

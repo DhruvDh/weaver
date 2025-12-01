@@ -4,6 +4,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
     thread,
+    time::Duration,
 };
 
 use futures::future::join_all;
@@ -114,4 +115,58 @@ fn analysis_cache_bounds_versions_per_kind() {
         "expected at most two cached versions per kind, got {versions:?}"
     );
     assert_eq!(versions, vec![8, 9]);
+}
+
+#[test]
+fn analysis_cache_honors_ttl() {
+    let cache = AnalysisCache::with_limits(usize::MAX, Duration::from_millis(5));
+    let kind = AnalysisKind::GapBundle;
+    let first = AnalysisCacheKey {
+        graph_version: 1,
+        kind:          kind.clone(),
+    };
+    cache.get_or_insert_with(first, || json!({ "version": 1 }));
+
+    thread::sleep(Duration::from_millis(10));
+
+    let second = AnalysisCacheKey {
+        graph_version: 2,
+        kind:          kind.clone(),
+    };
+    cache.get_or_insert_with(second, || json!({ "version": 2 }));
+
+    let versions = cache.versions_for_kind(&kind);
+    assert_eq!(versions, vec![2], "expected stale entries to be dropped after TTL expiry");
+}
+
+#[test]
+fn analysis_cache_enforces_capacity() {
+    let cache = AnalysisCache::with_limits(3, Duration::from_secs(60));
+    let keys = vec![
+        AnalysisCacheKey {
+            graph_version: 1,
+            kind:          AnalysisKind::GapBundle,
+        },
+        AnalysisCacheKey {
+            graph_version: 1,
+            kind:          AnalysisKind::Keystone,
+        },
+        AnalysisCacheKey {
+            graph_version: 1,
+            kind:          AnalysisKind::DagCheck,
+        },
+        AnalysisCacheKey {
+            graph_version: 1,
+            kind:          AnalysisKind::AssessmentGaps,
+        },
+    ];
+
+    for (idx, key) in keys.into_iter().enumerate() {
+        cache.get_or_insert_with(key, || json!({ "slot": idx }));
+    }
+
+    assert!(
+        cache.len() <= 3,
+        "capacity enforcement should evict least-recently-used entries"
+    );
 }

@@ -117,27 +117,6 @@ pub(crate) fn ensure_any_knowledge(
     }
 }
 
-/// Ensure a slug resolves to instructional knowledge (non-LO/non-assessment).
-#[allow(dead_code)]
-pub(crate) fn ensure_instructional_knowledge(
-    graph: &CurriculumGraph,
-    id: NodeId,
-    slug: &str,
-    tool: &'static str,
-) -> Result<(), ToolExecutionError> {
-    match &graph[id].kind {
-        NodeKind::Knowledge(k) if k.knowledge_type.is_instructional_knowledge() => Ok(()),
-        _ => Err(ToolExecutionError::Input(ToolInputError::InvalidPayload {
-            tool,
-            message: format!(
-                "slug `{}` must be instructional knowledge \
-                 (factual/conceptual/procedural/metacognitive)",
-                slug
-            ),
-        })),
-    }
-}
-
 /// Ensure a slug resolves to a TeachingStep node.
 pub(crate) fn ensure_teaching_step(
     graph: &CurriculumGraph,

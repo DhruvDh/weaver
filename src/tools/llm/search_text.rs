@@ -12,7 +12,10 @@ use super::{
     common::{ToolRunPayload, ToolRunner},
     render_relative_path, resolve_workspace_path, trim_optional,
 };
-use crate::tools::search::{self, SearchOptions};
+use crate::{
+    constants::{MAX_SEARCH_PATTERN_LEN, MAX_TOOL_PATH_LEN},
+    tools::search::{self, SearchOptions},
+};
 
 const IDENTIFIER: &str = "search_text";
 const DESCRIPTION: &str = "Run a regex search (ripgrep-style) within the workspace.";
@@ -24,15 +27,25 @@ const BODY_BYTE_CAP: u64 = 1_000_000;
 #[derive(Debug, Clone, Builder, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SearchTextArgs {
-    #[schemars(length(min = 1), description = "Rust-style regular expression.")]
+    #[schemars(
+        length(min = 1, max = MAX_SEARCH_PATTERN_LEN),
+        description = "Rust-style regular expression."
+    )]
     #[builder(with = |value: String| -> ToolInputResult<_> {
-        super::require_string(value, IDENTIFIER, "pattern")
+        let pattern = super::require_string(value, IDENTIFIER, "pattern")?;
+        super::ensure_max_len(&pattern, MAX_SEARCH_PATTERN_LEN, IDENTIFIER, "pattern")?;
+        Ok(pattern)
     })]
     pub pattern:    String,
     #[serde(default)]
-    #[schemars(description = "Optional directory to scope the search. Defaults to root.")]
+    #[schemars(
+        length(min = 1, max = MAX_TOOL_PATH_LEN),
+        description = "Optional directory to scope the search. Defaults to root."
+    )]
     #[builder(with = |value: String| -> ToolInputResult<_> {
-        super::require_string(value, IDENTIFIER, "path")
+        let path = super::require_string(value, IDENTIFIER, "path")?;
+        super::ensure_max_len(&path, MAX_TOOL_PATH_LEN, IDENTIFIER, "path")?;
+        Ok(path)
     })]
     pub path:       Option<String>,
     #[serde(default)]
@@ -75,6 +88,10 @@ crate::basic_tool!(
                 tool:    IDENTIFIER,
                 message: err.to_string(),
             })?;
+
+        for entry in &payload.allow {
+            super::ensure_max_len(entry, MAX_TOOL_PATH_LEN, IDENTIFIER, "allow")?;
+        }
 
         let args = match trim_optional(payload.path) {
             Some(path) => SearchTextArgs::builder()

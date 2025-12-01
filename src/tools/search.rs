@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use grep_regex::RegexMatcher;
 use grep_searcher::{BinaryDetection, SearcherBuilder, sinks::Lossy};
 use ignore::WalkBuilder;
+use tracing::{debug, trace};
 
 /// Directories skipped by default during recursive search to cut noise and
 /// expensive traversals. Keep this list small and overridable via
@@ -122,8 +123,24 @@ pub async fn search_recursive(
             });
             match searcher.search_path(&matcher, &path, &mut sink) {
                 Ok(()) => {}
-                Err(err) if err.kind() == ErrorKind::InvalidData => continue,
-                Err(_) => continue,
+                Err(err) if err.kind() == ErrorKind::InvalidData => {
+                    trace!(
+                        target: "weaver.search",
+                        path = %path.display(),
+                        error = %err,
+                        "skipping file with invalid data during search"
+                    );
+                    continue;
+                }
+                Err(err) => {
+                    debug!(
+                        target: "weaver.search",
+                        path = %path.display(),
+                        error = %err,
+                        "search failed for path; continuing"
+                    );
+                    continue;
+                }
             }
             if truncated && stop_early {
                 break;

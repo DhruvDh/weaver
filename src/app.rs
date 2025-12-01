@@ -833,7 +833,10 @@ pub async fn run_app(cli: Cli, runtime: RuntimeOptions) -> Result<()> {
             }
         };
 
-        let tool_names = FileReader::tool_identifiers();
+        let tool_names = FileReader::tool_identifiers().map_err(|err| {
+            error!(error = %err, "Failed to build LLM tool registry");
+            err
+        })?;
 
         debug!(
             workspace = %actor.workspace_root().display(),

@@ -1,10 +1,18 @@
-use std::sync::{Arc, OnceLock};
+use std::{
+    sync::{
+        Arc, LazyLock, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use dashmap::DashMap;
 use serde_json::Value;
 use tokio::sync::OnceCell;
 
-const VERSION_BUDGET_PER_KIND: usize = 2;
+use crate::constants::{
+    ANALYSIS_CACHE_MAX_ENTRIES, ANALYSIS_CACHE_TTL_SECS, ANALYSIS_CACHE_VERSIONS_PER_KIND,
+};
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum AnalysisKind {
@@ -46,44 +54,87 @@ pub struct AnalysisCacheValue {
     pub payload: Value,
 }
 
+fn now_millis() -> u64 {
+    static START: LazyLock<Instant> = LazyLock::new(Instant::now);
+    START.elapsed().as_millis() as u64
+}
+
 /// Simple in-process cache for graph analyses keyed by graph version and query
 /// kind. This keeps repeated tool invocations from re-running expensive
 /// analysis on an unchanged graph.
-#[derive(Default)]
 pub struct AnalysisCache {
-    inner: DashMap<AnalysisCacheKey, Arc<CacheEntry>>,
+    inner:       DashMap<AnalysisCacheKey, Arc<CacheEntry>>,
+    max_entries: usize,
+    ttl:         Duration,
 }
 
-#[derive(Default)]
+impl Default for AnalysisCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug)]
 struct CacheEntry {
-    sync_value:  OnceLock<Arc<AnalysisCacheValue>>,
-    async_value: OnceCell<Arc<AnalysisCacheValue>>,
+    sync_value:   OnceLock<Arc<AnalysisCacheValue>>,
+    async_value:  OnceCell<Arc<AnalysisCacheValue>>,
+    last_used_ms: AtomicU64,
+}
+
+impl CacheEntry {
+    fn new() -> Self {
+        Self {
+            sync_value:   OnceLock::new(),
+            async_value:  OnceCell::new(),
+            last_used_ms: AtomicU64::new(now_millis()),
+        }
+    }
+
+    fn touch(&self) {
+        self.last_used_ms.store(now_millis(), Ordering::Relaxed);
+    }
+
+    fn last_used_ms(&self) -> u64 {
+        self.last_used_ms.load(Ordering::Relaxed)
+    }
 }
 
 impl AnalysisCache {
     pub fn new() -> Self {
         Self {
+            inner:       DashMap::new(),
+            max_entries: ANALYSIS_CACHE_MAX_ENTRIES,
+            ttl:         Duration::from_secs(ANALYSIS_CACHE_TTL_SECS),
+        }
+    }
+
+    pub fn with_limits(max_entries: usize, ttl: Duration) -> Self {
+        Self {
             inner: DashMap::new(),
+            max_entries,
+            ttl,
         }
     }
 
     pub fn len(&self) -> usize {
+        self.prune_expired();
         self.inner.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
+        self.len() == 0
     }
 
     fn entry(&self, key: &AnalysisCacheKey) -> Arc<CacheEntry> {
         self.inner
             .entry(key.clone())
-            .or_insert_with(|| Arc::new(CacheEntry::default()))
+            .or_insert_with(|| Arc::new(CacheEntry::new()))
             .clone()
     }
 
     fn try_get(&self, key: &AnalysisCacheKey) -> Option<Arc<AnalysisCacheValue>> {
         self.inner.get(key).and_then(|entry| {
+            entry.value().touch();
             entry
                 .sync_value
                 .get()
@@ -100,6 +151,7 @@ impl AnalysisCache {
     where
         F: FnOnce() -> Value,
     {
+        self.prune_expired();
         if let Some(existing) = self.try_get(&key) {
             return existing;
         }
@@ -137,6 +189,7 @@ impl AnalysisCache {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Value> + Send + 'static,
     {
+        self.prune_expired();
         if let Some(existing) = self.try_get(&key) {
             return existing;
         }
@@ -145,6 +198,7 @@ impl AnalysisCache {
 
         // Fast-path in case a synchronous caller already populated the cache.
         if let Some(existing) = entry.sync_value.get() {
+            entry.touch();
             return Arc::clone(existing);
         }
 
@@ -175,6 +229,7 @@ impl AnalysisCache {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<serde_json::Value, E>> + Send + 'static,
     {
+        self.prune_expired();
         if let Some(existing) = self.try_get(&key) {
             return Ok(existing);
         }
@@ -182,6 +237,7 @@ impl AnalysisCache {
         let entry = self.entry(&key);
 
         if let Some(existing) = entry.sync_value.get() {
+            entry.touch();
             return Ok(Arc::clone(existing));
         }
 
@@ -197,28 +253,30 @@ impl AnalysisCache {
     }
 
     pub fn prune_for_version(&self, current_version: u64) -> usize {
-        let mut evicted = 0usize;
-        let window = VERSION_BUDGET_PER_KIND.saturating_sub(1) as u64;
+        let evicted = self.prune_expired();
+        let window = ANALYSIS_CACHE_VERSIONS_PER_KIND.saturating_sub(1) as u64;
+        let mut version_evicted = 0usize;
         self.inner.retain(|key, _| {
             let keep = key.graph_version + window >= current_version;
             if !keep {
-                evicted += 1;
+                version_evicted += 1;
             }
             keep
         });
-        if evicted > 0 {
+        if version_evicted > 0 {
             tracing::debug!(
                 target: "weaver.analysis_cache",
                 current_version,
-                evicted,
+                evicted = version_evicted,
                 size_after = self.inner.len(),
                 "pruned analysis cache versions outside retention window"
             );
         }
-        evicted
+        evicted + version_evicted
     }
 
     pub fn versions_for_kind(&self, kind: &AnalysisKind) -> Vec<u64> {
+        self.prune_expired();
         let mut out: Vec<u64> = self
             .inner
             .iter()
@@ -244,6 +302,51 @@ impl AnalysisCache {
         let _ = entry.sync_value.set(Arc::clone(cached));
         let _ = entry.async_value.set(Arc::clone(cached));
 
+        entry.touch();
+
+        let version_evicted = self.enforce_version_budget(key);
+        let capacity_evicted = self.enforce_capacity();
+
+        if version_evicted + capacity_evicted > 0 {
+            tracing::debug!(
+                target: "weaver.analysis_cache",
+                kind = ?key.kind,
+                version_evicted,
+                capacity_evicted,
+                size_after = self.inner.len(),
+                "evicted analysis cache entries after insert"
+            );
+        }
+    }
+
+    fn prune_expired(&self) -> usize {
+        let ttl_ms = self.ttl.as_millis() as u64;
+        if ttl_ms == 0 {
+            return 0;
+        }
+        let now = now_millis();
+        let mut evicted = 0usize;
+        self.inner.retain(|_, entry| {
+            let idle_ms = now.saturating_sub(entry.last_used_ms());
+            let keep = idle_ms <= ttl_ms;
+            if !keep {
+                evicted += 1;
+            }
+            keep
+        });
+        if evicted > 0 {
+            tracing::debug!(
+                target: "weaver.analysis_cache",
+                ttl_ms,
+                evicted,
+                size_after = self.inner.len(),
+                "evicted expired analysis cache entries"
+            );
+        }
+        evicted
+    }
+
+    fn enforce_version_budget(&self, key: &AnalysisCacheKey) -> usize {
         let mut versions: Vec<u64> = self
             .inner
             .iter()
@@ -256,13 +359,13 @@ impl AnalysisCache {
             })
             .collect();
 
-        if versions.len() <= VERSION_BUDGET_PER_KIND {
-            return;
+        if versions.len() <= ANALYSIS_CACHE_VERSIONS_PER_KIND {
+            return 0;
         }
 
         versions.sort_unstable_by(|a, b| b.cmp(a)); // newest first
         let mut evicted = 0usize;
-        for old in versions.into_iter().skip(VERSION_BUDGET_PER_KIND) {
+        for old in versions.into_iter().skip(ANALYSIS_CACHE_VERSIONS_PER_KIND) {
             let drop_key = AnalysisCacheKey {
                 graph_version: old,
                 kind:          key.kind.clone(),
@@ -281,6 +384,42 @@ impl AnalysisCache {
                 "evicted stale analysis cache versions for kind"
             );
         }
+
+        evicted
+    }
+
+    fn enforce_capacity(&self) -> usize {
+        let len = self.inner.len();
+        if len <= self.max_entries {
+            return 0;
+        }
+
+        let mut entries: Vec<(AnalysisCacheKey, u64)> = self
+            .inner
+            .iter()
+            .map(|item| (item.key().clone(), item.value().last_used_ms()))
+            .collect();
+        entries.sort_unstable_by_key(|(_, last_used)| *last_used);
+
+        let mut evicted = 0usize;
+        for (key, _) in entries
+            .into_iter()
+            .take(len.saturating_sub(self.max_entries))
+        {
+            if self.inner.remove(&key).is_some() {
+                evicted += 1;
+            }
+        }
+        if evicted > 0 {
+            tracing::debug!(
+                target: "weaver.analysis_cache",
+                evicted,
+                max_entries = self.max_entries,
+                size_after = self.inner.len(),
+                "evicted analysis cache entries to enforce capacity"
+            );
+        }
+        evicted
     }
 }
 

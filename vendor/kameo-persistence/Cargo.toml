@@ -66,6 +66,10 @@ features = ["derive"]
 version = "0.1.41"
 optional = true
 
+[dependencies.tokio]
+version = "1.48.0"
+features = ["fs"]
+
 [dependencies.url]
 version = "2.5.4"
 features = ["serde"]

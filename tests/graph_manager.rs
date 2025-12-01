@@ -62,8 +62,13 @@ async fn graph_manager_persists_and_restores_state() -> anyhow::Result<()> {
     svc.add_knowledge_node("k1".into(), mk_kn("k1", KnowledgeType::Conceptual), vec![])?;
     let base_version = svc.graph_version();
 
-    let state =
-        GraphManagerState::new(svc.snapshot_graph(), String::new(), false, base_version, 2_000);
+    let state = GraphManagerState::new(
+        svc.snapshot_graph_owned(),
+        String::new(),
+        false,
+        base_version,
+        2_000,
+    );
 
     let actor = GraphManager::spawn_persistent(state_url.clone(), state).await?;
 
@@ -127,8 +132,10 @@ async fn apply_runtime_config_honors_validation_timeout() -> anyhow::Result<()> 
     };
     svc.add_edge::<weaver::graph::RequiresSpec>(from, to, attrs, 1.0)?;
 
+    let _delay_guard = ValidationDelayGuard::set(50);
+
     let state = GraphManagerState::new(
-        svc.snapshot_graph(),
+        svc.snapshot_graph_owned(),
         String::new(),
         false,
         svc.graph_version(),

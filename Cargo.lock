@@ -4835,6 +4835,7 @@ dependencies = [
  "kameo-persistence-macros",
  "postcard",
  "serde",
+ "tokio",
  "url",
 ]
 

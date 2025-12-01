@@ -841,8 +841,13 @@ mod persistence_topology {
             .add_knowledge_node("k".into(), mk_kn("k", KnowledgeType::Conceptual), vec![])
             .unwrap();
         let version = svc.graph_version();
-        let state =
-            GraphManagerState::new(svc.snapshot_graph(), "deadbeef".into(), false, version, 2_000);
+        let state = GraphManagerState::new(
+            svc.snapshot_graph_owned(),
+            "deadbeef".into(),
+            false,
+            version,
+            2_000,
+        );
         let data = postcard::to_stdvec(&state).expect("serialize state");
         let decoded: GraphManagerState = postcard::from_bytes(&data).expect("deserialize state");
         let restored = GraphService::from_parts(
