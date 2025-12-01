@@ -15,10 +15,11 @@ use crate::schema::types::{
 /// Runtime configuration for graph persistence/metadata.
 #[derive(Clone, Debug)]
 pub struct GraphConfig {
-    pub course_commit:  String,
-    pub autosave_path:  PathBuf,
-    pub autosave_secs:  u64,
-    pub strict_quality: bool,
+    pub course_commit:         String,
+    pub autosave_path:         PathBuf,
+    pub autosave_secs:         u64,
+    pub strict_quality:        bool,
+    pub validation_timeout_ms: u64,
 }
 
 /// Primary graph type alias (stable indices survive deletions).
@@ -237,6 +238,10 @@ pub enum GraphError {
     RequiresCycle { cycle_slugs: Vec<String> },
     #[error("validator error: {0}")]
     Schema(String),
+    #[error("graph invariant validation timed out after {timeout_ms} ms")]
+    InvariantTimeout { timeout_ms: u64 },
+    #[error("graph invariant validation task failed: {message}")]
+    InvariantTaskFailed { message: String },
     #[error("graph invariant violation(s): {violations:?}")]
     InvariantViolation { violations: Vec<InvariantViolation> },
 }

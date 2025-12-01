@@ -9,6 +9,7 @@ This repo now distinguishes **views** (paged inspection) from **computations** (
 Pagination defaults: `limit=50`, max `200`; `offset` defaults to `0`.
 
 Cost/preview: summary tools accept `fetch_body` (default `false`). In preview mode they return a cost block; set `fetch_body=true` to receive the body.
+Command previews also return a cost block with byte/token hints so the gateway can price mutations before execution.
 
 ## Tool quick reference
 
@@ -50,6 +51,7 @@ All command outputs now follow `{type: "graph_command", tool: <id>, status: "ok"
 - Supports: all supports must carry a `case_tag`; supports into high `intrinsic_load` targets must include `coverage_tags`.
 - Purity & provenance: extraneous prerequisites and SourceRef revision mismatches are fatal regardless of strictness.
 - Teaching steps: when unanchored, provide `rationale` (new optional field on insert/update teaching-step commands).
+- Non-semantic algorithm tools (`graph_requires_pagerank`, cycles/bridges/articulation/shortest-path) are gated behind `WEAVER_DEBUG_GRAPH_ALGORITHMS=1` and stay out of the curated surface by default.
 
 ## Actor persistence
 - GraphManager snapshots live under `<graph_snapshot_path>.state/graph_manager` (derived from the

@@ -54,7 +54,7 @@ async fn corrupt_snapshot_fails_start_and_quarantines() -> anyhow::Result<()> {
         "invalid snapshot should fail validation"
     );
 
-    let state = GraphManagerState::new(graph.clone(), "deadbeef".into(), false, 7);
+    let state = GraphManagerState::new(graph.clone(), "deadbeef".into(), false, 7, 2_000);
     let snapshot_bytes = postcard::to_stdvec(&state)?;
     fs::write(state_dir.join("index.bin"), snapshot_bytes)?;
 

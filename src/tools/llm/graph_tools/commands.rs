@@ -838,6 +838,7 @@ fn parse_rename_node(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn T
     Ok(Box::new(GraphCommandTool::new(
         args,
         state.graph.clone(),
+        state.clone(),
         |args| RenameNode {
             old_slug: args.old_slug.clone(),
             new_slug: args.new_slug.clone(),
@@ -887,6 +888,7 @@ fn parse_remove_node(raw: Value, state: &CallState) -> ToolInputResult<Box<dyn T
     Ok(Box::new(GraphCommandTool::new(
         args,
         state.graph.clone(),
+        state.clone(),
         |args| crate::graph::manager::RemoveNode {
             slug: args.slug.clone(),
         },

@@ -246,15 +246,16 @@ impl Message<PruneTick> for PruneWorker {
 
 #[derive(Clone, Debug)]
 pub struct Cli {
-    pub rerun_mode:             RerunMode,
-    pub rerun_file:             PathBuf,
-    pub workspace:              PathBuf,
-    pub graph_snapshot_path:    PathBuf,
-    pub graph_autosave_secs:    u64,
-    pub graph_course_commit:    Option<String>,
-    pub graph_strict_quality:   bool,
-    pub graph_prune_requires_s: Option<u64>,
-    pub skip_demo:              bool,
+    pub rerun_mode:                  RerunMode,
+    pub rerun_file:                  PathBuf,
+    pub workspace:                   PathBuf,
+    pub graph_snapshot_path:         PathBuf,
+    pub graph_autosave_secs:         u64,
+    pub graph_course_commit:         Option<String>,
+    pub graph_strict_quality:        bool,
+    pub graph_prune_requires_s:      Option<u64>,
+    pub skip_demo:                   bool,
+    pub graph_validation_timeout_ms: u64,
 }
 
 #[derive(Clone)]
@@ -345,6 +346,10 @@ pub fn cli() -> OptionParser<Cli> {
         )
         .argument::<u64>("secs")
         .fallback(300);
+    let graph_validation_timeout_ms = long("graph-validation-timeout-ms")
+        .help("Timeout in milliseconds for graph invariant audits (default 2000ms)")
+        .argument::<u64>("ms")
+        .fallback(2_000);
     let graph_course_commit = long("graph-course-commit")
         .help(
             "Course commit hash to embed in snapshots (defaults to snapshot commit when present; \
@@ -378,6 +383,7 @@ pub fn cli() -> OptionParser<Cli> {
             graph_strict_quality,
             graph_prune_requires_s,
             skip_demo,
+            graph_validation_timeout_ms,
         }
     }
     .to_options()
@@ -547,10 +553,11 @@ pub async fn run_app(cli: Cli, runtime: RuntimeOptions) -> Result<()> {
     );
 
     let mut graph_config = GraphConfig {
-        course_commit:  String::new(),
-        autosave_path:  cli.graph_snapshot_path.clone(),
-        autosave_secs:  effective_autosave_secs,
-        strict_quality: cli.graph_strict_quality,
+        course_commit:         String::new(),
+        autosave_path:         cli.graph_snapshot_path.clone(),
+        autosave_secs:         effective_autosave_secs,
+        strict_quality:        cli.graph_strict_quality,
+        validation_timeout_ms: cli.graph_validation_timeout_ms,
     };
 
     let snapshot_path: PathBuf = graph_config.autosave_path.clone();
@@ -607,6 +614,7 @@ pub async fn run_app(cli: Cli, runtime: RuntimeOptions) -> Result<()> {
                             graph_config.course_commit.clone(),
                             graph_config.strict_quality,
                             snapshot.graph_version,
+                            graph_config.validation_timeout_ms,
                         )
                     }
                     Err(err) => {
@@ -625,6 +633,7 @@ pub async fn run_app(cli: Cli, runtime: RuntimeOptions) -> Result<()> {
                             fallback_commit,
                             graph_config.strict_quality,
                             0,
+                            graph_config.validation_timeout_ms,
                         )
                     }
                 }
@@ -639,6 +648,7 @@ pub async fn run_app(cli: Cli, runtime: RuntimeOptions) -> Result<()> {
                     fallback_commit,
                     graph_config.strict_quality,
                     0,
+                    graph_config.validation_timeout_ms,
                 )
             };
             GraphManager::spawn_persistent(graph_state_url.clone(), state).await?

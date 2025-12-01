@@ -40,15 +40,16 @@ fn make_node(commit: &str) -> KnowledgeNode {
 
 fn base_cli(root: &Path, snapshot: &Path, commit: &str, autosave_secs: u64) -> Cli {
     Cli {
-        rerun_mode:             RerunMode::None,
-        rerun_file:             root.join("noop.rrd"),
-        workspace:              root.join("workspace"),
-        graph_snapshot_path:    snapshot.to_path_buf(),
-        graph_autosave_secs:    autosave_secs,
-        graph_course_commit:    Some(commit.to_string()),
-        graph_strict_quality:   false,
-        graph_prune_requires_s: None,
-        skip_demo:              true,
+        rerun_mode:                  RerunMode::None,
+        rerun_file:                  root.join("noop.rrd"),
+        workspace:                   root.join("workspace"),
+        graph_snapshot_path:         snapshot.to_path_buf(),
+        graph_autosave_secs:         autosave_secs,
+        graph_course_commit:         Some(commit.to_string()),
+        graph_strict_quality:        false,
+        graph_prune_requires_s:      None,
+        skip_demo:                   true,
+        graph_validation_timeout_ms: 2_000,
     }
 }
 

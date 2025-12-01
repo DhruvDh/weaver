@@ -127,19 +127,23 @@ fn decode_cached<T: for<'de> Deserialize<'de>>(value: &Value) -> Result<T, ToolE
         .map_err(|err| ToolExecutionError::Internal(anyhow!("cache decode failed: {err}")))
 }
 
+struct SummaryContext<'a> {
+    metrics:         &'a crate::tools::llm::GatewayMetrics,
+    model:           &'a str,
+    conversation_id: &'a str,
+    hint_prefix:     &'a str,
+    meta:            &'a crate::graph::manager::GraphMeta,
+}
+
 fn finalize_summary_tool(
     tool: &'static str,
     payload: serde_json::Value,
     fetch_body: bool,
-    metrics: &crate::tools::llm::GatewayMetrics,
-    model: &str,
-    conversation_id: &str,
-    hint_prefix: &str,
-    meta: &crate::graph::manager::GraphMeta,
+    ctx: SummaryContext<'_>,
 ) -> Result<ToolOutput, ToolExecutionError> {
-    let payload_with_meta = super::common::attach_meta(payload, meta);
+    let payload_with_meta = super::common::attach_meta(payload, ctx.meta);
     let approx_bytes = payload_size_bytes(&payload_with_meta);
-    let estimates = prepare_payload_estimates(metrics, model, approx_bytes);
+    let estimates = prepare_payload_estimates(ctx.metrics, ctx.model, approx_bytes);
     let mode = ToolPayloadMode::from_fetch_flag(fetch_body);
     info!(tool = tool, mode = mode.as_str(), approx_bytes, "graph summary tool");
 
@@ -147,16 +151,17 @@ fn finalize_summary_tool(
         ToolPayloadMode::Preview => {
             let hints = vec![format!(
                 "{hint_prefix} ~{} bytes; set fetch_body=true to retrieve it.",
-                approx_bytes
+                approx_bytes,
+                hint_prefix = ctx.hint_prefix
             )];
             let mut preview = build_cost_preview(tool, approx_bytes, estimates.safe_tokens, hints);
             let preview_bytes = payload_size_bytes(&preview);
             let preview_tokens = estimate_tokens_from_characters(preview_bytes as usize);
             apply_preview_cost(
                 &mut preview,
-                metrics,
-                model,
-                conversation_id,
+                ctx.metrics,
+                ctx.model,
+                ctx.conversation_id,
                 preview_tokens,
                 estimates.safe_tokens,
             );
@@ -505,11 +510,13 @@ impl ToolInstance for FirstPrinciplesSummaryTool {
             FIRST_PRINCIPLES_SUMMARY,
             payload,
             self.args.fetch_body,
-            &self.metrics,
-            &self.model,
-            &self.conversation_id,
-            "Summary is",
-            &meta,
+            SummaryContext {
+                metrics:         self.metrics.as_ref(),
+                model:           self.model.as_str(),
+                conversation_id: self.conversation_id.as_str(),
+                hint_prefix:     "Summary is",
+                meta:            &meta,
+            },
         )
     }
 }
@@ -827,11 +834,13 @@ impl ToolInstance for LoAlignmentTool {
             LO_ALIGNMENT,
             payload,
             self.args.fetch_body,
-            &self.metrics,
-            &self.model,
-            &self.conversation_id,
-            "Summary is",
-            &meta,
+            SummaryContext {
+                metrics:         self.metrics.as_ref(),
+                model:           self.model.as_str(),
+                conversation_id: self.conversation_id.as_str(),
+                hint_prefix:     "Summary is",
+                meta:            &meta,
+            },
         )
     }
 }
@@ -1197,11 +1206,13 @@ impl ToolInstance for GapSummaryTool {
             GAP_SUMMARY,
             payload,
             self.args.fetch_body,
-            &self.metrics,
-            &self.model,
-            &self.conversation_id,
-            "Summary is",
-            &meta,
+            SummaryContext {
+                metrics:         self.metrics.as_ref(),
+                model:           self.model.as_str(),
+                conversation_id: self.conversation_id.as_str(),
+                hint_prefix:     "Summary is",
+                meta:            &meta,
+            },
         )
     }
 }
@@ -1696,11 +1707,13 @@ impl ToolInstance for AlignmentGapsTool {
             ALIGNMENT_GAPS,
             cached.payload.clone(),
             self.args.fetch_body,
-            &self.metrics,
-            &self.model,
-            &self.conversation_id,
-            "Payload is",
-            &meta,
+            SummaryContext {
+                metrics:         self.metrics.as_ref(),
+                model:           self.model.as_str(),
+                conversation_id: self.conversation_id.as_str(),
+                hint_prefix:     "Payload is",
+                meta:            &meta,
+            },
         )
     }
 }

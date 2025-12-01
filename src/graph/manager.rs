@@ -21,11 +21,17 @@ use crate::graph::{
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct GraphManagerState {
-    pub graph:          CurriculumGraph,
-    pub course_commit:  String,
-    pub strict_quality: bool,
+    pub graph:                 CurriculumGraph,
+    pub course_commit:         String,
+    pub strict_quality:        bool,
     #[serde(default)]
-    pub graph_version:  u64,
+    pub graph_version:         u64,
+    #[serde(default = "default_validation_timeout_ms")]
+    pub validation_timeout_ms: u64,
+}
+
+const fn default_validation_timeout_ms() -> u64 {
+    2_000
 }
 
 impl GraphManagerState {
@@ -34,24 +40,27 @@ impl GraphManagerState {
         course_commit: String,
         strict_quality: bool,
         graph_version: u64,
+        validation_timeout_ms: u64,
     ) -> Self {
         Self {
             graph,
             course_commit,
             strict_quality,
             graph_version,
+            validation_timeout_ms,
         }
     }
 }
 
 #[derive(Clone, Serialize)]
 struct QuarantinedSnapshot {
-    error:          String,
-    course_commit:  String,
-    strict_quality: bool,
-    graph_version:  u64,
-    saved_at_sec:   u64,
-    graph:          CurriculumGraph,
+    error:                 String,
+    course_commit:         String,
+    strict_quality:        bool,
+    graph_version:         u64,
+    validation_timeout_ms: u64,
+    saved_at_sec:          u64,
+    graph:                 CurriculumGraph,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -80,8 +89,9 @@ pub enum NeighborDirection {
 }
 
 pub struct GraphManager {
-    service:       GraphService,
-    course_commit: String,
+    service:               GraphService,
+    course_commit:         String,
+    validation_timeout_ms: u64,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -96,7 +106,12 @@ impl GraphManager {
         Self {
             service,
             course_commit: config.course_commit,
+            validation_timeout_ms: config.validation_timeout_ms,
         }
+    }
+
+    fn next_graph_version_after_snapshot(current_version: u64, snapshot_version: u64) -> u64 {
+        current_version.max(snapshot_version).saturating_add(1)
     }
 
     fn log_write_latency(op: &str, start: Instant) {
@@ -125,12 +140,13 @@ impl GraphManager {
         dir.push(filename);
 
         let envelope = QuarantinedSnapshot {
-            error:          err.to_string(),
-            course_commit:  state.course_commit.clone(),
-            strict_quality: state.strict_quality,
-            graph_version:  state.graph_version,
-            saved_at_sec:   saved_at,
-            graph:          state.graph.clone(),
+            error:                 err.to_string(),
+            course_commit:         state.course_commit.clone(),
+            strict_quality:        state.strict_quality,
+            graph_version:         state.graph_version,
+            validation_timeout_ms: state.validation_timeout_ms,
+            saved_at_sec:          saved_at,
+            graph:                 state.graph.clone(),
         };
 
         let payload = serde_json::to_vec_pretty(&envelope)?;
@@ -144,10 +160,11 @@ impl GraphManager {
 impl From<&GraphManager> for GraphManagerState {
     fn from(manager: &GraphManager) -> Self {
         GraphManagerState {
-            graph:          manager.service.snapshot_graph(),
-            course_commit:  manager.course_commit.clone(),
-            strict_quality: manager.service.strict_quality(),
-            graph_version:  manager.service.graph_version(),
+            graph:                 manager.service.snapshot_graph(),
+            course_commit:         manager.course_commit.clone(),
+            strict_quality:        manager.service.strict_quality(),
+            graph_version:         manager.service.graph_version(),
+            validation_timeout_ms: manager.validation_timeout_ms,
         }
     }
 }
@@ -188,6 +205,7 @@ impl Actor for GraphManager {
         Ok(Self {
             service,
             course_commit: state.course_commit,
+            validation_timeout_ms: state.validation_timeout_ms,
         })
     }
 }
@@ -800,11 +818,19 @@ impl Message<AuditInvariants> for GraphManager {
         _ctx: &mut MsgContext<Self, Self::Reply>,
     ) -> Self::Reply {
         let start = Instant::now();
+        let timeout = Duration::from_millis(self.validation_timeout_ms.max(1));
         let res = self
             .service
-            .validate_global_invariants_off_thread(Duration::from_secs(2))
+            .validate_global_invariants_off_thread(timeout)
             .await;
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        if let Err(GraphError::InvariantTimeout { timeout_ms }) = res.as_ref() {
+            tracing::warn!(
+                target: "weaver.graph.validation.audit",
+                code = "validation_timeout",
+                timeout_ms
+            );
+        }
         tracing::info!(
             target: "weaver.graph.validation.audit",
             elapsed_ms,
@@ -864,6 +890,9 @@ impl Message<LoadSnapshot> for GraphManager {
         }
         let prev_commit = self.course_commit.clone();
         let prev_expected = self.service.expected_revision().map(|s| s.to_string());
+        let prev_version = self.service.graph_version();
+        let target_version =
+            GraphManager::next_graph_version_after_snapshot(prev_version, snapshot.graph_version);
 
         let new_commit = if self.course_commit.is_empty() {
             snapshot.course_commit.clone()
@@ -877,10 +906,7 @@ impl Message<LoadSnapshot> for GraphManager {
         };
 
         self.service.set_expected_revision(expected);
-        if let Err(err) = self
-            .service
-            .install_graph(snapshot.graph, snapshot.graph_version)
-        {
+        if let Err(err) = self.service.install_graph(snapshot.graph, target_version) {
             // rollback commit/expected on failure
             self.course_commit = prev_commit;
             self.service.set_expected_revision(prev_expected);
@@ -888,7 +914,6 @@ impl Message<LoadSnapshot> for GraphManager {
         }
 
         self.course_commit = new_commit;
-        self.service.bump_version();
         GraphManager::log_write_latency("load_snapshot", start);
         Ok(())
     }
@@ -982,8 +1007,13 @@ mod tests {
         svc.add_knowledge_node("k1".into(), mk_kn("k1", KnowledgeType::Conceptual), vec![])?;
         let base_version = svc.graph_version();
 
-        let state =
-            GraphManagerState::new(svc.snapshot_graph(), String::new(), false, base_version);
+        let state = GraphManagerState::new(
+            svc.snapshot_graph(),
+            String::new(),
+            false,
+            base_version,
+            default_validation_timeout_ms(),
+        );
 
         let actor = GraphManager::spawn_persistent(state_url.clone(), state).await?;
 
@@ -1021,6 +1051,63 @@ mod tests {
             .expect("stop restored graph manager");
         restored.wait_for_shutdown().await;
 
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn load_snapshot_advances_graph_version_monotonically() -> anyhow::Result<()> {
+        let state_dir: PathBuf =
+            std::env::temp_dir().join(format!("weaver-load-snapshot-{}", Uuid::new_v4()));
+        fs::create_dir_all(&state_dir)?;
+        let state_url = Url::from_directory_path(&state_dir)
+            .map_err(|_| anyhow::anyhow!("invalid state url"))?;
+
+        let mut svc = GraphService::new();
+        svc.add_knowledge_node("k1".into(), mk_kn("k1", KnowledgeType::Conceptual), vec![])?;
+        let base_version = svc.graph_version();
+        let state = GraphManagerState::new(
+            svc.snapshot_graph(),
+            String::new(),
+            false,
+            base_version,
+            default_validation_timeout_ms(),
+        );
+        let actor = GraphManager::spawn_persistent(state_url.clone(), state).await?;
+
+        let snapshot_path = state_dir.join("snapshot.json");
+        actor
+            .ask(SaveSnapshot {
+                path: snapshot_path.clone(),
+            })
+            .await?;
+
+        actor
+            .ask(InsertKnowledge {
+                slug:    "k2".into(),
+                payload: mk_kn("k2", KnowledgeType::Procedural),
+                tags:    vec![],
+            })
+            .await?;
+        let version_after_mutation: u64 = actor.ask(GetGraphVersion).await?;
+        assert_eq!(version_after_mutation, base_version + 1);
+
+        actor
+            .ask(LoadSnapshot {
+                path: snapshot_path.clone(),
+            })
+            .await?;
+
+        let reloaded_version: u64 = actor.ask(GetGraphVersion).await?;
+        let expected_version =
+            GraphManager::next_graph_version_after_snapshot(version_after_mutation, base_version);
+        assert_eq!(reloaded_version, expected_version);
+
+        let missing = actor.ask(ResolveSlug { slug: "k2".into() }).await;
+        assert!(missing.is_err(), "snapshot reload should drop runtime-only edits");
+
+        actor.stop_gracefully().await?;
+        actor.wait_for_shutdown().await;
+        fs::remove_dir_all(state_dir)?;
         Ok(())
     }
 }

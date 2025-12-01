@@ -13,6 +13,8 @@ use crate::{
     schema::types::KnowledgeType,
     tools::llm::{
         CallState, ToolExecutionError, ToolInputError, ToolInputResult, ToolInstance, ToolOutput,
+        apply_preview_cost, estimate_tokens_from_characters, payload_size_bytes,
+        prepare_payload_estimates,
     },
 };
 
@@ -39,6 +41,12 @@ pub(crate) fn map_graph_err(err: GraphError, tool: &'static str) -> ToolExecutio
                     cycle_slugs.join(" -> ")
                 ),
             })
+        }
+        GraphError::InvariantTimeout { timeout_ms } => ToolExecutionError::Internal(anyhow!(
+            "graph invariant validation timed out after {timeout_ms} ms"
+        )),
+        GraphError::InvariantTaskFailed { message } => {
+            ToolExecutionError::Internal(anyhow!(message))
         }
         GraphError::InvariantViolation { violations } => {
             let joined = violations
@@ -106,6 +114,7 @@ where
 {
     args:    Args,
     graph:   ActorRef<crate::graph::manager::GraphManager>,
+    state:   CallState,
     build:   fn(&Args) -> Msg,
     map_ok:  fn(&Args, <MsgReply<Msg> as kameo::Reply>::Ok) -> Value,
     map_err: fn(SendError<Msg, <MsgReply<Msg> as kameo::Reply>::Error>) -> ToolExecutionError,
@@ -120,6 +129,7 @@ where
     pub(crate) fn new(
         args: Args,
         graph: ActorRef<crate::graph::manager::GraphManager>,
+        state: CallState,
         build: fn(&Args) -> Msg,
         map_ok: fn(&Args, <MsgReply<Msg> as kameo::Reply>::Ok) -> Value,
         map_err: fn(SendError<Msg, <MsgReply<Msg> as kameo::Reply>::Error>) -> ToolExecutionError,
@@ -128,6 +138,7 @@ where
         Self {
             args,
             graph,
+            state,
             build,
             map_ok,
             map_err,
@@ -146,23 +157,20 @@ where
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
         let meta = graph_meta(&self.graph).await?;
         if !self.args.apply_flag() {
-            let preview = attach_meta(
-                json!({
-                    "type": "graph_command",
-                    "tool": self.tool,
-                    "status": "preview",
-                    "apply": false,
-                    "hint": "Set apply=true to execute this mutation"
-                }),
-                &meta,
-            );
-            return Ok(ToolOutput::new(preview));
+            let preview = json!({
+                "type": "graph_command",
+                "tool": self.tool,
+                "status": "preview",
+                "apply": false,
+                "hint": "Set apply=true to execute this mutation"
+            });
+            return Ok(preview_with_cost(self.tool, preview, &meta, &self.state));
         }
         let msg = (self.build)(&self.args);
         let reply: <MsgReply<Msg> as kameo::Reply>::Ok =
             self.graph.ask(msg).await.map_err(|e| (self.map_err)(e))?;
         let payload = attach_meta((self.map_ok)(&self.args, reply), &meta);
-        Ok(ToolOutput::new(payload))
+        Ok(apply_with_byte_hint(payload))
     }
 }
 
@@ -187,6 +195,7 @@ where
     Ok(Box::new(GraphCommandTool::new(
         args,
         state.graph.clone(),
+        state.clone(),
         build,
         map_ok,
         map_err,
@@ -279,8 +288,48 @@ pub(crate) fn attach_meta(
     if let serde_json::Value::Object(ref mut obj) = payload {
         obj.insert(
             "meta".to_string(),
-            serde_json::to_value(meta).unwrap_or_else(|_| serde_json::Value::Null),
+            serde_json::to_value(meta).unwrap_or(serde_json::Value::Null),
         );
     }
     payload
+}
+
+fn preview_with_cost(
+    _tool: &'static str,
+    payload: serde_json::Value,
+    meta: &crate::graph::manager::GraphMeta,
+    state: &CallState,
+) -> ToolOutput {
+    let approx_bytes = payload_size_bytes(&payload);
+    let estimates = prepare_payload_estimates(&state.metrics, state.model.as_str(), approx_bytes);
+    let mut with_cost = payload;
+    if let serde_json::Value::Object(ref mut obj) = with_cost {
+        obj.insert(
+            "cost".to_string(),
+            json!({
+                "bytes_total": approx_bytes,
+                "approx_tokens": estimates.safe_tokens,
+                "preview_tokens": Value::Null,
+                "remaining_tokens": Value::Null,
+                "remaining_ratio": Value::Null,
+            }),
+        );
+    }
+    let preview_tokens = estimate_tokens_from_characters(payload_size_bytes(&with_cost) as usize);
+    apply_preview_cost(
+        &mut with_cost,
+        &state.metrics,
+        state.model.as_str(),
+        state.conversation_id.as_str(),
+        preview_tokens,
+        estimates.safe_tokens,
+    );
+    let with_meta = attach_meta(with_cost, meta);
+    let hint = payload_size_bytes(&with_meta);
+    ToolOutput::with_byte_hint(with_meta, hint)
+}
+
+fn apply_with_byte_hint(payload: serde_json::Value) -> ToolOutput {
+    let size = payload_size_bytes(&payload);
+    ToolOutput::with_byte_hint(payload, size)
 }

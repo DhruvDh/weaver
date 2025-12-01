@@ -84,7 +84,7 @@ impl EdgeSpec for SupportsSpec {
         from: NodeId,
         to: NodeId,
         attrs: &Self::Attrs,
-        confidence: f32,
+        _confidence: f32,
     ) -> Result<(), GraphError> {
         let (from_kind, to_kind) = svc.node_kinds(Self::NAME, from, to)?;
         if from == to {
@@ -132,20 +132,11 @@ impl EdgeSpec for SupportsSpec {
         }
 
         // Fadeability guard: adding this support must not create new
-        // first-principle -> assessment reachability. Simulate the insertion on
-        // a cloned graph and reuse the fadeability analysis; if the new edge is
-        // implicated in an issue, reject.
-        let mut tmp = svc.graph().clone();
+        // first-principle -> assessment reachability beyond the current graph.
         let fade_start = std::time::Instant::now();
-        let new_edge = tmp.add_edge(
-            from,
-            to,
-            EdgePayload {
-                kind: EdgeKind::Supports(attrs.clone()),
-                confidence,
-            },
-        );
-        let issues = crate::analysis::fadeability_issues(&tmp);
+        let fade_ctx = svc.fade_ctx();
+        let carries_prereq =
+            crate::analysis::support_would_break_fadeability(svc.graph(), &fade_ctx, from, to);
         let fade_elapsed_ms = fade_start.elapsed().as_secs_f64() * 1000.0;
         if fade_elapsed_ms > 10.0 {
             tracing::debug!(
@@ -154,14 +145,6 @@ impl EdgeSpec for SupportsSpec {
                 op = "supports_validate"
             );
         }
-        if fade_elapsed_ms > 2_000.0 {
-            return Err(GraphError::Schema(
-                "fadeability validation timed out; try again with smaller change".to_string(),
-            ));
-        }
-        let carries_prereq = issues
-            .iter()
-            .any(|issue| issue.support_edges.contains(&new_edge));
         if carries_prereq {
             return Err(GraphError::Schema(
                 "support would carry prerequisite load (not fadeable)".to_string(),

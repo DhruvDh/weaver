@@ -667,8 +667,14 @@ mod discourse {
             assert!(
                 violations
                     .iter()
+                    .any(|v| v.code == graph::InvariantCode::TeachingStepAnchorOrRationale),
+                "expected anchor/rationale violation when use step remains unanchored"
+            );
+            assert!(
+                !violations
+                    .iter()
                     .any(|v| v.code == graph::InvariantCode::BorrowAhead),
-                "expected borrow_ahead code"
+                "unanchored use without anchors should avoid double-reporting borrow_ahead"
             );
         }
     }
@@ -714,6 +720,92 @@ mod discourse {
         let results = analysis::borrow_ahead(svc.graph(), "ep1");
         assert!(results.is_empty());
     }
+
+    #[test]
+    fn unanchored_use_without_rationale_reports_once() {
+        let mut svc = GraphService::new();
+        svc.add_teaching_step(
+            "ts_use".into(),
+            graph::TeachingStepNode {
+                title:       "use".into(),
+                statement:   "use it".into(),
+                purpose:     graph::TeachingPurpose::Use,
+                method_tags: vec![],
+                episode:     "ep".into(),
+                source_refs: vec![SourceRef {
+                    path:       "dummy".into(),
+                    start_line: 1,
+                    end_line:   2,
+                    revision:   "deadbeef".into(),
+                }],
+                rationale:   None,
+            },
+            vec![],
+        )
+        .unwrap();
+        let err = svc
+            .set_strict_quality(true)
+            .expect_err("missing anchor/rationale should fail in strict mode");
+        if let graph::GraphError::InvariantViolation { violations } = err {
+            assert!(
+                violations
+                    .iter()
+                    .any(|v| v.code == graph::InvariantCode::TeachingStepAnchorOrRationale),
+                "expected anchor/rationale warning promoted to error"
+            );
+            assert!(
+                !violations
+                    .iter()
+                    .any(|v| v.code == graph::InvariantCode::BorrowAhead),
+                "borrow_ahead should not double-report unanchored use without rationale"
+            );
+        } else {
+            panic!("expected invariant violation");
+        }
+    }
+
+    #[test]
+    fn unanchored_use_with_rationale_warns_about_borrow_ahead() {
+        let mut svc = GraphService::new();
+        svc.add_teaching_step(
+            "ts_use".into(),
+            graph::TeachingStepNode {
+                title:       "use".into(),
+                statement:   "use it".into(),
+                purpose:     graph::TeachingPurpose::Use,
+                method_tags: vec![],
+                episode:     "ep".into(),
+                source_refs: vec![SourceRef {
+                    path:       "dummy".into(),
+                    start_line: 1,
+                    end_line:   2,
+                    revision:   "deadbeef".into(),
+                }],
+                rationale:   Some("we intend to reuse prior knowledge".into()),
+            },
+            vec![],
+        )
+        .unwrap();
+        let err = svc
+            .set_strict_quality(true)
+            .expect_err("borrow-ahead check should fire for unanchored use with rationale");
+        if let graph::GraphError::InvariantViolation { violations } = err {
+            assert!(
+                violations
+                    .iter()
+                    .any(|v| v.code == graph::InvariantCode::BorrowAhead),
+                "expected borrow_ahead code"
+            );
+            assert!(
+                !violations
+                    .iter()
+                    .any(|v| v.code == graph::InvariantCode::TeachingStepAnchorOrRationale),
+                "anchor/rationale warning should not double-report when rationale present"
+            );
+        } else {
+            panic!("expected invariant violation");
+        }
+    }
 }
 
 mod hygiene {
@@ -749,7 +841,8 @@ mod persistence_topology {
             .add_knowledge_node("k".into(), mk_kn("k", KnowledgeType::Conceptual), vec![])
             .unwrap();
         let version = svc.graph_version();
-        let state = GraphManagerState::new(svc.snapshot_graph(), "deadbeef".into(), false, version);
+        let state =
+            GraphManagerState::new(svc.snapshot_graph(), "deadbeef".into(), false, version, 2_000);
         let data = postcard::to_stdvec(&state).expect("serialize state");
         let decoded: GraphManagerState = postcard::from_bytes(&data).expect("deserialize state");
         let restored = GraphService::from_parts(

@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use petgraph::{
     Direction,
     algo::{has_path_connecting, is_cyclic_directed, toposort},
-    visit::{EdgeRef, Reversed},
+    visit::EdgeRef,
 };
 use rayon::prelude::*;
 use schemars::JsonSchema;
@@ -229,33 +229,89 @@ pub struct FadeabilityIssue {
     pub support_edges: Vec<petgraph::stable_graph::EdgeIndex<u32>>,
 }
 
+#[derive(Clone, Debug)]
+pub struct FadeabilityContext {
+    pub first_principles:               Vec<NodeId>,
+    pub reachable_requires:             HashSet<NodeId>,
+    pub reachable_requires_or_supports: HashSet<NodeId>,
+}
+
+impl FadeabilityContext {
+    pub fn from_first_principles(g: &CurriculumGraph, first_principles: &[NodeId]) -> Self {
+        let fps = first_principles.to_vec();
+        let reachable_requires =
+            reachable_with_filter(g, &fps, |k| matches!(k, EdgeKind::Requires(_)));
+        let reachable_requires_or_supports = reachable_with_filter(g, &fps, |k| {
+            matches!(k, EdgeKind::Requires(_) | EdgeKind::Supports(_))
+        });
+        Self {
+            first_principles: fps,
+            reachable_requires,
+            reachable_requires_or_supports,
+        }
+    }
+
+    pub fn compute(g: &CurriculumGraph) -> Self {
+        let fps = first_principles(g);
+        Self::from_first_principles(g, &fps)
+    }
+}
+
 pub fn fadeability_issues(g: &CurriculumGraph) -> Vec<FadeabilityIssue> {
-    let fps = first_principles(g);
-    let rs_view = traversal::requires_or_supports_view(g);
+    let ctx = FadeabilityContext::compute(g);
+    fadeability_issues_with_context(g, &ctx)
+}
 
-    let reachable_requires: HashSet<_> = g
+pub fn fadeability_issues_with_context(
+    g: &CurriculumGraph,
+    ctx: &FadeabilityContext,
+) -> Vec<FadeabilityIssue> {
+    let assessments_support_only: Vec<NodeId> = g
         .node_indices()
-        .filter(|&n| matches!(&g[n].kind, NodeKind::Knowledge(k) if k.knowledge_type.is_assessment_item()))
-        .filter(|&a| fps.iter().any(|&fp| traversal::requires_path_exists(g, fp, a)))
+        .filter(|&n| {
+            matches!(
+                &g[n].kind,
+                NodeKind::Knowledge(k) if k.knowledge_type.is_assessment_item()
+            )
+        })
+        .filter(|&a| {
+            ctx.reachable_requires_or_supports.contains(&a) && !ctx.reachable_requires.contains(&a)
+        })
         .collect();
 
-    let reachable_with_supports: HashSet<_> = g
-        .node_indices()
-        .filter(|&n| matches!(&g[n].kind, NodeKind::Knowledge(k) if k.knowledge_type.is_assessment_item()))
-        .filter(|&a| fps.iter().any(|&fp| has_path_connecting(&rs_view, fp, a, None)))
-        .collect();
-
-    reachable_with_supports
-        .difference(&reachable_requires)
-        .cloned()
-        .map(|assessment| {
-            let support_edges = supports_on_paths_to_assessment(g, &fps, assessment);
-            FadeabilityIssue {
-                assessment,
-                support_edges,
-            }
+    assessments_support_only
+        .into_iter()
+        .map(|assessment| FadeabilityIssue {
+            assessment,
+            support_edges: supports_on_paths_to_assessment(g, ctx, assessment),
         })
         .collect()
+}
+
+pub fn support_would_break_fadeability(
+    g: &CurriculumGraph,
+    ctx: &FadeabilityContext,
+    from: NodeId,
+    to: NodeId,
+) -> bool {
+    if !ctx.reachable_requires_or_supports.contains(&from) {
+        // New support cannot be reached from first principles, so it cannot
+        // introduce a reachable assessment.
+        return false;
+    }
+    let after = reachable_with_virtual_support(g, &ctx.first_principles, from, to);
+    after
+        .into_iter()
+        .filter(|&n| {
+            matches!(
+                &g[n].kind,
+                NodeKind::Knowledge(k) if k.knowledge_type.is_assessment_item()
+            )
+        })
+        .any(|assessment| {
+            !ctx.reachable_requires_or_supports.contains(&assessment)
+                && !ctx.reachable_requires.contains(&assessment)
+        })
 }
 
 /// Example minimum + variety checks.
@@ -753,25 +809,98 @@ fn has_requires_path(g: &CurriculumGraph, from: NodeId, to: NodeId) -> bool {
     false
 }
 
+fn reachable_with_filter(
+    g: &CurriculumGraph,
+    starts: &[NodeId],
+    predicate: impl Fn(&EdgeKind) -> bool,
+) -> HashSet<NodeId> {
+    let mut seen = HashSet::new();
+    let mut queue: VecDeque<NodeId> = VecDeque::new();
+    for &s in starts {
+        seen.insert(s);
+        queue.push_back(s);
+    }
+
+    while let Some(node) = queue.pop_front() {
+        for edge in g.edges_directed(node, Direction::Outgoing) {
+            if predicate(&edge.weight().kind) {
+                let tgt = edge.target();
+                if seen.insert(tgt) {
+                    queue.push_back(tgt);
+                }
+            }
+        }
+    }
+    seen
+}
+
+fn reachable_with_virtual_support(
+    g: &CurriculumGraph,
+    starts: &[NodeId],
+    from: NodeId,
+    to: NodeId,
+) -> HashSet<NodeId> {
+    let mut seen = HashSet::new();
+    let mut queue: VecDeque<NodeId> = VecDeque::new();
+    for &s in starts {
+        seen.insert(s);
+        queue.push_back(s);
+    }
+    while let Some(node) = queue.pop_front() {
+        for edge in g.edges_directed(node, Direction::Outgoing) {
+            if matches!(edge.weight().kind, EdgeKind::Requires(_) | EdgeKind::Supports(_)) {
+                let tgt = edge.target();
+                if seen.insert(tgt) {
+                    queue.push_back(tgt);
+                }
+            }
+        }
+        if node == from && seen.insert(to) {
+            queue.push_back(to);
+        }
+    }
+    seen
+}
+
+fn reverse_reachable_with_filter(
+    g: &CurriculumGraph,
+    target: NodeId,
+    predicate: impl Fn(&EdgeKind) -> bool,
+) -> HashSet<NodeId> {
+    let mut seen = HashSet::new();
+    let mut queue: VecDeque<NodeId> = VecDeque::new();
+    seen.insert(target);
+    queue.push_back(target);
+
+    while let Some(node) = queue.pop_front() {
+        for edge in g.edges_directed(node, Direction::Incoming) {
+            if predicate(&edge.weight().kind) {
+                let src = edge.source();
+                if seen.insert(src) {
+                    queue.push_back(src);
+                }
+            }
+        }
+    }
+    seen
+}
+
 /// Return support edges that participate in at least one path from any first
 /// principle to `assessment` when supports are allowed.
 fn supports_on_paths_to_assessment(
     g: &CurriculumGraph,
-    first_principles: &[NodeId],
+    ctx: &FadeabilityContext,
     assessment: NodeId,
 ) -> Vec<petgraph::stable_graph::EdgeIndex<u32>> {
-    let view = traversal::requires_or_supports_view(g);
-    let rev = Reversed(&view);
+    let backwards = reverse_reachable_with_filter(g, assessment, |k| {
+        matches!(k, EdgeKind::Requires(_) | EdgeKind::Supports(_))
+    });
 
     g.edge_indices()
         .filter(|&e| matches!(g[e].kind, EdgeKind::Supports(_)))
         .filter(|&e| {
             if let Some((u, v)) = g.edge_endpoints(e) {
-                let from_fp = first_principles
-                    .iter()
-                    .any(|&fp| has_path_connecting(&view, fp, u, None));
-                let to_assessment = has_path_connecting(&rev, assessment, v, None);
-                from_fp && to_assessment
+                ctx.reachable_requires_or_supports.contains(&u) && backwards.contains(&v)
             } else {
                 false
             }

@@ -1,14 +1,23 @@
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::{
     collections::{HashMap, HashSet},
     hash::{Hash, Hasher},
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicU16, Ordering},
+    },
     time::{Duration, Instant},
 };
 
+use bitflags::bitflags;
 use petgraph::{Direction, visit::EdgeRef};
 use tokio::{task, time::timeout};
 use tracing::warn;
 use uuid::Uuid;
+
+#[cfg(test)]
+static INVARIANT_RUNS: AtomicUsize = AtomicUsize::new(0);
 
 use crate::{
     analysis,
@@ -33,6 +42,42 @@ struct ValidationIssue {
     severity:          ValidationSeverity,
     message:           String,
     promote_in_strict: bool,
+}
+
+bitflags! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct InvariantFamilies: u16 {
+        const STATEMENTS    = 1 << 0;
+        const PROVENANCE    = 1 << 1;
+        const REQUIRES_DAG  = 1 << 2;
+        const FADEABILITY   = 1 << 3;
+        const COVERAGE      = 1 << 4;
+        const SUPPORTS      = 1 << 5;
+        const PURITY        = 1 << 6;
+        const DISCOURSE     = 1 << 7;
+        const INTRODUCTIONS = 1 << 8;
+        const ALL           = Self::STATEMENTS.bits()
+            | Self::PROVENANCE.bits()
+            | Self::REQUIRES_DAG.bits()
+            | Self::FADEABILITY.bits()
+            | Self::COVERAGE.bits()
+            | Self::SUPPORTS.bits()
+            | Self::PURITY.bits()
+            | Self::DISCOURSE.bits()
+            | Self::INTRODUCTIONS.bits();
+    }
+}
+
+struct ValidationState {
+    dirty: AtomicU16,
+}
+
+impl ValidationState {
+    fn new_empty() -> Self {
+        Self {
+            dirty: AtomicU16::new(0),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -61,6 +106,8 @@ pub struct GraphService {
     graph_version:     u64,
     expected_revision: Option<String>,
     rubric_hashes:     RwLock<HashMap<String, u64>>,
+    validation_state:  ValidationState,
+    fade_cache:        RwLock<Option<(u64, analysis::FadeabilityContext)>>,
 }
 
 impl GraphService {
@@ -72,6 +119,8 @@ impl GraphService {
             graph_version:     0,
             expected_revision: None,
             rubric_hashes:     RwLock::new(HashMap::new()),
+            validation_state:  ValidationState::new_empty(),
+            fade_cache:        RwLock::new(None),
         }
     }
 
@@ -101,6 +150,8 @@ impl GraphService {
             graph_version,
             expected_revision: expected_revision.filter(|s| !s.is_empty()),
             rubric_hashes,
+            validation_state: ValidationState::new_empty(),
+            fade_cache: RwLock::new(None),
         };
         svc.rebuild_slug_index()?;
         svc.validate_global_invariants()?;
@@ -118,6 +169,89 @@ impl GraphService {
 
     pub fn graph_version(&self) -> u64 {
         self.graph_version
+    }
+
+    pub(crate) fn fade_ctx(&self) -> analysis::FadeabilityContext {
+        if let Ok(cache) = self.fade_cache.read()
+            && let Some((ver, ctx)) = cache.as_ref()
+            && *ver == self.graph_version
+        {
+            return ctx.clone();
+        }
+        let fresh = analysis::FadeabilityContext::compute(self.graph());
+        if let Ok(mut cache) = self.fade_cache.write() {
+            *cache = Some((self.graph_version, fresh.clone()));
+        }
+        fresh
+    }
+
+    fn mark_dirty(&self, families: InvariantFamilies) {
+        if families.is_empty() {
+            return;
+        }
+        self.validation_state
+            .dirty
+            .fetch_or(families.bits(), Ordering::Relaxed);
+        if let Ok(mut cache) = self.fade_cache.write() {
+            cache.take();
+        }
+    }
+
+    fn planned_families(&self, required: InvariantFamilies) -> InvariantFamilies {
+        let dirty = InvariantFamilies::from_bits_truncate(
+            self.validation_state.dirty.load(Ordering::Relaxed),
+        );
+        dirty | required
+    }
+
+    fn clear_validated_families(&self, families: InvariantFamilies) {
+        if families.is_empty() {
+            return;
+        }
+        let mask = !families.bits();
+        self.validation_state
+            .dirty
+            .fetch_and(mask, Ordering::Relaxed);
+    }
+
+    fn families_for_scope(
+        mut families: InvariantFamilies,
+        scope: &ValidationScope,
+    ) -> InvariantFamilies {
+        match scope {
+            ValidationScope::Full => {}
+            ValidationScope::Targeted {
+                coverage_los,
+                skip_requires_dag,
+                skip_fadeability,
+            } => {
+                if *skip_requires_dag {
+                    families.remove(InvariantFamilies::REQUIRES_DAG);
+                }
+                if *skip_fadeability {
+                    families.remove(InvariantFamilies::FADEABILITY);
+                }
+                if coverage_los.is_empty() {
+                    families.remove(InvariantFamilies::COVERAGE);
+                }
+            }
+        }
+        families
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_reset_invariant_runs() {
+        INVARIANT_RUNS.store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_invariant_runs() -> usize {
+        INVARIANT_RUNS.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn test_mark_dirty(&self, families: InvariantFamilies) {
+        self.mark_dirty(families);
     }
 
     pub fn strict_quality(&self) -> bool {
@@ -185,6 +319,18 @@ impl GraphService {
         }
         validate_source_refs(&payload.source_refs)?;
         self.validate_revision(&payload.source_refs, "knowledge")?;
+        let mut dirty = InvariantFamilies::STATEMENTS
+            | InvariantFamilies::PROVENANCE
+            | InvariantFamilies::SUPPORTS;
+        if payload.knowledge_type == KnowledgeType::LearningOutcome
+            || payload.knowledge_type.is_assessment_item()
+        {
+            dirty.insert(InvariantFamilies::COVERAGE);
+        }
+        if payload.knowledge_type.is_assessment_item() {
+            dirty.insert(InvariantFamilies::PURITY);
+        }
+        self.mark_dirty(dirty);
         let logical_id = Uuid::new_v4();
         let node = NodePayload {
             logical_id,
@@ -239,6 +385,36 @@ impl GraphService {
         }
         validate_source_refs(&payload.source_refs)?;
         self.validate_revision(&payload.source_refs, "knowledge")?;
+        let mut dirty = InvariantFamilies::STATEMENTS
+            | InvariantFamilies::PROVENANCE
+            | InvariantFamilies::SUPPORTS;
+        let mut needs_coverage = false;
+        let mut needs_purity = false;
+        if let NodeKind::Knowledge(k) = &old_kind {
+            if k.knowledge_type == KnowledgeType::LearningOutcome
+                || k.knowledge_type.is_assessment_item()
+            {
+                needs_coverage = true;
+            }
+            if k.knowledge_type.is_assessment_item() {
+                needs_purity = true;
+            }
+        }
+        if payload.knowledge_type == KnowledgeType::LearningOutcome
+            || payload.knowledge_type.is_assessment_item()
+        {
+            needs_coverage = true;
+        }
+        if payload.knowledge_type.is_assessment_item() {
+            needs_purity = true;
+        }
+        if needs_coverage {
+            dirty.insert(InvariantFamilies::COVERAGE);
+        }
+        if needs_purity {
+            dirty.insert(InvariantFamilies::PURITY);
+        }
+        self.mark_dirty(dirty);
 
         // apply tentative change
         self.graph_mut()[id].kind = NodeKind::Knowledge(payload);
@@ -371,6 +547,7 @@ impl GraphService {
             .read()
             .expect("rubric_hashes lock")
             .clone();
+        self.mark_dirty(InvariantFamilies::ALL);
 
         self.slug_to_node.remove(slug);
         self.graph_mut().remove_node(id);
@@ -412,7 +589,7 @@ impl GraphService {
         self.slug_to_node = index;
         self.graph_version = graph_version;
         self.rubric_hashes = RwLock::new(compute_rubric_hashes(self.graph.as_ref()));
-
+        self.mark_dirty(InvariantFamilies::ALL);
         if let Err(err) = self.validate_global_invariants() {
             // rollback on failure
             self.graph = old_graph;
@@ -476,6 +653,11 @@ impl GraphService {
         }
         validate_source_refs(&payload.source_refs)?;
         self.validate_revision(&payload.source_refs, "teaching_step")?;
+        self.mark_dirty(
+            InvariantFamilies::STATEMENTS
+                | InvariantFamilies::PROVENANCE
+                | InvariantFamilies::DISCOURSE,
+        );
         let logical_id = Uuid::new_v4();
         let node = NodePayload {
             logical_id,
@@ -522,6 +704,11 @@ impl GraphService {
         }
         validate_source_refs(&payload.source_refs)?;
         self.validate_revision(&payload.source_refs, "teaching_step")?;
+        self.mark_dirty(
+            InvariantFamilies::STATEMENTS
+                | InvariantFamilies::PROVENANCE
+                | InvariantFamilies::DISCOURSE,
+        );
         self.graph_mut()[id].kind = NodeKind::TeachingStep(payload);
 
         if let Err(err) = self.validate_incident_edges(id) {
@@ -583,6 +770,23 @@ impl GraphService {
             // Other edges do not impact requires/fadeability invariants.
             _ => (true, true),
         };
+
+        let mut dirty = match S::NAME {
+            "requires" => {
+                InvariantFamilies::REQUIRES_DAG
+                    | InvariantFamilies::FADEABILITY
+                    | InvariantFamilies::PURITY
+            }
+            "supports" => InvariantFamilies::FADEABILITY | InvariantFamilies::SUPPORTS,
+            "assesses" => InvariantFamilies::PURITY,
+            "precedes" => InvariantFamilies::DISCOURSE,
+            "anchors" => InvariantFamilies::DISCOURSE | InvariantFamilies::INTRODUCTIONS,
+            _ => InvariantFamilies::empty(),
+        };
+        if !coverage_los.is_empty() {
+            dirty.insert(InvariantFamilies::COVERAGE);
+        }
+        self.mark_dirty(dirty);
 
         if let Err(err) =
             self.validate_targeted_invariants(coverage_los, skip_requires_dag, skip_fadeability)
@@ -702,6 +906,12 @@ impl GraphService {
             }
         }
         if removed > 0 {
+            self.mark_dirty(
+                InvariantFamilies::REQUIRES_DAG
+                    | InvariantFamilies::FADEABILITY
+                    | InvariantFamilies::COVERAGE
+                    | InvariantFamilies::PURITY,
+            );
             self.bump_version();
         }
         removed
@@ -709,7 +919,8 @@ impl GraphService {
 
     /// Run global audits and return violations as errors.
     pub fn validate_global_invariants(&self) -> Result<(), GraphError> {
-        self.validate_invariants(ValidationScope::Full)
+        let families = self.planned_families(InvariantFamilies::ALL);
+        self.validate_invariants(ValidationScope::Full, families)
     }
 
     /// Run global audits on a snapshot in a blocking task with a timeout. This
@@ -718,6 +929,12 @@ impl GraphService {
         &self,
         timeout_ms: Duration,
     ) -> Result<(), GraphError> {
+        let scope = ValidationScope::Full;
+        let families = self.planned_families(InvariantFamilies::ALL);
+        let effective = GraphService::families_for_scope(families, &scope);
+        if effective.is_empty() {
+            return Ok(());
+        }
         let graph = self.graph.clone();
         let ctx = ValidationContext {
             strict:                self.strict_quality,
@@ -729,21 +946,45 @@ impl GraphService {
                 .clone(),
             include_rubric_update: true,
         };
-        let scope = ValidationScope::Full;
-        let handle = task::spawn_blocking(move || run_invariants_for_graph(&graph, scope, &ctx));
-        let rubric_current = timeout(timeout_ms, handle)
-            .await
-            .map_err(|_| GraphError::Schema("graph invariant validation timed out".to_string()))?
-            .map_err(|join_err| {
-                GraphError::Schema(format!("graph invariant validation task failed: {join_err}"))
-            })??;
+        let handle =
+            task::spawn_blocking(move || run_invariants_for_graph(&graph, scope, &ctx, effective));
+        let join_result = match timeout(timeout_ms, handle).await {
+            Ok(res) => res,
+            Err(_) => {
+                let timeout_ms = timeout_ms.as_millis() as u64;
+                tracing::warn!(
+                    target: "weaver.graph.validation",
+                    code = "validation_timeout",
+                    timeout_ms
+                );
+                return Err(GraphError::InvariantTimeout { timeout_ms });
+            }
+        };
+        let rubric_current = match join_result {
+            Ok(inner) => inner?,
+            Err(join_err) => {
+                tracing::warn!(
+                    target: "weaver.graph.validation",
+                    code = "validation_task_failed",
+                    error = %join_err
+                );
+                return Err(GraphError::InvariantTaskFailed {
+                    message: format!("graph invariant validation task failed: {join_err}"),
+                });
+            }
+        };
         if let Some(rubric) = rubric_current {
             *self.rubric_hashes.write().expect("rubric_hashes lock") = rubric;
         }
+        self.clear_validated_families(effective);
         Ok(())
     }
 
-    fn validate_invariants(&self, scope: ValidationScope) -> Result<(), GraphError> {
+    fn validate_invariants(
+        &self,
+        scope: ValidationScope,
+        families: InvariantFamilies,
+    ) -> Result<(), GraphError> {
         let ctx = ValidationContext {
             strict:                self.strict_quality,
             expected_revision:     self.expected_revision.clone(),
@@ -754,10 +995,15 @@ impl GraphService {
                 .clone(),
             include_rubric_update: true,
         };
-        let result = run_invariants_for_graph(self.graph(), scope, &ctx)?;
+        let effective = GraphService::families_for_scope(families, &scope);
+        if effective.is_empty() {
+            return Ok(());
+        }
+        let result = run_invariants_for_graph(self.graph(), scope, &ctx, effective)?;
         if let Some(rubric) = result {
             *self.rubric_hashes.write().expect("rubric_hashes lock") = rubric;
         }
+        self.clear_validated_families(effective);
         Ok(())
     }
 
@@ -767,11 +1013,28 @@ impl GraphService {
         skip_requires_dag: bool,
         skip_fadeability: bool,
     ) -> Result<(), GraphError> {
-        self.validate_invariants(ValidationScope::Targeted {
-            coverage_los,
-            skip_requires_dag,
-            skip_fadeability,
-        })
+        let required = {
+            let mut mask = InvariantFamilies::empty();
+            if !coverage_los.is_empty() {
+                mask.insert(InvariantFamilies::COVERAGE);
+            }
+            if !skip_requires_dag {
+                mask.insert(InvariantFamilies::REQUIRES_DAG);
+            }
+            if !skip_fadeability {
+                mask.insert(InvariantFamilies::FADEABILITY);
+            }
+            mask
+        };
+        let families = self.planned_families(required);
+        self.validate_invariants(
+            ValidationScope::Targeted {
+                coverage_los,
+                skip_requires_dag,
+                skip_fadeability,
+            },
+            families,
+        )
     }
 
     fn los_assessed_by(&self, assessment: NodeId) -> Vec<NodeId> {
@@ -827,7 +1090,10 @@ fn run_invariants_for_graph(
     g: &CurriculumGraph,
     scope: ValidationScope,
     ctx: &ValidationContext,
+    families: InvariantFamilies,
 ) -> Result<Option<HashMap<String, u64>>, GraphError> {
+    #[cfg(test)]
+    INVARIANT_RUNS.fetch_add(1, Ordering::Relaxed);
     let start = Instant::now();
     let slug_index: HashMap<String, NodeId> =
         g.node_indices().map(|n| (g[n].slug.clone(), n)).collect();
@@ -855,21 +1121,39 @@ fn run_invariants_for_graph(
         } => (coverage_los.clone(), !skip_requires_dag, !skip_fadeability),
     };
 
-    let needs_coverage = !coverage_los.is_empty();
+    let include_requires_dag =
+        include_requires_dag && families.contains(InvariantFamilies::REQUIRES_DAG);
+    let include_fadeability =
+        include_fadeability && families.contains(InvariantFamilies::FADEABILITY);
+    let needs_coverage = !coverage_los.is_empty() && families.contains(InvariantFamilies::COVERAGE);
 
     let rubric_current = compute_rubric_hashes(g);
     let (first_principles, rubric_prev) =
-        if needs_coverage || matches!(scope, ValidationScope::Full) {
+        if needs_coverage || matches!(scope, ValidationScope::Full) || include_fadeability {
             (analysis::first_principles(g), ctx.rubric_prev.clone())
         } else {
             (Vec::new(), HashMap::new())
         };
+    let fade_ctx = if include_fadeability {
+        Some(analysis::FadeabilityContext::from_first_principles(g, &first_principles))
+    } else {
+        None
+    };
 
     let mut issues = Vec::new();
-    issues.extend(check_statements(g));
-    issues.extend(check_provenance(g, ctx.expected_revision.as_deref()));
+    if families.contains(InvariantFamilies::STATEMENTS) {
+        issues.extend(check_statements(g));
+    }
+    if families.contains(InvariantFamilies::PROVENANCE) {
+        issues.extend(check_provenance(g, ctx.expected_revision.as_deref()));
+    }
     if include_requires_dag || include_fadeability {
-        issues.extend(check_requires_and_fadeability(g, include_requires_dag, include_fadeability));
+        issues.extend(check_requires_and_fadeability(
+            g,
+            include_requires_dag,
+            include_fadeability,
+            fade_ctx.as_ref(),
+        ));
     }
     if needs_coverage {
         issues.extend(check_reachability_and_coverage(
@@ -880,10 +1164,16 @@ fn run_invariants_for_graph(
             &rubric_current,
         ));
     }
-    issues.extend(check_supports_and_practice(g));
-    issues.extend(check_purity(g, &slug_index));
-    if has_teaching_steps {
+    if families.contains(InvariantFamilies::SUPPORTS) {
+        issues.extend(check_supports_and_practice(g));
+    }
+    if families.contains(InvariantFamilies::PURITY) {
+        issues.extend(check_purity(g, &slug_index));
+    }
+    if has_teaching_steps && families.contains(InvariantFamilies::DISCOURSE) {
         issues.extend(check_discourse(g));
+    }
+    if has_teaching_steps && families.contains(InvariantFamilies::INTRODUCTIONS) {
         issues.extend(check_introductions(g));
     }
 
@@ -1064,6 +1354,7 @@ fn check_requires_and_fadeability(
     g: &CurriculumGraph,
     include_dag: bool,
     include_fadeability: bool,
+    fade_ctx: Option<&analysis::FadeabilityContext>,
 ) -> Vec<ValidationIssue> {
     let mut out = Vec::new();
     if include_dag && !analysis::requires_is_dag(g) {
@@ -1075,7 +1366,10 @@ fn check_requires_and_fadeability(
         ));
     }
     if include_fadeability {
-        for issue in analysis::fadeability_issues(g) {
+        let ctx = fade_ctx
+            .cloned()
+            .unwrap_or_else(|| analysis::FadeabilityContext::compute(g));
+        for issue in analysis::fadeability_issues_with_context(g, &ctx) {
             let assessment_slug = g[issue.assessment].slug.clone();
             let edges: Vec<String> = issue
                 .support_edges
@@ -1333,19 +1627,21 @@ fn check_discourse(g: &CurriculumGraph) -> Vec<ValidationIssue> {
                 .as_ref()
                 .map(|r| !r.trim().is_empty())
                 .unwrap_or(false);
-            if !has_anchor && !has_rationale {
-                if matches!(ts.purpose, TeachingPurpose::Use) {
-                    out.push(make_issue(
-                        InvariantCode::BorrowAhead,
-                        ValidationSeverity::Warning,
-                        true,
-                        format!(
-                            "teaching_step `{}` has purpose=use but no anchors; cannot verify \
-                             introduction order",
-                            g[n].slug
-                        ),
-                    ));
-                }
+            let missing_anchor = !has_anchor;
+            let missing_rationale = !has_rationale;
+            if matches!(ts.purpose, TeachingPurpose::Use) && missing_anchor && !missing_rationale {
+                out.push(make_issue(
+                    InvariantCode::BorrowAhead,
+                    ValidationSeverity::Warning,
+                    true,
+                    format!(
+                        "teaching_step `{}` has purpose=use but no anchors; cannot verify \
+                         introduction order despite provided rationale",
+                        g[n].slug
+                    ),
+                ));
+            }
+            if missing_anchor && missing_rationale {
                 out.push(make_issue(
                     InvariantCode::TeachingStepAnchorOrRationale,
                     ValidationSeverity::Warning,
@@ -1434,5 +1730,35 @@ fn normalize_assesses_claims_graph(graph: &mut CurriculumGraph) {
                 attrs.evidence_link.claim = target_slug;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn targeted_validation_is_noop_when_clean_and_no_required() {
+        let svc = GraphService::new();
+        GraphService::test_reset_invariant_runs();
+        let res = svc.validate_targeted_invariants(Vec::new(), true, true);
+        assert!(res.is_ok());
+        assert_eq!(GraphService::test_invariant_runs(), 0);
+    }
+
+    #[test]
+    fn dirty_validation_runs_and_clears_flag() {
+        let svc = GraphService::new();
+        GraphService::test_reset_invariant_runs();
+        svc.test_mark_dirty(InvariantFamilies::STATEMENTS);
+        let res = svc.validate_targeted_invariants(Vec::new(), true, true);
+        assert!(res.is_ok());
+        assert_eq!(GraphService::test_invariant_runs(), 1);
+        assert_eq!(
+            InvariantFamilies::from_bits_truncate(
+                svc.validation_state.dirty.load(Ordering::Relaxed)
+            ),
+            InvariantFamilies::empty()
+        );
     }
 }
