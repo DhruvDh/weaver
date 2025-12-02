@@ -1,6 +1,7 @@
 use std::{
     convert::Infallible,
     fs,
+    io::{IsTerminal, stderr},
     path::{Component, Path, PathBuf},
     process::Command,
     sync::Arc,
@@ -13,6 +14,11 @@ use futures::future::{BoxFuture, join_all};
 use kameo::{error::SendError, prelude::*};
 use kameo_actors::scheduler::{Scheduler, SetInterval};
 use kameo_persistence::PersistentActor;
+use tokio::{
+    sync::mpsc,
+    task::JoinHandle,
+    time::{sleep, timeout},
+};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 use url::Url;
@@ -38,6 +44,7 @@ use crate::{
         GatewayMetrics, GetGatewayMetrics, LLMGateway, LLMGatewayState, PersistGatewaySnapshot,
     },
     rerun_sink::{RerunSink, RerunTarget},
+    ui::{BackendEvent, UiAction},
 };
 
 fn log_scalar(rerun: &Option<ActorRef<RerunSink>>, path: impl Into<String>, value: f64) {
@@ -410,6 +417,36 @@ pub struct AppHandles {
 }
 
 pub type AppHook = Arc<dyn Fn(AppHandles) -> BoxFuture<'static, Result<()>> + Send + Sync>;
+
+struct EventLogWriter {
+    tx:              mpsc::UnboundedSender<BackendEvent>,
+    also_stderr:     bool,
+    stderr_fallback: std::io::Stderr,
+}
+
+impl std::io::Write for EventLogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Ok(text) = std::str::from_utf8(buf) {
+            for line in text.split('\n') {
+                if !line.trim().is_empty() {
+                    let _ = self.tx.send(BackendEvent::Log(line.trim_end().to_string()));
+                    if self.also_stderr {
+                        let _ = writeln!(self.stderr_fallback, "{line}");
+                    }
+                }
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.also_stderr {
+            self.stderr_fallback.flush()
+        } else {
+            Ok(())
+        }
+    }
+}
 
 fn git_head_hash() -> Option<String> {
     Command::new("git")
@@ -932,14 +969,98 @@ async fn spawn_gateway(
     }
 }
 
+async fn stream_reply_chunks(tx: mpsc::UnboundedSender<BackendEvent>, content: String) {
+    if content.trim().is_empty() {
+        let _ = tx.send(BackendEvent::RequestComplete);
+        return;
+    }
+
+    for chunk in content.split_inclusive(|c: char| c.is_whitespace()) {
+        let _ = tx.send(BackendEvent::TokenChunk(chunk.to_string()));
+        sleep(Duration::from_millis(18)).await;
+    }
+    let _ = tx.send(BackendEvent::RequestComplete);
+}
+
+async fn interactive_backend(
+    reader: ActorRef<FileReader>,
+    mut action_rx: mpsc::UnboundedReceiver<UiAction>,
+    event_tx: mpsc::UnboundedSender<BackendEvent>,
+) {
+    let mut inflight: Option<JoinHandle<()>> = None;
+
+    while let Some(action) = action_rx.recv().await {
+        match action {
+            UiAction::SendMessage(prompt) => {
+                if let Some(handle) = inflight.take() {
+                    handle.abort();
+                }
+                let reader = reader.clone();
+                let tx = event_tx.clone();
+                let handle = tokio::spawn(async move {
+                    let result =
+                        timeout(Duration::from_secs(60), reader.ask(FileReaderQuery { prompt }))
+                            .await;
+                    match result {
+                        Ok(Ok(content)) => stream_reply_chunks(tx, content).await,
+                        Ok(Err(err)) => {
+                            let _ = tx.send(BackendEvent::Error(err.to_string()));
+                        }
+                        Err(_) => {
+                            let _ = tx.send(BackendEvent::Error(
+                                "Request timed out after 60s; try again or simplify.".into(),
+                            ));
+                        }
+                    }
+                });
+                inflight = Some(handle);
+            }
+            UiAction::CancelRequest => {
+                if let Some(handle) = inflight.take() {
+                    handle.abort();
+                }
+            }
+            UiAction::Exit => {
+                if let Some(handle) = inflight.take() {
+                    handle.abort();
+                }
+                break;
+            }
+        }
+    }
+
+    if let Some(handle) = inflight {
+        handle.abort();
+    }
+}
+
 pub async fn run_app(cli: Cli, runtime: RuntimeOptions) -> Result<()> {
     if cli.graph_autosave_secs == 0 {
         anyhow::bail!("--graph-autosave-secs must be at least 1 second");
     }
+    let interactive_tui = cli.interactive && std::io::stdout().is_terminal();
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    if let Err(err) = tracing_subscriber::fmt()
+    let log_tui_to_stderr = std::env::var("WEAVER_TUI_LOG_STDERR").is_ok();
+    let (action_tx, action_rx) = mpsc::unbounded_channel();
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let event_tx_for_logs = event_tx.clone();
+
+    if interactive_tui {
+        let _ = tracing_subscriber::fmt()
+            .with_timer(tracing_subscriber::fmt::time::ChronoLocal::new(
+                "%Y-%m-%d %H:%M:%S%.3f".into(),
+            ))
+            .with_env_filter(filter.clone())
+            .with_writer(move || EventLogWriter {
+                tx:              event_tx_for_logs.clone(),
+                also_stderr:     log_tui_to_stderr,
+                stderr_fallback: stderr(),
+            })
+            .try_init();
+    } else if let Err(err) = tracing_subscriber::fmt()
         .with_timer(tracing_subscriber::fmt::time::ChronoLocal::new("%Y-%m-%d %H:%M:%S%.3f".into()))
         .with_env_filter(filter)
+        .with_writer(stderr)
         .try_init()
     {
         debug!(error = %err, "tracing subscriber already initialized; continuing");
@@ -1193,14 +1314,16 @@ pub async fn run_app(cli: Cli, runtime: RuntimeOptions) -> Result<()> {
         .await?;
     }
 
-    if !cli.skip_demo {
-        let actor = match FileReader::from_env(
+    let interactive_ui = interactive_tui;
+    if interactive_ui {
+        let actor = match FileReader::from_env_with_limit(
             cli.workspace.clone(),
             gateway.clone(),
             Arc::clone(&metrics),
             graph_actor.clone(),
             dedup_agent.clone(),
             rerun_actor.clone(),
+            0,
             resolved_commit.clone(),
         ) {
             Ok(actor) => actor,
@@ -1225,27 +1348,36 @@ pub async fn run_app(cli: Cli, runtime: RuntimeOptions) -> Result<()> {
         );
 
         let reader = FileReader::spawn(actor);
+        let backend = tokio::spawn(interactive_backend(reader, action_rx, event_tx.clone()));
 
-        let prompt = "Summarize the key goals of the UNCC CS2 PreTeXt project. Highlight any \
-                      modules in the `source/` tree that look important. Please do make effective \
-                      use of the `delegate_tasks` tools for all tasks, in parallel if possible.";
-        debug!(prompt, "Dispatching FileReaderQuery with LLM tool access");
+        let ui_result = {
+            let terminal = ratatui::init();
+            let mut terminal = terminal;
+            terminal.clear()?;
+            let result = crate::ui::tui::run(terminal, action_tx.clone(), event_rx, None).await;
+            ratatui::restore();
+            result
+        };
 
-        match reader
-            .ask(FileReaderQuery {
-                prompt: prompt.to_string(),
-            })
-            .await
-        {
-            Ok(content) => {
-                println!("{content}");
-            }
-            Err(err) => {
-                eprintln!("FileReader query failed: {err}");
-            }
+        let _ = action_tx.send(UiAction::Exit);
+        if let Err(err) = backend.await {
+            warn!(error = %err, "interactive backend task failed");
         }
-    } else {
-        info!("FileReader demo skipped by flag");
+
+        ui_result?;
+    } else if cli.interactive && !cli.skip_demo {
+        // Preserve legacy behavior: interactive without a TTY still validates
+        // the FileReader configuration so missing OPENAI_MODEL fails fast.
+        FileReader::from_env(
+            cli.workspace.clone(),
+            gateway.clone(),
+            Arc::clone(&metrics),
+            graph_actor.clone(),
+            dedup_agent.clone(),
+            rerun_actor.clone(),
+            resolved_commit.clone(),
+        )?;
+        info!("Interactive mode requested but stdout is not a TTY; skipping TUI session");
     }
 
     metrics.log_summary();

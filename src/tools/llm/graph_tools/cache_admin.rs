@@ -18,7 +18,7 @@ const CLEAR_CACHE: &str = "graph_analysis_cache_clear";
 
 #[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct ClearCacheArgs;
+struct ClearCacheArgs {}
 
 pub(super) fn tool_prototypes() -> Vec<ToolPrototype> {
     vec![clear_cache_meta()]
