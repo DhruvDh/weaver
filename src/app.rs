@@ -30,7 +30,7 @@ use url::Url;
 use crate::{
     agents::deduplication::{DeduplicationAgent, RunDeduplication},
     constants::PRETEXT_SUBDIR,
-    file_reader::{FileReader, FileReaderQuery},
+    file_reader::{AgentMode, AnalystReader, FileReader, FileReaderQuery, ModeSpec, Reader},
     graph::{
         CurriculumGraph, GraphConfig,
         audit::{FanoutMutationSink, RerunMutationSink},
@@ -371,6 +371,8 @@ pub struct Cli {
     pub dedup_auto_merge_threshold:  f64,
     pub skip_dedup_on_insert:        bool,
     pub interactive:                 bool,
+    pub interactive_writable:        bool,
+    pub analyst:                     bool,
     pub harvest_timeout_hours:       Option<f64>,
     pub weave_timeout_hours:         Option<f64>,
     pub max_concurrent_chapters:     usize,
@@ -527,10 +529,19 @@ pub fn cli() -> OptionParser<Cli> {
         .help("Skip insert-time duplicate checks (useful for bulk imports)")
         .switch();
     let skip_demo = long("skip-demo")
-        .help("Skip the startup FileReader demo (useful for tests or headless runs)")
+        .help("Skip startup interactive initialization (useful for tests or headless runs)")
         .switch();
     let interactive = long("interactive")
-        .help("Run the legacy interactive FileReader demo instead of two-phase automation")
+        .help("Launch the interactive TUI (read-only analyst mode by default)")
+        .switch();
+    let interactive_writable = long("interactive-writable")
+        .help(
+            "Enable writable interactive mode instead of the read-only analyst (use with \
+             --interactive)",
+        )
+        .switch();
+    let analyst = long("analyst")
+        .help("Shortcut to launch the interactive analyst TUI (same as --interactive)")
         .switch();
     let harvest_timeout_hours = long("harvest-timeout-hours")
         .help("Two-phase: maximum hours to spend harvesting before proceeding to weaving")
@@ -572,6 +583,8 @@ pub fn cli() -> OptionParser<Cli> {
             dedup_auto_merge_threshold,
             skip_dedup_on_insert,
             interactive,
+            interactive_writable,
+            analyst,
             harvest_timeout_hours,
             weave_timeout_hours,
             max_concurrent_chapters,
@@ -581,6 +594,27 @@ pub fn cli() -> OptionParser<Cli> {
         }
     }
     .to_options()
+}
+
+pub fn interactive_session_mode(cli: &Cli) -> Option<AgentMode> {
+    if !(cli.interactive || cli.analyst) {
+        return None;
+    }
+
+    if cli.interactive_writable {
+        Some(AgentMode::Interactive)
+    } else {
+        Some(AgentMode::Analyst)
+    }
+}
+
+fn mode_label(mode: AgentMode) -> &'static str {
+    match mode {
+        AgentMode::Analyst => "Analyst",
+        AgentMode::Interactive => "FileReader",
+        AgentMode::Harvester => "Harvester",
+        AgentMode::Weaver => "Weaver",
+    }
 }
 
 async fn persist_once(
@@ -722,8 +756,8 @@ async fn stream_reply_chunks(tx: mpsc::UnboundedSender<BackendEvent>, content: S
     let _ = tx.send(BackendEvent::RequestComplete);
 }
 
-async fn interactive_backend(
-    reader: ActorRef<FileReader>,
+async fn interactive_backend<M: ModeSpec>(
+    reader: ActorRef<Reader<M>>,
     mut action_rx: mpsc::UnboundedReceiver<UiAction>,
     event_tx: mpsc::UnboundedSender<BackendEvent>,
 ) {
@@ -778,7 +812,9 @@ pub async fn run_app(cli: Cli, runtime: RuntimeOptions) -> Result<()> {
     if cli.graph_autosave_secs == 0 {
         bail!("--graph-autosave-secs must be at least 1 second");
     }
-    let interactive_tui = cli.interactive && std::io::stdout().is_terminal();
+    let session_mode = interactive_session_mode(&cli);
+    let interactive_requested = session_mode.is_some();
+    let interactive_tui = interactive_requested && std::io::stdout().is_terminal();
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let log_tui_to_stderr = std::env::var("WEAVER_TUI_LOG_STDERR").is_ok();
     let (action_tx, action_rx) = mpsc::unbounded_channel();
@@ -1090,70 +1126,157 @@ pub async fn run_app(cli: Cli, runtime: RuntimeOptions) -> Result<()> {
         .await?;
     }
 
-    let interactive_ui = interactive_tui;
-    if interactive_ui {
-        let actor = match FileReader::from_env_with_limit(
-            cli.workspace.clone(),
-            gateway.clone(),
-            Arc::clone(&metrics),
-            graph_actor.clone(),
-            dedup_agent.clone(),
-            rerun_actor.clone(),
-            0,
-            resolved_commit.clone(),
-        ) {
-            Ok(actor) => actor,
-            Err(err) => {
-                error!(
-                    error = %err,
-                    "Failed to initialize FileReader; set OPENAI_MODEL to enable LLM tools"
+    if interactive_tui {
+        match session_mode.expect("interactive mode should exist when TUI is active") {
+            AgentMode::Analyst => {
+                let actor = match AnalystReader::from_env_with_limit(
+                    cli.workspace.clone(),
+                    gateway.clone(),
+                    Arc::clone(&metrics),
+                    graph_actor.clone(),
+                    dedup_agent.clone(),
+                    rerun_actor.clone(),
+                    0,
+                    resolved_commit.clone(),
+                ) {
+                    Ok(actor) => actor,
+                    Err(err) => {
+                        error!(
+                            error = %err,
+                            "Failed to initialize Analyst; set OPENAI_MODEL to enable LLM tools"
+                        );
+                        return Err(err);
+                    }
+                };
+
+                let tool_names = AnalystReader::tool_identifiers().map_err(|err| {
+                    error!(error = %err, "Failed to build LLM tool registry");
+                    err
+                })?;
+
+                debug!(
+                    mode = mode_label(AgentMode::Analyst),
+                    workspace = %actor.workspace_root().display(),
+                    tools = ?tool_names,
+                    "Initialized interactive analyst with LLM tool bridge for the PreTeXt project"
                 );
-                return Err(err);
+
+                let reader = AnalystReader::spawn(actor);
+                let backend =
+                    tokio::spawn(interactive_backend(reader, action_rx, event_tx.clone()));
+
+                let ui_result = {
+                    let terminal = ratatui::init();
+                    let mut terminal = terminal;
+                    terminal.clear()?;
+                    let result =
+                        crate::ui::tui::run(terminal, action_tx.clone(), event_rx, None).await;
+                    ratatui::restore();
+                    result
+                };
+
+                let _ = action_tx.send(UiAction::Exit);
+                if let Err(err) = backend.await {
+                    warn!(error = %err, "interactive analyst backend task failed");
+                }
+
+                ui_result?;
             }
-        };
+            AgentMode::Interactive => {
+                let actor = match FileReader::from_env_with_limit(
+                    cli.workspace.clone(),
+                    gateway.clone(),
+                    Arc::clone(&metrics),
+                    graph_actor.clone(),
+                    dedup_agent.clone(),
+                    rerun_actor.clone(),
+                    0,
+                    resolved_commit.clone(),
+                ) {
+                    Ok(actor) => actor,
+                    Err(err) => {
+                        error!(
+                            error = %err,
+                            "Failed to initialize writable interactive reader; set OPENAI_MODEL to \
+                             enable LLM tools"
+                        );
+                        return Err(err);
+                    }
+                };
 
-        let tool_names = FileReader::tool_identifiers().map_err(|err| {
-            error!(error = %err, "Failed to build LLM tool registry");
-            err
-        })?;
+                let tool_names = FileReader::tool_identifiers().map_err(|err| {
+                    error!(error = %err, "Failed to build LLM tool registry");
+                    err
+                })?;
 
-        debug!(
-            workspace = %actor.workspace_root().display(),
-            tools = ?tool_names,
-            "Initialized FileReader with LLM tool bridge for the PreTeXt project"
-        );
+                debug!(
+                    mode = mode_label(AgentMode::Interactive),
+                    workspace = %actor.workspace_root().display(),
+                    tools = ?tool_names,
+                    "Initialized interactive reader with LLM tool bridge for the PreTeXt project"
+                );
 
-        let reader = FileReader::spawn(actor);
-        let backend = tokio::spawn(interactive_backend(reader, action_rx, event_tx.clone()));
+                let reader = FileReader::spawn(actor);
+                let backend =
+                    tokio::spawn(interactive_backend(reader, action_rx, event_tx.clone()));
 
-        let ui_result = {
-            let terminal = ratatui::init();
-            let mut terminal = terminal;
-            terminal.clear()?;
-            let result = crate::ui::tui::run(terminal, action_tx.clone(), event_rx, None).await;
-            ratatui::restore();
-            result
-        };
+                let ui_result = {
+                    let terminal = ratatui::init();
+                    let mut terminal = terminal;
+                    terminal.clear()?;
+                    let result =
+                        crate::ui::tui::run(terminal, action_tx.clone(), event_rx, None).await;
+                    ratatui::restore();
+                    result
+                };
 
-        let _ = action_tx.send(UiAction::Exit);
-        if let Err(err) = backend.await {
-            warn!(error = %err, "interactive backend task failed");
+                let _ = action_tx.send(UiAction::Exit);
+                if let Err(err) = backend.await {
+                    warn!(error = %err, "interactive backend task failed");
+                }
+
+                ui_result?;
+            }
+            _ => unreachable!("only analyst or interactive modes are valid for the TUI"),
         }
-
-        ui_result?;
-    } else if cli.interactive && !cli.skip_demo {
-        // Preserve legacy behavior: interactive without a TTY still validates
-        // the FileReader configuration so missing OPENAI_MODEL fails fast.
-        FileReader::from_env(
-            cli.workspace.clone(),
-            gateway.clone(),
-            Arc::clone(&metrics),
-            graph_actor.clone(),
-            dedup_agent.clone(),
-            rerun_actor.clone(),
-            resolved_commit.clone(),
-        )?;
-        info!("Interactive mode requested but stdout is not a TTY; skipping TUI session");
+    } else if interactive_requested && !cli.skip_demo {
+        // Preserve validation behavior: interactive without a TTY still validates
+        // the configuration so missing OPENAI_MODEL fails fast.
+        match session_mode {
+            Some(AgentMode::Analyst) => {
+                AnalystReader::from_env(
+                    cli.workspace.clone(),
+                    gateway.clone(),
+                    Arc::clone(&metrics),
+                    graph_actor.clone(),
+                    dedup_agent.clone(),
+                    rerun_actor.clone(),
+                    resolved_commit.clone(),
+                )?;
+                info!(
+                    mode = mode_label(AgentMode::Analyst),
+                    "Interactive analyst mode requested but stdout is not a TTY; skipping TUI \
+                     session"
+                );
+            }
+            Some(AgentMode::Interactive) => {
+                FileReader::from_env(
+                    cli.workspace.clone(),
+                    gateway.clone(),
+                    Arc::clone(&metrics),
+                    graph_actor.clone(),
+                    dedup_agent.clone(),
+                    rerun_actor.clone(),
+                    resolved_commit.clone(),
+                )?;
+                info!(
+                    mode = mode_label(AgentMode::Interactive),
+                    "Writable interactive mode requested but stdout is not a TTY; skipping TUI \
+                     session"
+                );
+            }
+            _ => {}
+        }
     }
 
     metrics.log_summary();

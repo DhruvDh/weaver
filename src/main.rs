@@ -6,12 +6,14 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use glob::glob;
 use pathdiff::diff_paths;
-use weaver::app::{Cli, RuntimeOptions, cli, run_app, run_two_phase_construction};
+use weaver::app::{
+    Cli, RuntimeOptions, cli, interactive_session_mode, run_app, run_two_phase_construction,
+};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let args = cli().run();
-    if !args.interactive {
+    if interactive_session_mode(&args).is_none() {
         let workspace_abs = args
             .workspace
             .canonicalize()

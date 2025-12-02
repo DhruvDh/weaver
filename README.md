@@ -531,6 +531,62 @@ tail -f logs/weaver.log | rg "WARN|ERROR|harvesting|weaving"
 tail -f logs/weaver.log | rg "grace|cancel|timeout"
 ```
 
+### Analyst Mode (Post-Processing)
+
+After harvesting and weaving, use **Analyst Mode** for interactive analysis (read-only by default):
+
+```bash
+cargo run --release -- uncc_cs2-pretext-project --interactive
+# alias: cargo run --release -- uncc_cs2-pretext-project --analyst
+# opt-in to writable tools: cargo run --release -- uncc_cs2-pretext-project --interactive --interactive-writable
+```
+
+The Analyst has **read-only access** to powerful analysis tools:
+
+```mermaid
+flowchart TB
+    subgraph Analyst["🔬 Analyst Mode"]
+        direction TB
+        
+        subgraph Structure["Structural Analysis"]
+            S1["graph_first_principles()"]
+            S2["graph_dag_check()"]
+            S3["graph_keystone()"]
+        end
+        
+        subgraph LO["Learning Outcome Analysis"]
+            L1["graph_lo_alignment_summary()"]
+            L2["graph_lo_coverage()"]
+            L3["graph_lo_missing_criteria_view()"]
+        end
+        
+        subgraph Gaps["Gap Analysis"]
+            G1["graph_gap_summary()"]
+            G2["graph_example_gaps_view()"]
+            G3["graph_fadeability_view()"]
+            G4["graph_practice_gaps_view()"]
+        end
+        
+        subgraph Discourse["Discourse Analysis"]
+            D1["graph_borrow_ahead()"]
+            D2["graph_discourse_orphans()"]
+        end
+    end
+    
+    style Analyst fill:#f3e5f5
+```
+
+**Example Analysis Questions:**
+
+| Question | Tool to Use |
+|----------|-------------|
+| "What concepts are foundational?" | `graph_first_principles_summary()` |
+| "Are there any cycles?" | `graph_dag_check()` |
+| "Which LOs lack assessments?" | `graph_lo_missing_criteria_view()` |
+| "What examples are missing?" | `graph_example_gaps_view()` |
+| "What are the keystone concepts?" | `graph_keystone()` |
+| "Are concepts used before taught?" | `graph_borrow_ahead()` |
+
 ---
 
 ## 📈 Expected Output
@@ -577,6 +633,15 @@ Using the actor model for LLM coordination provides:
 
 ### 5. Deduplication Barrier
 A synchronization point that ensures graph consistency before edge creation, preventing duplicate edges and missed connections.
+
+### 6. Read-Only Analyst Mode
+Launch with `--interactive` (or `--analyst`) to open the TUI in read-only mode; add
+`--interactive-writable` only when you explicitly want the legacy writable FileReader tools.
+A dedicated analysis agent with **26 inspection tools** for validating curriculum structure:
+- Structural analysis (DAG check, keystones, first principles)
+- Learning outcome alignment (coverage, reachability, criteria gaps)
+- Quality gaps (examples, fadeability, practice assessments)
+- Discourse coherence (borrow-ahead, orphaned steps)
 
 ---
 

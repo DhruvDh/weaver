@@ -145,37 +145,41 @@ struct WeaveGateClosed;
 
 #[derive(Actor)]
 pub struct TwoPhaseOrchestrator {
-    ctx:          Option<PhaseCtx>,
-    chapter:      Option<PathBuf>,
-    chapter_tag:  Option<String>,
-    phase:        PhaseStage,
-    harvest:      PhaseState<HarvestNiche>,
-    weave:        PhaseState<WeaveNiche>,
-    tagged_count: usize,
-    harvest_only: bool,
-    stop_reason:  Option<StopReason>,
-    cancellation: Option<CancellationToken>,
-    harvest_done: Option<oneshot::Sender<HarvestReport>>,
-    weave_gate:   Option<oneshot::Receiver<()>>,
-    completion:   Option<oneshot::Sender<Result<TwoPhaseSummary>>>,
+    ctx:            Option<PhaseCtx>,
+    chapter:        Option<PathBuf>,
+    chapter_tag:    Option<String>,
+    phase:          PhaseStage,
+    harvest:        PhaseState<HarvestNiche>,
+    weave:          PhaseState<WeaveNiche>,
+    tagged_count:   usize,
+    harvest_only:   bool,
+    stop_reason:    Option<StopReason>,
+    cancellation:   Option<CancellationToken>,
+    harvest_cancel: Option<CancellationToken>,
+    weave_cancel:   Option<CancellationToken>,
+    harvest_done:   Option<oneshot::Sender<HarvestReport>>,
+    weave_gate:     Option<oneshot::Receiver<()>>,
+    completion:     Option<oneshot::Sender<Result<TwoPhaseSummary>>>,
 }
 
 impl TwoPhaseOrchestrator {
     pub fn new() -> Self {
         Self {
-            ctx:          None,
-            chapter:      None,
-            chapter_tag:  None,
-            phase:        PhaseStage::Idle,
-            harvest:      PhaseState::new(ALL_HARVEST_NICHES),
-            weave:        PhaseState::new(ALL_WEAVE_NICHES),
-            tagged_count: 0,
-            harvest_only: false,
-            stop_reason:  None,
-            cancellation: None,
-            harvest_done: None,
-            weave_gate:   None,
-            completion:   None,
+            ctx:            None,
+            chapter:        None,
+            chapter_tag:    None,
+            phase:          PhaseStage::Idle,
+            harvest:        PhaseState::new(ALL_HARVEST_NICHES),
+            weave:          PhaseState::new(ALL_WEAVE_NICHES),
+            tagged_count:   0,
+            harvest_only:   false,
+            stop_reason:    None,
+            cancellation:   None,
+            harvest_cancel: None,
+            weave_cancel:   None,
+            harvest_done:   None,
+            weave_gate:     None,
+            completion:     None,
         }
     }
 
@@ -187,6 +191,8 @@ impl TwoPhaseOrchestrator {
         self.harvest.reset(ALL_HARVEST_NICHES);
         self.weave.reset(ALL_WEAVE_NICHES);
         self.completion = None;
+        self.harvest_cancel = None;
+        self.weave_cancel = None;
     }
 
     fn cancellation(&self) -> CancellationToken {
@@ -194,6 +200,20 @@ impl TwoPhaseOrchestrator {
             .as_ref()
             .cloned()
             .unwrap_or_else(CancellationToken::new)
+    }
+
+    fn harvest_cancellation(&self) -> CancellationToken {
+        self.harvest_cancel
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| self.cancellation().child_token())
+    }
+
+    fn weave_cancellation(&self) -> CancellationToken {
+        self.weave_cancel
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| self.cancellation().child_token())
     }
 
     fn cancel_timeout(handle: &mut Option<JoinHandle<()>>) {
@@ -289,7 +309,7 @@ impl TwoPhaseOrchestrator {
             status.status = NicheStatus::InProgress;
         }
 
-        let cancellation = self.cancellation().child_token();
+        let cancellation = self.harvest_cancellation().child_token();
         let reader_actor = match HarvesterReader::from_env_with_limit_and_cancellation(
             phase_ctx.workspace_root.clone(),
             phase_ctx.gateway.clone(),
@@ -347,7 +367,7 @@ impl TwoPhaseOrchestrator {
             status.status = NicheStatus::InProgress;
         }
 
-        let cancellation = self.cancellation().child_token();
+        let cancellation = self.weave_cancellation().child_token();
         let reader_actor = match WeaverReader::from_env_with_limit_and_cancellation(
             phase_ctx.workspace_root.clone(),
             phase_ctx.gateway.clone(),
@@ -572,7 +592,7 @@ impl TwoPhaseOrchestrator {
         if matches!(self.phase, PhaseStage::Harvesting) {
             self.harvest.timed_out = true;
             warn!("Harvest phase timed out; stopping new harvest tasks");
-            if let Some(token) = &self.cancellation {
+            if let Some(token) = &self.harvest_cancel {
                 token.cancel();
             }
             Self::cancel_timeout(&mut self.harvest.timer);
@@ -588,7 +608,7 @@ impl TwoPhaseOrchestrator {
         if matches!(self.phase, PhaseStage::Weaving | PhaseStage::WaitingForWeave) {
             self.weave.timed_out = true;
             warn!("Weave phase timed out; stopping new weave tasks");
-            if let Some(token) = &self.cancellation {
+            if let Some(token) = &self.weave_cancel {
                 token.cancel();
             }
             Self::cancel_timeout(&mut self.weave.timer);
@@ -652,6 +672,10 @@ impl Message<StartTwoPhase> for TwoPhaseOrchestrator {
         self.harvest_done = harvest_done;
         self.weave_gate = weave_gate;
         self.reset_state();
+        let root_cancel = self.cancellation();
+        self.cancellation = Some(root_cancel.clone());
+        self.harvest_cancel = Some(root_cancel.child_token());
+        self.weave_cancel = Some(root_cancel.child_token());
         let (tx, rx) = oneshot::channel();
         self.completion = Some(tx);
 
@@ -842,7 +866,7 @@ impl Message<HarvestGraceExpired> for TwoPhaseOrchestrator {
     ) -> Self::Reply {
         if matches!(self.phase, PhaseStage::Harvesting) && self.harvest.timed_out {
             warn!("Harvest grace period expired; cancelling remaining harvest tasks");
-            if let Some(token) = &self.cancellation {
+            if let Some(token) = &self.harvest_cancel {
                 token.cancel();
             }
             Self::mark_cancelled(&mut self.harvest.statuses, self.harvest.inflight.keys().copied());
@@ -867,7 +891,7 @@ impl Message<WeaveGraceExpired> for TwoPhaseOrchestrator {
     ) -> Self::Reply {
         if matches!(self.phase, PhaseStage::Weaving) && self.weave.timed_out {
             warn!("Weave grace period expired; cancelling remaining weave tasks");
-            if let Some(token) = &self.cancellation {
+            if let Some(token) = &self.weave_cancel {
                 token.cancel();
             }
             Self::mark_cancelled(&mut self.weave.statuses, self.weave.inflight.keys().copied());

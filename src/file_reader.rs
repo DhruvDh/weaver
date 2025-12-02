@@ -37,6 +37,8 @@ pub enum AgentMode {
     /// use).
     #[default]
     Interactive,
+    /// Analysis mode: read-only graph inspection and analysis tools.
+    Analyst,
 }
 
 /// Optional specialization for harvester actors.
@@ -64,6 +66,7 @@ pub enum ToolHost {
     Interactive(ActorRef<Reader<InteractiveSpec>>),
     Harvester(ActorRef<Reader<HarvesterSpec>>),
     Weaver(ActorRef<Reader<WeaverSpec>>),
+    Analyst(ActorRef<Reader<AnalystSpec>>),
 }
 
 impl ToolHost {
@@ -72,6 +75,7 @@ impl ToolHost {
             ToolHost::Interactive(_) => AgentMode::Interactive,
             ToolHost::Harvester(_) => AgentMode::Harvester,
             ToolHost::Weaver(_) => AgentMode::Weaver,
+            ToolHost::Analyst(_) => AgentMode::Analyst,
         }
     }
 
@@ -87,6 +91,7 @@ impl ToolHost {
             ToolHost::Interactive(actor) => actor.ask(msg).await,
             ToolHost::Harvester(actor) => actor.ask(msg).await,
             ToolHost::Weaver(actor) => actor.ask(msg).await,
+            ToolHost::Analyst(actor) => actor.ask(msg).await,
         }
     }
 }
@@ -102,6 +107,7 @@ pub trait ModeSpec: Send + Sync + 'static {
 pub struct HarvesterSpec;
 pub struct WeaverSpec;
 pub struct InteractiveSpec;
+pub struct AnalystSpec;
 
 impl ModeSpec for HarvesterSpec {
     const MODE: AgentMode = AgentMode::Harvester;
@@ -127,6 +133,15 @@ impl ModeSpec for InteractiveSpec {
 
     fn wrap_tool_host(actor: ActorRef<Reader<Self>>) -> ToolHost {
         ToolHost::Interactive(actor)
+    }
+}
+
+impl ModeSpec for AnalystSpec {
+    const MODE: AgentMode = AgentMode::Analyst;
+    const SUFFIX: &'static str = "/Analyst";
+
+    fn wrap_tool_host(actor: ActorRef<Reader<Self>>) -> ToolHost {
+        ToolHost::Analyst(actor)
     }
 }
 
@@ -380,6 +395,7 @@ pub type FileReader = Reader<InteractiveSpec>;
 pub type InteractiveReader = Reader<InteractiveSpec>;
 pub type HarvesterReader = Reader<HarvesterSpec>;
 pub type WeaverReader = Reader<WeaverSpec>;
+pub type AnalystReader = Reader<AnalystSpec>;
 
 pub fn tool_identifiers_for_mode(mode: AgentMode) -> Result<Vec<&'static str>> {
     let all_tools = llm::all_tools()?;
@@ -436,6 +452,47 @@ pub fn tool_identifiers_for_mode(mode: AgentMode) -> Result<Vec<&'static str>> {
                 "read_file_full",
                 "read_file_range",
                 "search_text",
+            ];
+            all_tools
+                .iter()
+                .filter(|meta| allowed.contains(&meta.id))
+                .map(|meta| meta.id)
+                .collect()
+        }
+        AgentMode::Analyst => {
+            // Read-only graph inspection and analysis tools
+            let allowed = [
+                // Graph inspection (read-only)
+                "graph_get_node",
+                "graph_neighbors",
+                "graph_list_nodes_by_tag",
+                "graph_list_nodes_by_kind",
+                "graph_list_tags",
+                "graph_search_nodes",
+                "graph_course_commit",
+                // Structural analysis
+                "graph_first_principles",
+                "graph_first_principles_summary",
+                "graph_dag_check",
+                "graph_keystone",
+                "graph_redundant_requires",
+                // Learning outcome analysis
+                "graph_lo_reachability",
+                "graph_lo_coverage",
+                "graph_lo_alignment_summary",
+                "graph_lo_assessments_view",
+                "graph_lo_missing_criteria_view",
+                "graph_lo_anchors_view",
+                // Gap analysis
+                "graph_gap_summary",
+                "graph_example_gaps_view",
+                "graph_fadeability_view",
+                "graph_practice_gaps_view",
+                "graph_assessment_gaps",
+                "graph_extraneous",
+                // Discourse analysis
+                "graph_borrow_ahead",
+                "graph_discourse_orphans",
             ];
             all_tools
                 .iter()
@@ -556,6 +613,16 @@ pub(crate) async fn run_delegate_batch_with_state(
                                     .ask(FileReaderQuery { prompt })
                                     .await
                             }
+                            AgentMode::Analyst => {
+                                let child = Reader::<AnalystSpec>::new(
+                                    deps.clone(),
+                                    depth + 1,
+                                    max_subdelegations,
+                                );
+                                Reader::<AnalystSpec>::spawn(child)
+                                    .ask(FileReaderQuery { prompt })
+                                    .await
+                            }
                         };
                         match result {
                             Ok(content) => {
@@ -609,7 +676,7 @@ impl<M: ModeSpec> Message<FileReaderQuery> for Reader<M> {
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         if self.cancellation_token.is_cancelled() {
-            return ctx.spawn(async { Err(anyhow!("FileReader cancelled")) });
+            return ctx.spawn(async { Err(anyhow!("Interactive session cancelled")) });
         }
         let tool_host = M::wrap_tool_host(ctx.actor_ref().clone());
         let gateway = self.gateway.clone();
@@ -622,7 +689,8 @@ impl<M: ModeSpec> Message<FileReaderQuery> for Reader<M> {
         let cancel_reason = self.cancel_reason.clone();
 
         ctx.spawn(async move {
-            let cancel_msg = cancel_reason.unwrap_or_else(|| "FileReader cancelled".to_string());
+            let cancel_msg =
+                cancel_reason.unwrap_or_else(|| "Interactive session cancelled".to_string());
             if cancellation.is_cancelled() {
                 return Err(anyhow!(cancel_msg.clone()));
             }
@@ -691,7 +759,7 @@ impl<M: ModeSpec> Message<ExecuteTool> for Reader<M> {
             let reason = self
                 .cancel_reason
                 .clone()
-                .unwrap_or_else(|| "FileReader cancelled".to_string());
+                .unwrap_or_else(|| "Interactive session cancelled".to_string());
             return Err(llm::ToolExecutionError::Internal(anyhow!(reason)));
         }
         let meta = match llm::lookup_tool(&identifier)

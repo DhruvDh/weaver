@@ -30,6 +30,8 @@ fn test_cli() -> Cli {
         dedup_auto_merge_threshold:  0.95,
         skip_dedup_on_insert:        true,
         interactive:                 false,
+        interactive_writable:        false,
+        analyst:                     false,
         harvest_timeout_hours:       None,
         weave_timeout_hours:         None,
         max_concurrent_chapters:     2,

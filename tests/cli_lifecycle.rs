@@ -77,6 +77,8 @@ fn base_cli(root: &Path, snapshot: &Path, commit: &str, autosave_secs: u64) -> C
         dedup_auto_merge_threshold:  0.95,
         skip_dedup_on_insert:        false,
         interactive:                 true,
+        interactive_writable:        false,
+        analyst:                     false,
         harvest_timeout_hours:       None,
         weave_timeout_hours:         None,
         max_concurrent_chapters:     4,
