@@ -7,11 +7,17 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum KnowledgeType {
+    #[serde(alias = "Factual")]
     Factual,
+    #[serde(alias = "Conceptual")]
     Conceptual,
+    #[serde(alias = "Procedural")]
     Procedural,
+    #[serde(alias = "Metacognitive")]
     Metacognitive,
+    #[serde(alias = "LearningOutcome")]
     LearningOutcome,
+    #[serde(alias = "AssessmentItem")]
     AssessmentItem,
 }
 
@@ -67,35 +73,50 @@ impl FromStr for KnowledgeType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Strength {
+    #[serde(alias = "Necessary")]
     Necessary,
+    #[serde(alias = "Strong")]
     Strong,
+    #[serde(alias = "Helpful")]
     Helpful,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SupportKind {
+    #[serde(alias = "WorkedExample", alias = "Worked_Example")]
     WorkedExample,
+    #[serde(alias = "Analogy")]
     Analogy,
+    #[serde(alias = "Counterexample", alias = "CounterExample")]
     Counterexample,
+    #[serde(alias = "MisconceptionFix", alias = "Misconception_Fix")]
     MisconceptionFix,
+    #[serde(alias = "StrategyHint", alias = "Strategy_Hint")]
     StrategyHint,
+    #[serde(alias = "RubricNote", alias = "Rubric_Note")]
     RubricNote,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum IntendedEffect {
+    #[serde(alias = "ReduceExtraneousLoad", alias = "Reduce_Extraneous_Load")]
     ReduceExtraneousLoad,
+    #[serde(alias = "IncreaseGermaneLoad", alias = "Increase_Germane_Load")]
     IncreaseGermaneLoad,
+    #[serde(alias = "Motivate")]
     Motivate,
+    #[serde(alias = "Contrast")]
     Contrast,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AssessmentScope {
+    #[serde(alias = "Target")]
     Target,
+    #[serde(alias = "Enabling")]
     Enabling,
 }
 
@@ -103,9 +124,18 @@ pub enum AssessmentScope {
 /// + revision).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SourceRef {
+    #[schemars(
+        description = "Workspace-relative path to the source file (e.g., source/Unit/1.ptx)."
+    )]
     pub path:       String,
+    #[schemars(description = "Starting line (1-based, inclusive) for the cited span.")]
     pub start_line: u32,
+    #[schemars(description = "Ending line (1-based, inclusive) for the cited span.")]
     pub end_line:   u32,
+    #[serde(default)]
+    #[schemars(
+        description = "DO NOT PROVIDE - auto-filled from course_commit. Leave empty or omit."
+    )]
     pub revision:   String,
 }
 

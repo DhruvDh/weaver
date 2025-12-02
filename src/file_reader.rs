@@ -13,6 +13,7 @@ use async_openai::types::{
 use futures::{StreamExt, stream};
 use kameo::{prelude::*, reply::DelegatedReply};
 use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
@@ -225,6 +226,8 @@ pub struct Reader<M: ModeSpec> {
     max_subdelegations: usize,
     actor_name:         Arc<String>,
     conversation_id:    Arc<String>,
+    cancellation_token: CancellationToken,
+    cancel_reason:      Option<String>,
     _mode:              PhantomData<M>,
 }
 
@@ -239,6 +242,7 @@ struct ReaderDeps {
     dedup:          ActorRef<DeduplicationAgent>,
     analysis_cache: Arc<AnalysisCache>,
     rerun:          Option<ActorRef<crate::rerun_sink::RerunSink>>,
+    cancellation:   CancellationToken,
 }
 
 impl<M: ModeSpec> Reader<M> {
@@ -252,7 +256,7 @@ impl<M: ModeSpec> Reader<M> {
         rerun: Option<ActorRef<crate::rerun_sink::RerunSink>>,
         course_commit: impl Into<String>,
     ) -> Result<Self> {
-        Self::from_env_with_limit(
+        Self::from_env_with_limit_and_cancellation(
             root,
             gateway,
             metrics,
@@ -261,6 +265,7 @@ impl<M: ModeSpec> Reader<M> {
             rerun,
             DEFAULT_MAX_SUBDELEGATIONS,
             course_commit,
+            CancellationToken::new(),
         )
     }
 
@@ -275,6 +280,32 @@ impl<M: ModeSpec> Reader<M> {
         rerun: Option<ActorRef<crate::rerun_sink::RerunSink>>,
         max_subdelegations: usize,
         course_commit: impl Into<String>,
+    ) -> Result<Self> {
+        Self::from_env_with_limit_and_cancellation(
+            root,
+            gateway,
+            metrics,
+            graph,
+            dedup,
+            rerun,
+            max_subdelegations,
+            course_commit,
+            CancellationToken::new(),
+        )
+    }
+
+    /// Build a new reader with explicit cancellation control.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_env_with_limit_and_cancellation(
+        root: impl AsRef<Path>,
+        gateway: ActorRef<LLMGateway>,
+        metrics: Arc<GatewayMetrics>,
+        graph: ActorRef<crate::graph::manager::GraphManager>,
+        dedup: ActorRef<DeduplicationAgent>,
+        rerun: Option<ActorRef<crate::rerun_sink::RerunSink>>,
+        max_subdelegations: usize,
+        course_commit: impl Into<String>,
+        cancellation_token: CancellationToken,
     ) -> Result<Self> {
         let model = Arc::new(
             env::var("OPENAI_MODEL")
@@ -299,6 +330,7 @@ impl<M: ModeSpec> Reader<M> {
             dedup,
             analysis_cache,
             rerun,
+            cancellation: cancellation_token,
         };
         Ok(Self::new(deps, 0, max_subdelegations))
     }
@@ -325,6 +357,8 @@ impl<M: ModeSpec> Reader<M> {
             max_subdelegations,
             actor_name: Arc::new(actor_name),
             conversation_id: Arc::new(conversation_id),
+            cancellation_token: deps.cancellation,
+            cancel_reason: None,
             _mode: PhantomData,
         }
     }
@@ -428,6 +462,7 @@ pub(crate) struct DelegateBatchCtx {
     pub depth:              usize,
     pub max_subdelegations: usize,
     pub mode:               AgentMode,
+    pub cancellation:       CancellationToken,
 }
 
 pub(crate) async fn run_delegate_batch_with_state(
@@ -444,77 +479,108 @@ pub(crate) async fn run_delegate_batch_with_state(
         }));
     }
 
+    if ctx.cancellation.is_cancelled() {
+        return Ok(json!({
+            "type": "delegation_cancelled",
+            "depth": ctx.depth + 1,
+            "reason": "parent cancelled",
+        }));
+    }
+
     let total = tasks.len();
     let limit = MAX_PARALLEL_DELEGATIONS.min(total);
 
-    let results = stream::iter(tasks.into_iter())
-        .map(|task| {
-            let deps = ReaderDeps {
-                gateway:        ctx.gateway.clone(),
-                model:          Arc::clone(&ctx.model),
-                root:           Arc::clone(&ctx.workspace_root),
-                metrics:        Arc::clone(&ctx.metrics),
-                graph:          ctx.graph.clone(),
-                dedup:          ctx.dedup.clone(),
-                analysis_cache: Arc::clone(&ctx.analysis_cache),
-                rerun:          ctx.rerun.clone(),
-                course_commit:  Arc::clone(&ctx.course_commit),
-            };
-            let depth = ctx.depth;
-            let max_subdelegations = ctx.max_subdelegations;
-            async move {
-                let prompt = task.clone();
-                let result = match ctx.mode {
-                    AgentMode::Harvester => {
-                        let child = Reader::<HarvesterSpec>::new(
-                            deps.clone(),
-                            depth + 1,
-                            max_subdelegations,
-                        );
-                        Reader::<HarvesterSpec>::spawn(child)
-                            .ask(FileReaderQuery { prompt })
-                            .await
+    let cancellation = ctx.cancellation.clone();
+    let results = tokio::select! {
+        _ = cancellation.cancelled() => {
+            return Ok(json!({
+                "type": "delegation_cancelled",
+                "depth": ctx.depth + 1,
+                "reason": "cancelled during execution",
+            }));
+        }
+        results = async {
+            stream::iter(tasks.into_iter())
+                .map(|task| {
+                    let deps = ReaderDeps {
+                        gateway:        ctx.gateway.clone(),
+                        model:          Arc::clone(&ctx.model),
+                        root:           Arc::clone(&ctx.workspace_root),
+                        metrics:        Arc::clone(&ctx.metrics),
+                        graph:          ctx.graph.clone(),
+                        dedup:          ctx.dedup.clone(),
+                        analysis_cache: Arc::clone(&ctx.analysis_cache),
+                        rerun:          ctx.rerun.clone(),
+                        course_commit:  Arc::clone(&ctx.course_commit),
+                        cancellation:   ctx.cancellation.clone(),
+                    };
+                    let depth = ctx.depth;
+                    let max_subdelegations = ctx.max_subdelegations;
+                    async move {
+                        if deps.cancellation.is_cancelled() {
+                            return json!({
+                                "task": task,
+                                "status": "error",
+                                "error": "delegated task cancelled",
+                            });
+                        }
+                        let prompt = task.clone();
+                        let result = match ctx.mode {
+                            AgentMode::Harvester => {
+                                let child = Reader::<HarvesterSpec>::new(
+                                    deps.clone(),
+                                    depth + 1,
+                                    max_subdelegations,
+                                );
+                                Reader::<HarvesterSpec>::spawn(child)
+                                    .ask(FileReaderQuery { prompt })
+                                    .await
+                            }
+                            AgentMode::Weaver => {
+                                let child = Reader::<WeaverSpec>::new(
+                                    deps.clone(),
+                                    depth + 1,
+                                    max_subdelegations,
+                                );
+                                Reader::<WeaverSpec>::spawn(child)
+                                    .ask(FileReaderQuery { prompt })
+                                    .await
+                            }
+                            AgentMode::Interactive => {
+                                let child = Reader::<InteractiveSpec>::new(
+                                    deps.clone(),
+                                    depth + 1,
+                                    max_subdelegations,
+                                );
+                                Reader::<InteractiveSpec>::spawn(child)
+                                    .ask(FileReaderQuery { prompt })
+                                    .await
+                            }
+                        };
+                        match result {
+                            Ok(content) => {
+                                json!({
+                                    "task": task,
+                                    "status": "ok",
+                                    "content": content,
+                                })
+                            }
+                            Err(err) => {
+                                let error = err.to_string();
+                                json!({
+                                    "task": task,
+                                    "status": "error",
+                                    "error": error,
+                                })
+                            }
+                        }
                     }
-                    AgentMode::Weaver => {
-                        let child =
-                            Reader::<WeaverSpec>::new(deps.clone(), depth + 1, max_subdelegations);
-                        Reader::<WeaverSpec>::spawn(child)
-                            .ask(FileReaderQuery { prompt })
-                            .await
-                    }
-                    AgentMode::Interactive => {
-                        let child = Reader::<InteractiveSpec>::new(
-                            deps.clone(),
-                            depth + 1,
-                            max_subdelegations,
-                        );
-                        Reader::<InteractiveSpec>::spawn(child)
-                            .ask(FileReaderQuery { prompt })
-                            .await
-                    }
-                };
-                match result {
-                    Ok(content) => {
-                        json!({
-                            "task": task,
-                            "status": "ok",
-                            "content": content,
-                        })
-                    }
-                    Err(err) => {
-                        let error = err.to_string();
-                        json!({
-                            "task": task,
-                            "status": "error",
-                            "error": error,
-                        })
-                    }
-                }
-            }
-        })
-        .buffered(limit)
-        .collect::<Vec<Value>>()
-        .await;
+                })
+                .buffered(limit)
+                .collect::<Vec<Value>>()
+                .await
+        } => results,
+    };
 
     Ok(json!({
         "type": "delegation_batch_result",
@@ -530,6 +596,10 @@ pub struct FileReaderQuery {
     pub prompt: String,
 }
 
+pub struct CancelWork {
+    pub reason: String,
+}
+
 impl<M: ModeSpec> Message<FileReaderQuery> for Reader<M> {
     type Reply = DelegatedReply<Result<String>>;
 
@@ -538,6 +608,9 @@ impl<M: ModeSpec> Message<FileReaderQuery> for Reader<M> {
         FileReaderQuery { prompt }: FileReaderQuery,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        if self.cancellation_token.is_cancelled() {
+            return ctx.spawn(async { Err(anyhow!("FileReader cancelled")) });
+        }
         let tool_host = M::wrap_tool_host(ctx.actor_ref().clone());
         let gateway = self.gateway.clone();
         let system_prompt = self.system_prompt();
@@ -545,8 +618,14 @@ impl<M: ModeSpec> Message<FileReaderQuery> for Reader<M> {
         let actor_name = (*self.actor_name).clone();
         let conversation_id = (*self.conversation_id).clone();
         let rerun = self.rerun.clone();
+        let cancellation = self.cancellation_token.clone();
+        let cancel_reason = self.cancel_reason.clone();
 
         ctx.spawn(async move {
+            let cancel_msg = cancel_reason.unwrap_or_else(|| "FileReader cancelled".to_string());
+            if cancellation.is_cancelled() {
+                return Err(anyhow!(cancel_msg.clone()));
+            }
             let system_msg: ChatCompletionRequestMessage =
                 ChatCompletionRequestSystemMessageArgs::default()
                     .content(system_prompt)
@@ -568,11 +647,32 @@ impl<M: ModeSpec> Message<FileReaderQuery> for Reader<M> {
                 actor_name,
                 conversation_id,
                 rerun,
+                cancellation_token: cancellation.clone(),
             };
 
-            let reply = gateway.ask(request).await?;
+            let reply = tokio::select! {
+                _ = cancellation.cancelled() => {
+                    Err(anyhow!(cancel_msg.clone()))
+                }
+                response = gateway.ask(request) => response.map_err(|err| anyhow!(err.to_string())),
+            }?;
             Ok(reply)
         })
+    }
+}
+
+impl<M: ModeSpec> Message<CancelWork> for Reader<M> {
+    type Reply = Result<()>;
+
+    async fn handle(
+        &mut self,
+        CancelWork { reason }: CancelWork,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.cancel_reason = Some(reason.clone());
+        self.cancellation_token.cancel();
+        ctx.stop();
+        Ok(())
     }
 }
 
@@ -587,6 +687,13 @@ impl<M: ModeSpec> Message<ExecuteTool> for Reader<M> {
         }: ExecuteTool,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        if self.cancellation_token.is_cancelled() {
+            let reason = self
+                .cancel_reason
+                .clone()
+                .unwrap_or_else(|| "FileReader cancelled".to_string());
+            return Err(llm::ToolExecutionError::Internal(anyhow!(reason)));
+        }
         let meta = match llm::lookup_tool(&identifier)
             .map_err(|err| ToolExecutionError::system(err.into()))?
         {
@@ -609,6 +716,7 @@ impl<M: ModeSpec> Message<ExecuteTool> for Reader<M> {
             analysis_cache:     Arc::clone(&self.analysis_cache),
             mode:               M::MODE,
             course_commit:      Arc::clone(&self.course_commit),
+            cancellation:       self.cancellation_token.clone(),
         };
 
         let tool = (meta.parse)(arguments, &state).map_err(ToolExecutionError::from)?;

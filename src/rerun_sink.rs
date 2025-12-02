@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     convert::Infallible,
     path::PathBuf,
     time::{Instant, SystemTime},
@@ -8,6 +9,7 @@ use kameo::prelude::*;
 use rerun::{
     GraphEdges, GraphNodes, RecordingStream, RecordingStreamBuilder, TimeCell,
     archetypes::{Arrows2D, Scalars, TextLog},
+    sink::{FileSink, GrpcSink, LogSink},
 };
 use tokio::task;
 use tracing::debug;
@@ -47,25 +49,37 @@ impl RerunSink {
             return;
         }
         self.last_attempt = Some(now);
+
+        let mut sinks_by_name: HashMap<String, Vec<Box<dyn LogSink>>> = HashMap::new();
         for target in &self.targets {
             match target {
-                RerunTarget::Grpc { name } => {
-                    match RecordingStreamBuilder::new(name.clone()).connect_grpc() {
-                        Ok(rec) => self.recs.push(rec),
-                        Err(err) => debug!(error = %err, "rerun grpc connect failed"),
-                    }
-                }
-                RerunTarget::File { name, path } => {
-                    match RecordingStreamBuilder::new(name.clone()).save(path) {
-                        Ok(rec) => self.recs.push(rec),
-                        Err(err) => {
-                            debug!(error = %err, path = %path.display(), "rerun save failed")
-                        }
-                    }
-                }
+                RerunTarget::Grpc { name } => sinks_by_name
+                    .entry(name.clone())
+                    .or_default()
+                    .push(Box::new(GrpcSink::default())),
+                RerunTarget::File { name, path } => match FileSink::new(path) {
+                    Ok(sink) => sinks_by_name
+                        .entry(name.clone())
+                        .or_default()
+                        .push(Box::new(sink)),
+                    Err(err) => debug!(error = %err, path = %path.display(), "rerun save failed"),
+                },
             }
         }
-        if !self.recs.is_empty() {
+
+        let mut recs = Vec::new();
+        for (name, sinks) in sinks_by_name {
+            if sinks.is_empty() {
+                continue;
+            }
+            match RecordingStreamBuilder::new(name.clone()).set_sinks(sinks) {
+                Ok(rec) => recs.push(rec),
+                Err(err) => debug!(error = %err, name = %name, "rerun init failed"),
+            }
+        }
+
+        if !recs.is_empty() {
+            self.recs = recs;
             self.ready = true;
         }
     }

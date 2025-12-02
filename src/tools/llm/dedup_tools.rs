@@ -534,6 +534,7 @@ mod tests {
     use std::{path::PathBuf, sync::Arc};
 
     use kameo::{actor::Spawn, prelude::ActorRef};
+    use tokio_util::sync::CancellationToken;
 
     use super::*;
     use crate::{
@@ -633,6 +634,7 @@ mod tests {
             analysis_cache: Arc::new(AnalysisCache::new()),
             mode: AgentMode::Interactive,
             course_commit: Arc::new("deadbeef".into()),
+            cancellation: CancellationToken::new(),
         };
 
         (call_state, graph_actor, dedup_actor, gateway_actor)

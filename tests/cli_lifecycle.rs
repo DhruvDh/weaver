@@ -10,7 +10,7 @@ use tracing_subscriber::EnvFilter;
 use url::Url;
 use uuid::Uuid;
 use weaver::{
-    app::{Cli, GatewayMode, RerunMode, RuntimeOptions, run_app},
+    app::{Cli, GatewayMode, RuntimeOptions, run_app},
     graph::{
         CurriculumGraph, EdgeKind, EdgePayload, IntroductionScope, KnowledgeNode, NodeKind,
         commands::InsertKnowledge,
@@ -64,8 +64,7 @@ fn make_node(commit: &str) -> KnowledgeNode {
 
 fn base_cli(root: &Path, snapshot: &Path, commit: &str, autosave_secs: u64) -> Cli {
     Cli {
-        rerun_mode:                  RerunMode::None,
-        rerun_file:                  root.join("noop.rrd"),
+        rerun_file:                  Some(root.join("noop.rrd")),
         workspace:                   root.join("workspace"),
         graph_snapshot_path:         snapshot.to_path_buf(),
         graph_autosave_secs:         autosave_secs,
@@ -78,6 +77,9 @@ fn base_cli(root: &Path, snapshot: &Path, commit: &str, autosave_secs: u64) -> C
         dedup_auto_merge_threshold:  0.95,
         skip_dedup_on_insert:        false,
         interactive:                 true,
+        harvest_timeout_hours:       None,
+        weave_timeout_hours:         None,
+        max_concurrent_chapters:     4,
         chapters_pattern:            None,
         chapters_dir:                None,
     }

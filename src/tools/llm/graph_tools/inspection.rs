@@ -14,8 +14,10 @@ use crate::{
         },
         manager::GetCourseCommit,
     },
+    schema::types::KnowledgeType,
     tools::llm::{
-        CallState, ToolExecutionError, ToolInstance, ToolOutput, ToolPayloadMode, ToolPrototype,
+        CallState, ToolExecutionError, ToolInputError, ToolInstance, ToolOutput, ToolPayloadMode,
+        ToolPrototype,
         common::{ToolRunPayload, ToolRunner},
         require_string, require_usize_min,
     },
@@ -53,7 +55,7 @@ pub struct CourseCommitArgs {}
 crate::analysis_tool!(
     course_commit_meta,
     id: COURSE_COMMIT,
-    description: "Return the course commit hash currently configured for the graph.",
+    description: "Get the git commit hash of the course content this graph is built from. All source_refs should reference this commit. Useful for verifying graph-to-source alignment.",
     args: CourseCommitArgs,
     prepare: |raw| parse_args_with_builder(COURSE_COMMIT, raw, |_input: CourseCommitArgs| {
         Ok(CourseCommitArgs {})
@@ -99,27 +101,35 @@ const GRAPH_NEIGHBORS: &str = "graph_neighbors";
 #[derive(Debug, Clone, Builder, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NeighborsArgs {
-    #[schemars(description = "Existing node slug whose neighborhood you want to inspect.")]
+    #[schemars(
+        description = "Node slug to inspect. Use graph_search_nodes first if unsure of exact slug."
+    )]
     #[builder(with = |value: String| -> crate::tools::llm::ToolInputResult<_> {
         require_string(value, GRAPH_NEIGHBORS, "slug")
     })]
     pub slug:      String,
     #[serde(default)]
     #[schemars(
-        description = "Optional edge layer filter: requires | supports | assesses | precedes | \
-                       anchors. Leave empty to see all kinds."
+        description = "Filter by edge type: requires (prerequisites), supports (scaffolds), \
+                       assesses (assessment→LO links), precedes (step ordering), anchors \
+                       (step→knowledge links). Omit to see all types."
     )]
     pub edge_kind: Option<EdgeKindFilter>,
     #[serde(default)]
     #[schemars(
-        description = "Direction relative to the node: incoming | outgoing | both (default)."
+        description = "incoming (edges pointing TO this node), outgoing (edges FROM this node), \
+                       both (default). Example: 'incoming' on a concept shows what \
+                       concepts/procedures depend on it."
     )]
     pub direction: Option<NeighborDirectionArg>,
     #[serde(default)]
-    #[schemars(description = "Maximum neighbors to return (default 50, max 200).")]
+    #[schemars(
+        description = "Maximum results to return (default 50, max 200). Use with offset for \
+                       pagination."
+    )]
     pub limit:     Option<usize>,
     #[serde(default)]
-    #[schemars(description = "Offset into the neighbor list (default 0).")]
+    #[schemars(description = "Skip this many results (for pagination). Use with limit.")]
     pub offset:    Option<usize>,
 }
 
@@ -134,9 +144,7 @@ pub enum NeighborDirectionArg {
 crate::analysis_tool!(
     neighbors_meta,
     id: GRAPH_NEIGHBORS,
-    description: "Inspect local graph structure: list neighbors with edge_kind and direction \
-                  (requires/supports/assesses/precedes/anchors). Use to read prerequisites, \
-                  scaffolds, assessment links, and discourse anchors around a node.",
+    description: "List all nodes connected to a given node via edges. Shows neighbor slug, edge type (requires/supports/assesses/precedes/anchors), and direction (incoming/outgoing). Use to explore the graph structure around a specific node.",
     args: NeighborsArgs,
     prepare: |raw| parse_args_with_builder(GRAPH_NEIGHBORS, raw, |mut input: NeighborsArgs| {
         input.slug = require_string(input.slug, GRAPH_NEIGHBORS, "slug")?;
@@ -224,8 +232,8 @@ const GET_NODE: &str = "graph_get_node";
 #[serde(deny_unknown_fields)]
 pub struct GetNodeArgs {
     #[schemars(
-        description = "Existing node slug in the curriculum graph. Use graph_neighbors or prior \
-                       tools to discover slugs."
+        description = "Exact node slug to retrieve. Example: 'C.contract_components', \
+                       'LO.write_docstring'. Use graph_search_nodes first if unsure."
     )]
     #[builder(with = |value: String| -> crate::tools::llm::ToolInputResult<_> {
         require_string(value, GET_NODE, "slug")
@@ -236,9 +244,7 @@ pub struct GetNodeArgs {
 crate::analysis_tool!(
     get_node_meta,
     id: GET_NODE,
-    description: "Fetch a node payload by slug (kind, statement, rubric/construct-irrelevant \
-                  data, grain/load/scope, source_refs, tags). Use this before proposing edits \
-                  or edges.",
+    description: "Get full details of a node by its slug. Returns all fields: title, statement, knowledge_type, source_refs, rubric_criteria (for LOs), tags, etc. Use this to verify a node exists and check its properties before creating edges.",
     args: GetNodeArgs,
     prepare: |raw| parse_args_with_builder(GET_NODE, raw, |mut input: GetNodeArgs| {
         input.slug = require_string(input.slug, GET_NODE, "slug")?;
@@ -319,24 +325,28 @@ const LIST_NODES_BY_TAG: &str = "graph_list_nodes_by_tag";
 #[derive(Debug, Clone, Builder, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ListNodesByTagArgs {
-    #[schemars(description = "Filter nodes that include this tag (case-insensitive match).")]
+    #[schemars(description = "Tag to filter by (case-insensitive). Examples: \
+                              'source:02_contracts/toctree.ptx' (all nodes from a chapter), \
+                              'spec:procedural' (all procedural nodes), 'req:C.some_concept' \
+                              (nodes with this hint tag)")]
     #[builder(with = |value: String| -> crate::tools::llm::ToolInputResult<_> {
         require_string(value, LIST_NODES_BY_TAG, "tag")
     })]
     pub tag:    String,
     #[serde(default)]
-    #[schemars(description = "Maximum nodes to return (default 50, max 200).")]
+    #[schemars(
+        description = "Maximum results (default 50, max 200). Use with offset for pagination."
+    )]
     pub limit:  Option<usize>,
     #[serde(default)]
-    #[schemars(description = "Offset into the matching list (default 0).")]
+    #[schemars(description = "Skip this many results (for pagination).")]
     pub offset: Option<usize>,
 }
 
 crate::analysis_tool!(
     list_nodes_by_tag_meta,
     id: LIST_NODES_BY_TAG,
-    description: "List nodes carrying a specific tag. Use workspace-relative chapter tags like \
-                  `source:<chapter_path>` to scope work for harvesters/weavers.",
+    description: "Find all nodes with a specific tag. Essential for scoping work to a chapter (tag='source:<chapter>') or finding nodes by specialization (tag='spec:<niche>'). Also useful for finding harvest hint tags like 'req:*', 'sup:*'.",
     args: ListNodesByTagArgs,
     prepare: |raw| parse_args_with_builder(LIST_NODES_BY_TAG, raw, |mut input: ListNodesByTagArgs| {
         input.tag = require_string(input.tag, LIST_NODES_BY_TAG, "tag")?;
@@ -398,26 +408,43 @@ impl ToolInstance for ListNodesByTagTool {
 
 const LIST_NODES_BY_KIND: &str = "graph_list_nodes_by_kind";
 
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum NodeKindSelectorInput {
+    Selector(NodeKindSelector),
+    #[schemars(
+        description = "Node type selector as string: teaching_step (narrative nodes), \
+                       any_knowledge (all knowledge types), or specific type: factual | \
+                       conceptual | procedural | metacognitive | learning_outcome | \
+                       assessment_item"
+    )]
+    String(String),
+}
+
 #[derive(Debug, Clone, Builder, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ListNodesByKindArgs {
     #[schemars(
-        description = "Select knowledge_type to filter knowledge nodes or choose \
-                       teaching_step/any_knowledge."
+        description = "Node type to list: 'teaching_step' (narrative moments), 'any_knowledge' \
+                       (all knowledge nodes), or specific knowledge_type: 'factual', \
+                       'conceptual', 'procedural', 'metacognitive', 'learning_outcome', \
+                       'assessment_item'"
     )]
-    pub selector: NodeKindSelector,
+    pub selector: NodeKindSelectorInput,
     #[serde(default)]
-    #[schemars(description = "Maximum nodes to return (default 50, max 200).")]
+    #[schemars(
+        description = "Maximum results (default 50, max 200). Use with offset for pagination."
+    )]
     pub limit:    Option<usize>,
     #[serde(default)]
-    #[schemars(description = "Offset into the matching list (default 0).")]
+    #[schemars(description = "Skip this many results (for pagination).")]
     pub offset:   Option<usize>,
 }
 
 crate::analysis_tool!(
     list_nodes_by_kind_meta,
     id: LIST_NODES_BY_KIND,
-    description: "List nodes by type: pick a knowledge_type, any_knowledge, or teaching_step.",
+    description: "List all nodes of a specific type. Use 'learning_outcome' to find all LOs, 'assessment_item' for assessments, 'procedural' for procedures, 'teaching_step' for discourse nodes, etc. Good for inventory and gap analysis.",
     args: ListNodesByKindArgs,
     prepare: |raw| parse_args_with_builder(LIST_NODES_BY_KIND, raw, |input: ListNodesByKindArgs| {
         Ok(input)
@@ -433,15 +460,41 @@ struct ListNodesByKindTool {
     state: CallState,
 }
 
+fn normalize_selector(
+    selector: NodeKindSelectorInput,
+) -> Result<NodeKindSelector, ToolExecutionError> {
+    match selector {
+        NodeKindSelectorInput::Selector(sel) => Ok(sel),
+        NodeKindSelectorInput::String(value) => match value.as_str() {
+            "teaching_step" => Ok(NodeKindSelector::TeachingStep),
+            "any_knowledge" => Ok(NodeKindSelector::AnyKnowledge),
+            other => {
+                let lower = other.to_ascii_lowercase();
+                match lower.parse::<KnowledgeType>() {
+                    Ok(kind) => Ok(NodeKindSelector::Knowledge {
+                        knowledge_type: kind,
+                    }),
+                    Err(_) => Err(ToolExecutionError::Input(ToolInputError::InvalidPayload {
+                        tool: LIST_NODES_BY_KIND,
+                        message: "selector string must be teaching_step, any_knowledge, or a \
+                                  knowledge_type in snake_case (factual|conceptual|procedural|\
+                                  metacognitive|learning_outcome|assessment_item)"
+                            .into(),
+                    })),
+                }
+            }
+        },
+    }
+}
+
 #[async_trait]
 impl ToolInstance for ListNodesByKindTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
+        let selector = normalize_selector(self.args.selector.clone())?;
         let nodes = self
             .state
             .graph
-            .ask(ListNodesByKind {
-                selector: self.args.selector.clone(),
-            })
+            .ask(ListNodesByKind { selector })
             .await
             .map_err(|e| map_send_err(e, LIST_NODES_BY_KIND))?;
 
@@ -483,7 +536,7 @@ pub struct ListTagsArgs {}
 crate::analysis_tool!(
     list_tags_meta,
     id: LIST_TAGS,
-    description: "List all tags present in the graph (deduplicated).",
+    description: "List all unique tags used in the graph. Useful for discovering available source:<chapter> tags, spec:<niche> tags, and harvest hint tags. Use with graph_list_nodes_by_tag to explore specific categories.",
     args: ListTagsArgs,
     prepare: |raw| parse_args_with_builder(LIST_TAGS, raw, |_input: ListTagsArgs| Ok(ListTagsArgs {})),
     runner: |args: ListTagsArgs, state: &CallState| ListTagsTool {
@@ -529,21 +582,24 @@ const SEARCH_NODES: &str = "graph_search_nodes";
 #[derive(Debug, Clone, Builder, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SearchNodesArgs {
-    #[schemars(description = "Query to match against slug/title/statement (case-insensitive).")]
+    #[schemars(
+        description = "Search term to match against node slugs, titles, and statements. Uses \
+                       fuzzy matching. Examples: 'contract', 'docstring', 'precondition'. Results \
+                       sorted by relevance score."
+    )]
     #[builder(with = |value: String| -> crate::tools::llm::ToolInputResult<_> {
         require_string(value, SEARCH_NODES, "query")
     })]
     pub query: String,
     #[serde(default)]
-    #[schemars(description = "Maximum matches to return (default 20, max 200).")]
+    #[schemars(description = "Maximum results (default 20, max 200).")]
     pub limit: Option<usize>,
 }
 
 crate::analysis_tool!(
     search_nodes_meta,
     id: SEARCH_NODES,
-    description: "Fuzzy search nodes by slug/title/statement. Uses substring + Jaro-Winkler \
-                  scoring. Helpful when slugs are unknown or dedup changed them.",
+    description: "Fuzzy search for nodes by slug, title, or statement content. ALWAYS use this before referencing a slug you're unsure about. Returns matches with relevance scores. Better than graph_list_nodes_by_tag when you don't know exact tags.",
     args: SearchNodesArgs,
     prepare: |raw| parse_args_with_builder(SEARCH_NODES, raw, |mut input: SearchNodesArgs| {
         input.query = require_string(input.query, SEARCH_NODES, "query")?;

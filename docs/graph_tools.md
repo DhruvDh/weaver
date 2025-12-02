@@ -11,6 +11,28 @@ Pagination defaults: `limit=50`, max `200`; `offset` defaults to `0`.
 Cost/preview: summary tools accept `fetch_body` (default `false`). In preview mode they return a cost block; set `fetch_body=true` to receive the body.
 Command previews also return a cost block with byte/token hints so the gateway can price mutations before execution.
 
+## Two-phase niche flow (LLM-facing)
+
+The two-phase pipeline runs **harvest → dedup/persist barrier → weave**. Chapter tags follow `source:<chapter_path>`; niche tags use `spec:<niche>`.
+
+- Harvest niches (per chapter, all run concurrently):
+  - `spec:factual_conceptual`: factual + conceptual knowledge nodes (mid-grain).
+  - `spec:procedural_examples`: procedural nodes plus worked/practice examples (case: typical/edge/error).
+  - `spec:assessments`: assessment_item nodes with `claim:` and `obs:` hint tags.
+  - `spec:teaching_steps`: teaching steps with purpose/method_tags/episode; anchors/precedes hints in tags only.
+  - `spec:supports`: scaffolds/analogies/counterexamples/misconception fixes/strategy hints with `support:` and `effect:` tags.
+  - `spec:metacognitive`: metacognitive knowledge (strategy/reflection/self-regulation).
+
+- Weave niches (per chapter after dedup barrier):
+  - `requires`: build requires DAG from req:/ref:/sup: hints; validate with `graph_dag_check`.
+  - `supports`: add supports edges from tagged scaffolds/examples; enforce fadeability via `graph_fadeability_view`.
+  - `assesses`: connect assessment → LO with scope target/enabling and observation_features.
+  - `teaching_steps`: precedes DAG per episode + anchors (impact introduce/use/refine/motivate/target).
+  - `coverage/gap`: run `graph_gap_summary`, `graph_example_gaps_view`, `graph_practice_gaps_view`, `graph_lo_alignment_summary`; patch obvious gaps or note TODOs.
+  - `cleanup/qa`: normalize tags/labels/introduction_scope, clear hint tags, rerun `graph_dag_check`, `graph_gap_summary`, `graph_lo_alignment_summary`, `graph_fadeability_view`, and `AuditInvariants`.
+
+Weaving only starts after all chapters finish harvest and a single dedup/persist pass completes; `--max-concurrent-chapters` caps chapters in flight during harvest and weave.
+
 ## Tool quick reference
 
 | id | kind | purpose | key params |

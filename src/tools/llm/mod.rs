@@ -14,6 +14,7 @@ use once_cell::sync::Lazy;
 use schemars::{JsonSchema, schema_for};
 use serde_json::{self, Map, Value, json};
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use self::{
@@ -372,6 +373,7 @@ pub struct CallState {
     pub analysis_cache:     Arc<AnalysisCache>,
     pub mode:               AgentMode,
     pub course_commit:      Arc<String>,
+    pub cancellation:       CancellationToken,
 }
 
 pub const fn default_false() -> bool {

@@ -14,21 +14,26 @@ use super::{
     depth_exceeded, payload_size_bytes, trim_optional,
 };
 use crate::{
-    constants::{MAX_DELEGATED_TASK_LEN, MAX_DELEGATED_TASKS, MAX_PARALLEL_DELEGATIONS},
+    constants::{MAX_DELEGATED_TASKS, MAX_PARALLEL_DELEGATIONS},
     file_reader::run_delegate_batch_with_state,
 };
 
 const IDENTIFIER: &str = "delegate_tasks";
-const DESCRIPTION: &str = "Delegate one or more tasks to child FileReader agents via the `tasks` \
-                           array. Wrap single tasks in an array when needed.";
+const DESCRIPTION: &str = "Spawn child agents for parallel sub-tasks. Use when files are large \
+                           (>200 lines) or work can be parallelized. Each child agent gets fresh \
+                           context and inherits your mode (harvester/weaver). Children can use \
+                           all your tools but cannot further delegate (depth limited).";
 
 #[derive(Debug, Clone, Builder, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DelegateTasksArgs {
     #[schemars(
         length(min = 1, max = MAX_DELEGATED_TASKS),
-        description = "Precise, educational description with motivation and acceptance criteria \
-                       of tasks to delegate in parallel."
+        description = "Array of 1-8 independent task instructions. Each spawns a child agent with \
+                       fresh context. Tasks run in parallel (up to 8 concurrent). Keep each task \
+                       focused: one file, one section, or one type of extraction. Example tasks: \
+                       ['Extract factual nodes from sec_component.ptx', 'Extract procedural nodes \
+                       from sec_syntax.ptx']."
     )]
     #[builder(with = |raw_tasks: Vec<String>| -> ToolInputResult<_> {
         let tasks: Vec<_> = raw_tasks
@@ -49,9 +54,6 @@ pub struct DelegateTasksArgs {
                 ),
             })
         } else {
-            for task in &tasks {
-                super::ensure_max_len(task, MAX_DELEGATED_TASK_LEN, IDENTIFIER, "task")?;
-            }
             Ok(tasks)
         }
     })]
@@ -59,8 +61,9 @@ pub struct DelegateTasksArgs {
     #[serde(default)]
     #[builder(default = false)]
     #[schemars(
-        description = "When true, return full child outputs; default false returns a summary \
-                       preview to avoid context blowups."
+        description = "Return full child outputs vs summaries. Default false = returns only \
+                       status and summary. Set true = returns complete child responses. Use false \
+                       to save context budget unless you need detailed child outputs."
     )]
     pub fetch_body: bool,
 }
@@ -128,6 +131,7 @@ impl ToolInstance for DelegateTasksTool {
             max_subdelegations: self.state.max_subdelegations,
             mode:               self.state.mode,
             course_commit:      Arc::clone(&self.state.course_commit),
+            cancellation:       self.state.cancellation.clone(),
         };
 
         let result = run_delegate_batch_with_state(ctx, self.args.tasks.clone()).await?;

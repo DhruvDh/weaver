@@ -21,7 +21,7 @@ use crate::{
         SupportKind,
     },
     tools::llm::{
-        CallState, ToolInputResult, ToolPrototype,
+        CallState, ToolInputError, ToolInputResult, ToolPrototype,
         common::{
             AnyKnowledge, AssessmentItem, LearningOutcome, Slug, TeachingStep, resolve_typed,
         },
@@ -42,6 +42,33 @@ fn command_ok(tool: &'static str, extra: serde_json::Value) -> serde_json::Value
     serde_json::Value::Object(map)
 }
 
+fn fill_source_ref_revisions(source_refs: &mut [SourceRef], course_commit: &str) {
+    for span in source_refs.iter_mut() {
+        if span.revision.is_empty() {
+            span.revision = course_commit.to_string();
+        }
+    }
+}
+
+fn reject_mixed_case_knowledge_type(
+    raw: &serde_json::Value,
+    tool: &'static str,
+) -> ToolInputResult<()> {
+    if let Some(value) = raw.get("knowledge_type").and_then(|v| v.as_str()) {
+        let lower = value.to_ascii_lowercase();
+        if value != lower {
+            return Err(ToolInputError::InvalidPayload {
+                tool,
+                message: format!(
+                    "knowledge_type must be snake_case (e.g., \"conceptual\"), got \"{}\"",
+                    value
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 // ---------- Insert / update knowledge ----------
 
 const INSERT_KNOWLEDGE: &str = "graph_insert_knowledge";
@@ -51,72 +78,95 @@ const UPDATE_KNOWLEDGE: &str = "graph_update_knowledge";
 #[serde(deny_unknown_fields)]
 pub struct InsertKnowledgeArgs {
     #[schemars(
-        description = "Stable slug for this knowledge/LO/assessment node (must be unique)."
+        description = "Unique identifier following {Kind}.{name} pattern. Examples: \
+                       C.contract_components, P.design_recipe, LO.write_docstring, A.exercise_1. \
+                       Kind prefixes: F=factual, C=conceptual, P=procedural, M=metacognitive, \
+                       LO=learning_outcome, A=assessment_item"
     )]
     #[builder(with = |value: String| -> ToolInputResult<_> {
         require_string(value, INSERT_KNOWLEDGE, "slug")
     })]
     pub slug: String,
-    #[schemars(description = "Short title for the knowledge/LO/assessment.")]
+    #[schemars(
+        description = "Human-readable title. Keep concise (3-8 words). Example: 'Python Docstring \
+                       Format'"
+    )]
     #[builder(with = |value: String| -> ToolInputResult<_> {
         require_string(value, INSERT_KNOWLEDGE, "title")
     })]
     pub title: String,
     #[schemars(
-        description = "Full statement of the knowledge item, learning outcome, or assessment \
-                       target."
+        description = "Self-contained description of the knowledge. Must pass the Assessable Atom \
+                       Test: 'Can I write ONE exam question targeting ONLY this?' Keep to 1-3 \
+                       sentences."
     )]
     #[builder(with = |value: String| -> ToolInputResult<_> {
         require_string(value, INSERT_KNOWLEDGE, "statement")
     })]
     pub statement: String,
-    #[schemars(
-        description = "KnowledgeType: factual, conceptual, procedural, metacognitive, \
-                       learning_outcome, or assessment_item."
-    )]
+    #[schemars(description = "Type of knowledge from Bloom's taxonomy. Use: factual \
+                              (terms/definitions), conceptual (principles/models), procedural \
+                              (algorithms/methods), metacognitive (self-regulation strategies), \
+                              learning_outcome (measurable goals), assessment_item \
+                              (exercises/tests)")]
     pub knowledge_type: KnowledgeType,
-    #[schemars(description = "Rubric criteria (expected for learning_outcome nodes).")]
+    #[schemars(
+        description = "REQUIRED for learning_outcome only. List of observable, measurable \
+                       behaviors. Example: ['identifies preconditions', 'documents raises \
+                       clause', 'tests boundary cases']. assesses edges' observation_features \
+                       must cover these."
+    )]
     #[serde(default)]
     pub rubric_criteria: Vec<String>,
-    #[schemars(description = "Known construct-irrelevant demands (assessment_item nodes).")]
+    #[schemars(
+        description = "OPTIONAL for assessment_item only. Skills the assessment requires but \
+                       doesn't intend to measure. Example: ['prose writing ability']. Used in \
+                       construct validity checks."
+    )]
     #[serde(default)]
     pub construct_irrelevant_demands: Vec<String>,
     #[schemars(
-        description = "Source spans in the repository supporting this node (path + line range, \
-                       pinned to repo revision)."
+        description = "REQUIRED. Where in the source text this knowledge appears. Array of \
+                       objects with ONLY these fields: {path: 'relative/path.ptx', start_line: \
+                       10, end_line: 25}. Do NOT include 'revision' - it is auto-filled."
     )]
     #[serde(default)]
     pub source_refs: Vec<SourceRef>,
     #[schemars(
-        description = "Confidence in this node (0.0-1.0). Defaults to 1.0 when omitted or 0.0)."
+        description = "Your confidence in this extraction (0.0-1.0). Default 1.0. Use lower \
+                       values to flag uncertain extractions for review."
     )]
     #[serde(default)]
     pub confidence: f32,
     #[serde(default)]
     #[schemars(
-        description = "Grain level of this knowledge: macro (coarse), mid (default), or micro \
-                       (fine)."
+        description = "Granularity level. mid (default) = one exam question. macro = needs \
+                       splitting. micro = too small, fold into parent."
     )]
     pub grain_level: Option<crate::graph::GrainLevel>,
     #[serde(default)]
-    #[schemars(description = "Intrinsic cognitive load: low, medium, or high.")]
+    #[schemars(
+        description = "Cognitive load. high = needs extra scaffolding (examples). medium = \
+                       typical. low = straightforward."
+    )]
     pub intrinsic_load: Option<crate::graph::IntrinsicLoad>,
     #[serde(default)]
     #[schemars(
-        description = "Where this knowledge is introduced: in_course (default), prior, or \
-                       external."
+        description = "Where this knowledge is introduced. in_course (default) = taught here. \
+                       prior = assumed known. external = referenced but not taught."
     )]
     pub introduction_scope: Option<IntroductionScope>,
     #[serde(default)]
-    #[schemars(
-        description = "Free-form tags to group/filter knowledge nodes (e.g., principle, \
-                       misconception, keystone)."
-    )]
+    #[schemars(description = "Tags for filtering and organization. REQUIRED: \
+                              'source:<chapter_path>' and 'spec:<niche>'. Hints for weavers: \
+                              'req:<slug>', 'sup:<slug>', 'ref:<slug>'")]
     pub tags: Vec<String>,
     #[serde(default)]
     #[builder(default = false)]
     #[schemars(
-        description = "Set apply=true to perform the mutation; default false returns a preview."
+        description = "Set true to actually create the node. Default false returns a preview \
+                       showing what would be created. Always preview first on uncertain \
+                       extractions."
     )]
     pub apply: bool,
 }
@@ -152,61 +202,88 @@ fn build_insert_knowledge(args: &InsertKnowledgeArgs) -> crate::graph::commands:
     }
 }
 
-crate::graph_action_tool!(
-    insert_knowledge_meta,
-    id: INSERT_KNOWLEDGE,
-    description: "Insert a new mid-grain Knowledge node \
-                  (factual/conceptual/procedural/metacognitive/LO/assessment). Use for a single \
-                  assessable idea (Assessable Atom) with stable slug, statement, Bloom-based \
-                  knowledge_type, grain level, introduction scope, rubric/construct-irrelevant \
-                  fields, and source_refs.",
-    args: InsertKnowledgeArgs,
-    prepare: |raw| super::common::parse_args_with_builder(
-        INSERT_KNOWLEDGE,
-        raw,
-        |mut input: InsertKnowledgeArgs| {
-            input.slug = require_string(input.slug, INSERT_KNOWLEDGE, "slug")?;
-            input.title = require_string(input.title, INSERT_KNOWLEDGE, "title")?;
-            input.statement = require_string(input.statement, INSERT_KNOWLEDGE, "statement")?;
-            Ok(input)
+pub(super) fn insert_knowledge_meta() -> ToolPrototype {
+    ToolPrototype {
+        id:          INSERT_KNOWLEDGE,
+        description: "Create a Knowledge, LearningOutcome, or AssessmentItem node. Each node \
+                      should represent ONE assessable idea (pass the 'can I write one exam \
+                      question for this?' test). Use apply=false first to preview, then \
+                      apply=true to create.",
+        schema:      crate::tools::llm::schema_for_args::<InsertKnowledgeArgs>(),
+        parse:       |raw, state| {
+            reject_mixed_case_knowledge_type(&raw, INSERT_KNOWLEDGE)?;
+            let mut args: InsertKnowledgeArgs = super::common::parse_args_with_builder(
+                INSERT_KNOWLEDGE,
+                raw,
+                |mut input: InsertKnowledgeArgs| {
+                    input.slug = require_string(input.slug, INSERT_KNOWLEDGE, "slug")?;
+                    input.title = require_string(input.title, INSERT_KNOWLEDGE, "title")?;
+                    input.statement =
+                        require_string(input.statement, INSERT_KNOWLEDGE, "statement")?;
+                    Ok(input)
+                },
+            )?;
+            fill_source_ref_revisions(&mut args.source_refs, state.course_commit.as_ref());
+            let raw_args =
+                serde_json::to_value(&args).expect("failed to serialize graph action args");
+            super::common::parse_graph_command(
+                INSERT_KNOWLEDGE,
+                raw_args,
+                state,
+                build_insert_knowledge,
+                |args: &InsertKnowledgeArgs, _| {
+                    info!(tool = INSERT_KNOWLEDGE, slug = %args.slug, "graph insert knowledge");
+                    command_ok(INSERT_KNOWLEDGE, json!({"slug": args.slug}))
+                },
+                |e| map_send_err(e, INSERT_KNOWLEDGE),
+                None,
+            )
         },
-    ),
-    build: |args: &InsertKnowledgeArgs| build_insert_knowledge(args),
-    ok: |args: &InsertKnowledgeArgs, _| {
-        info!(tool = INSERT_KNOWLEDGE, slug = %args.slug, "graph insert knowledge");
-        command_ok(INSERT_KNOWLEDGE, json!({"slug": args.slug}))
-    },
-    map_err: |e| map_send_err(e, INSERT_KNOWLEDGE)
-);
+    }
+}
 
-crate::graph_action_tool!(
-    update_knowledge_meta,
-    id: UPDATE_KNOWLEDGE,
-    description: "Update an existing Knowledge node in place (statement/metadata/tags) without \
-                  changing its identity. Use to refine wording, rubric metadata, \
-                  load/grain/scope—not for splitting/merging concepts.",
-    args: InsertKnowledgeArgs,
-    prepare: |raw| super::common::parse_args_with_builder(
-        UPDATE_KNOWLEDGE,
-        raw,
-        |mut input: InsertKnowledgeArgs| {
-            input.slug = require_string(input.slug, UPDATE_KNOWLEDGE, "slug")?;
-            input.title = require_string(input.title, UPDATE_KNOWLEDGE, "title")?;
-            input.statement = require_string(input.statement, UPDATE_KNOWLEDGE, "statement")?;
-            Ok(input)
+pub(super) fn update_knowledge_meta() -> ToolPrototype {
+    ToolPrototype {
+        id:          UPDATE_KNOWLEDGE,
+        description: "Update an existing Knowledge node's metadata. Useful for fixing statements, \
+                      updating tags (e.g., removing harvest hint tags like req:*), or changing \
+                      introduction_scope. Provide all fields including unchanged ones.",
+        schema:      crate::tools::llm::schema_for_args::<InsertKnowledgeArgs>(),
+        parse:       |raw, state| {
+            reject_mixed_case_knowledge_type(&raw, UPDATE_KNOWLEDGE)?;
+            let mut args: InsertKnowledgeArgs = super::common::parse_args_with_builder(
+                UPDATE_KNOWLEDGE,
+                raw,
+                |mut input: InsertKnowledgeArgs| {
+                    input.slug = require_string(input.slug, UPDATE_KNOWLEDGE, "slug")?;
+                    input.title = require_string(input.title, UPDATE_KNOWLEDGE, "title")?;
+                    input.statement =
+                        require_string(input.statement, UPDATE_KNOWLEDGE, "statement")?;
+                    Ok(input)
+                },
+            )?;
+            fill_source_ref_revisions(&mut args.source_refs, state.course_commit.as_ref());
+            let raw_args =
+                serde_json::to_value(&args).expect("failed to serialize graph action args");
+            super::common::parse_graph_command(
+                UPDATE_KNOWLEDGE,
+                raw_args,
+                state,
+                |args: &InsertKnowledgeArgs| UpdateKnowledge {
+                    slug:    args.slug.clone(),
+                    payload: build_insert_knowledge(args).payload,
+                    tags:    args.tags.clone(),
+                },
+                |args: &InsertKnowledgeArgs, _| {
+                    info!(tool = UPDATE_KNOWLEDGE, slug = %args.slug, "graph update knowledge");
+                    command_ok(UPDATE_KNOWLEDGE, json!({"slug": args.slug}))
+                },
+                |e| map_send_err(e, UPDATE_KNOWLEDGE),
+                None,
+            )
         },
-    ),
-    build: |args: &InsertKnowledgeArgs| UpdateKnowledge {
-        slug:    args.slug.clone(),
-        payload: build_insert_knowledge(args).payload,
-        tags:    args.tags.clone(),
-    },
-    ok: |args: &InsertKnowledgeArgs, _| {
-        info!(tool = UPDATE_KNOWLEDGE, slug = %args.slug, "graph update knowledge");
-        command_ok(UPDATE_KNOWLEDGE, json!({"slug": args.slug}))
-    },
-    map_err: |e| map_send_err(e, UPDATE_KNOWLEDGE)
-);
+    }
+}
 
 // ---------- Insert / update teaching step ----------
 
@@ -216,54 +293,71 @@ const UPDATE_TEACHING: &str = "graph_update_teaching_step";
 #[derive(Debug, Clone, Builder, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct InsertTeachingArgs {
-    #[schemars(description = "Stable slug for this teaching step.")]
+    #[schemars(
+        description = "Unique identifier following TS.{name} pattern. Example: \
+                       TS.contract_motivation, TS.docstring_definition"
+    )]
     #[builder(with = |value: String| -> ToolInputResult<_> {
         require_string(value, INSERT_TEACHING, "slug")
     })]
     pub slug:        String,
-    #[schemars(description = "Short title for the teaching step.")]
+    #[schemars(
+        description = "Human-readable title (3-8 words). Example: 'Motivating the Need for \
+                       Contracts'"
+    )]
     #[builder(with = |value: String| -> ToolInputResult<_> {
         require_string(value, INSERT_TEACHING, "title")
     })]
     pub title:       String,
-    #[schemars(description = "Concise statement/summary of the step.")]
+    #[schemars(
+        description = "Brief summary of what this teaching moment does (1-2 sentences). Example: \
+                       'Opens with a crashing function to motivate explicit contracts.'"
+    )]
     #[builder(with = |value: String| -> ToolInputResult<_> {
         require_string(value, INSERT_TEACHING, "statement")
     })]
     pub statement:   String,
     #[schemars(
-        description = "Purpose of the step: setup (prepare/motivate), idea (introduce concept), \
-                       use (apply/practice), or consolidate (refine/summarize)."
+        description = "Pedagogical purpose: setup (motivation/framing), idea (introduces new \
+                       concept), use (applies known knowledge), consolidate \
+                       (summarizes/reinforces)"
     )]
     pub purpose:     TeachingPurpose,
     #[serde(default)]
     #[schemars(
-        description = "Method tags describing pedagogy: e.g., worked-example, naive-first, \
-                       analogy, retrieval-practice, socratic-question, reflection."
+        description = "Pedagogical technique markers. Examples: ['worked-example'], \
+                       ['naive-first'], ['analogy'], ['guided-practice'], ['breakdown']"
     )]
     pub method_tags: Vec<String>,
     #[schemars(
-        description = "Episode identifier; precedes edges for this step must stay within this \
-                       episode."
+        description = "Section/lesson identifier. Used to scope precedes edges (steps in same \
+                       episode are ordered together). Example: '02_contracts', 'chapter3_loops'"
     )]
     #[builder(with = |value: String| -> ToolInputResult<_> {
         require_string(value, INSERT_TEACHING, "episode")
     })]
     pub episode:     String,
     #[serde(default)]
-    #[schemars(description = "Source spans in the repository that define this teaching step.")]
+    #[schemars(
+        description = "REQUIRED. Source location: [{path: 'relative/path.ptx', start_line: 10, \
+                       end_line: 25}]. Do NOT include 'revision' - it is auto-filled."
+    )]
     pub source_refs: Vec<SourceRef>,
     #[serde(default)]
-    #[schemars(description = "Free-form tags to group/filter teaching steps.")]
+    #[schemars(
+        description = "Tags for filtering. REQUIRED: 'source:<chapter_path>' and \
+                       'spec:teaching_steps'. Hints: 'anchors:<slug>:<impact>', 'precedes:<slug>'"
+    )]
     pub tags:        Vec<String>,
     #[serde(default)]
-    #[schemars(description = "Rationale when a step intentionally has no anchors.")]
+    #[schemars(
+        description = "Justification if this step has no anchors edges. Every TeachingStep should \
+                       anchor to knowledge/LOs; if not, explain why."
+    )]
     pub rationale:   Option<String>,
     #[serde(default)]
     #[builder(default = false)]
-    #[schemars(
-        description = "Set apply=true to perform the mutation; default false returns a preview."
-    )]
+    #[schemars(description = "Set true to create. Default false = preview. Always preview first.")]
     pub apply:       bool,
 }
 
@@ -289,61 +383,88 @@ fn build_insert_teaching(args: &InsertTeachingArgs) -> crate::graph::commands::I
     }
 }
 
-crate::graph_action_tool!(
-    insert_teaching_meta,
-    id: INSERT_TEACHING,
-    description: "Insert a TeachingStep in the discourse layer for a specific episode. A \
-                  TeachingStep is an atomic narrative step with purpose \
-                  (setup/idea/use/consolidate) and method_tags that will be ordered by precedes \
-                  and anchored to knowledge/LOs/assessments.",
-    args: InsertTeachingArgs,
-    prepare: |raw| super::common::parse_args_with_builder(
-        INSERT_TEACHING,
-        raw,
-        |mut input: InsertTeachingArgs| {
-            input.slug = require_string(input.slug, INSERT_TEACHING, "slug")?;
-            input.title = require_string(input.title, INSERT_TEACHING, "title")?;
-            input.statement = require_string(input.statement, INSERT_TEACHING, "statement")?;
-            input.episode = require_string(input.episode, INSERT_TEACHING, "episode")?;
-            Ok(input)
+pub(super) fn insert_teaching_meta() -> ToolPrototype {
+    ToolPrototype {
+        id:          INSERT_TEACHING,
+        description: "Create a TeachingStep node representing a narrative moment in the textbook \
+                      (the Discourse Layer). Each step has a purpose (setup/idea/use/consolidate) \
+                      and should be connected via 'precedes' edges to order steps and 'anchors' \
+                      edges to link to knowledge.",
+        schema:      crate::tools::llm::schema_for_args::<InsertTeachingArgs>(),
+        parse:       |raw, state| {
+            let mut args: InsertTeachingArgs = super::common::parse_args_with_builder(
+                INSERT_TEACHING,
+                raw,
+                |mut input: InsertTeachingArgs| {
+                    input.slug = require_string(input.slug, INSERT_TEACHING, "slug")?;
+                    input.title = require_string(input.title, INSERT_TEACHING, "title")?;
+                    input.statement =
+                        require_string(input.statement, INSERT_TEACHING, "statement")?;
+                    input.episode = require_string(input.episode, INSERT_TEACHING, "episode")?;
+                    Ok(input)
+                },
+            )?;
+            fill_source_ref_revisions(&mut args.source_refs, state.course_commit.as_ref());
+            let raw_args =
+                serde_json::to_value(&args).expect("failed to serialize graph action args");
+            super::common::parse_graph_command(
+                INSERT_TEACHING,
+                raw_args,
+                state,
+                build_insert_teaching,
+                |args: &InsertTeachingArgs, _| {
+                    info!(tool = INSERT_TEACHING, slug = %args.slug, "graph insert teaching_step");
+                    command_ok(INSERT_TEACHING, json!({"slug": args.slug}))
+                },
+                |e| map_send_err(e, INSERT_TEACHING),
+                None,
+            )
         },
-    ),
-    build: |args: &InsertTeachingArgs| build_insert_teaching(args),
-    ok: |args: &InsertTeachingArgs, _| {
-        info!(tool = INSERT_TEACHING, slug = %args.slug, "graph insert teaching_step");
-        command_ok(INSERT_TEACHING, json!({"slug": args.slug}))
-    },
-    map_err: |e| map_send_err(e, INSERT_TEACHING)
-);
+    }
+}
 
-crate::graph_action_tool!(
-    update_teaching_meta,
-    id: UPDATE_TEACHING,
-    description: "Update an existing TeachingStep (statement, purpose, method_tags, episode) \
-                  while preserving its identity and discourse links.",
-    args: InsertTeachingArgs,
-    prepare: |raw| super::common::parse_args_with_builder(
-        UPDATE_TEACHING,
-        raw,
-        |mut input: InsertTeachingArgs| {
-            input.slug = require_string(input.slug, UPDATE_TEACHING, "slug")?;
-            input.title = require_string(input.title, UPDATE_TEACHING, "title")?;
-            input.statement = require_string(input.statement, UPDATE_TEACHING, "statement")?;
-            input.episode = require_string(input.episode, UPDATE_TEACHING, "episode")?;
-            Ok(input)
+pub(super) fn update_teaching_meta() -> ToolPrototype {
+    ToolPrototype {
+        id:          UPDATE_TEACHING,
+        description: "Update an existing TeachingStep node's metadata. Useful for fixing \
+                      statements, updating tags, or adding rationale. Provide all fields \
+                      including unchanged ones.",
+        schema:      crate::tools::llm::schema_for_args::<InsertTeachingArgs>(),
+        parse:       |raw, state| {
+            let mut args: InsertTeachingArgs = super::common::parse_args_with_builder(
+                UPDATE_TEACHING,
+                raw,
+                |mut input: InsertTeachingArgs| {
+                    input.slug = require_string(input.slug, UPDATE_TEACHING, "slug")?;
+                    input.title = require_string(input.title, UPDATE_TEACHING, "title")?;
+                    input.statement =
+                        require_string(input.statement, UPDATE_TEACHING, "statement")?;
+                    input.episode = require_string(input.episode, UPDATE_TEACHING, "episode")?;
+                    Ok(input)
+                },
+            )?;
+            fill_source_ref_revisions(&mut args.source_refs, state.course_commit.as_ref());
+            let raw_args =
+                serde_json::to_value(&args).expect("failed to serialize graph action args");
+            super::common::parse_graph_command(
+                UPDATE_TEACHING,
+                raw_args,
+                state,
+                |args: &InsertTeachingArgs| UpdateTeachingStep {
+                    slug:    args.slug.clone(),
+                    payload: build_insert_teaching(args).payload,
+                    tags:    args.tags.clone(),
+                },
+                |args: &InsertTeachingArgs, _| {
+                    info!(tool = UPDATE_TEACHING, slug = %args.slug, "graph update teaching_step");
+                    command_ok(UPDATE_TEACHING, json!({"slug": args.slug}))
+                },
+                |e| map_send_err(e, UPDATE_TEACHING),
+                None,
+            )
         },
-    ),
-    build: |args: &InsertTeachingArgs| UpdateTeachingStep {
-        slug:    args.slug.clone(),
-        payload: build_insert_teaching(args).payload,
-        tags:    args.tags.clone(),
-    },
-    ok: |args: &InsertTeachingArgs, _| {
-        info!(tool = UPDATE_TEACHING, slug = %args.slug, "graph update teaching_step");
-        command_ok(UPDATE_TEACHING, json!({"slug": args.slug}))
-    },
-    map_err: |e| map_send_err(e, UPDATE_TEACHING)
-);
+    }
+}
 
 // ---------- Edge tools ----------
 
@@ -356,32 +477,51 @@ const ADD_ANCHORS: &str = "graph_add_anchors";
 #[derive(Debug, Clone, Builder, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AddRequiresArgs {
-    #[schemars(description = "Prerequisite knowledge slug (source of the requires edge).")]
+    #[schemars(
+        description = "Source node slug (the prerequisite). Must be a Knowledge node \
+                       (factual/conceptual/procedural/metacognitive). Example: 'C.variable_scope'"
+    )]
     #[builder(with = |v: String| -> ToolInputResult<_> {
         require_string(v, ADD_REQUIRES, "from_slug")
     })]
     pub from_slug:     String,
-    #[schemars(description = "Dependent knowledge/assessment slug that requires the source.")]
+    #[schemars(
+        description = "Target node slug (depends on prerequisite). Can be Knowledge or \
+                       AssessmentItem. Example: 'P.write_function' or 'A.scope_exercise'. \
+                       Learning outcomes cannot be targets."
+    )]
     #[builder(with = |v: String| -> ToolInputResult<_> {
         require_string(v, ADD_REQUIRES, "to_slug")
     })]
     pub to_slug:       String,
-    #[schemars(description = "Strength of dependency: necessary | strong | helpful.")]
+    #[schemars(
+        description = "Dependency strength: necessary (cannot proceed without), strong (very \
+                       difficult without), helpful (makes learning easier but not required)"
+    )]
     pub strength:      Strength,
-    #[schemars(description = "Short rationale explaining the prerequisite link.")]
+    #[schemars(description = "REQUIRED. Why does from_slug enable to_slug? Example: \
+                              'Understanding variable scope is necessary to correctly identify \
+                              which variables a function can access.'")]
     #[builder(with = |v: String| -> ToolInputResult<_> {
         require_string(v, ADD_REQUIRES, "rationale")
     })]
     pub rationale:     String,
     #[serde(default)]
     #[schemars(
-        description = "Optional source_refs defending this prerequisite (e.g., text anchors)."
+        description = "Optional source locations supporting this dependency claim. Array of \
+                       {path, start_line, end_line}. Do NOT include 'revision'."
     )]
     pub evidence_refs: Vec<SourceRef>,
     #[serde(default = "default_confidence")]
+    #[schemars(description = "Your confidence in this edge (0.0-1.0). Default 1.0.")]
     pub confidence:    f32,
     #[serde(default)]
     #[builder(default = false)]
+    #[schemars(
+        description = "Set true to create. Default false = preview. The edge will be REJECTED if \
+                       it creates a cycle in the DAG. Run graph_dag_check() after adding to \
+                       verify."
+    )]
     pub apply:         bool,
 }
 
@@ -394,8 +534,7 @@ impl MaybeApply for AddRequiresArgs {
 crate::graph_action_tool!(
     add_requires_meta,
     id: ADD_REQUIRES,
-    description: "Add a requires edge (prerequisite) between knowledge nodes (cycle-checked; \
-                  follows the Knowledge DAG).",
+    description: "Add a prerequisite (requires) edge from a Knowledge node to another Knowledge or AssessmentItem. Forms the dependency DAG. CRITICAL: The system rejects edges that would create cycles. Always run graph_dag_check() after adding requires edges to verify acyclicity.",
     args: AddRequiresArgs,
     prepare: |raw| super::common::parse_args_with_builder(
         ADD_REQUIRES,
@@ -445,44 +584,64 @@ crate::graph_action_tool!(
 #[derive(Debug, Clone, Builder, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AddSupportsArgs {
-    #[schemars(description = "Source knowledge slug providing the support (example/analogy/etc.).")]
+    #[schemars(
+        description = "Source node slug (the scaffold/example). Must be a Knowledge node. \
+                       Example: 'P.docstring_typical_example'"
+    )]
     #[builder(with = |v: String| -> ToolInputResult<_> {
         require_string(v, ADD_SUPPORTS, "from_slug")
     })]
     pub from_slug:       String,
-    #[schemars(description = "Target knowledge/LO slug receiving the support.")]
+    #[schemars(
+        description = "Target node slug (what the scaffold supports). Can be Knowledge or \
+                       LearningOutcome. Example: 'P.python_docstring' or \
+                       'LO.write_documented_function'"
+    )]
     #[builder(with = |v: String| -> ToolInputResult<_> {
         require_string(v, ADD_SUPPORTS, "to_slug")
     })]
     pub to_slug:         String,
     #[schemars(
-        description = "Kind of pedagogical support: worked_example | analogy | counterexample | \
-                       misconception_fix | strategy_hint | rubric_note."
+        description = "Type of scaffold: worked_example (step-by-step demo), analogy (comparison \
+                       to familiar), counterexample (what NOT to do), misconception_fix (corrects \
+                       common mistake), strategy_hint (tip for applying), rubric_note (clarifies \
+                       LO grading)"
     )]
     pub support_kind:    SupportKind,
-    #[schemars(description = "Intended cognitive effect: reduce_extraneous_load | \
-                              increase_germane_load | motivate | contrast.")]
+    #[schemars(
+        description = "Cognitive purpose: reduce_extraneous_load (simplify learning), \
+                       increase_germane_load (deepen understanding), motivate (create desire to \
+                       learn), contrast (highlight boundaries/differences)"
+    )]
     pub intended_effect: IntendedEffect,
     #[serde(default)]
     #[schemars(
-        description = "Case type this support covers: typical | edge | error_case (used for \
-                       example variety policies)."
+        description = "For examples only: typical (happy path, common case), edge (boundary \
+                       condition), error_case (demonstrates failure mode). Procedural nodes need \
+                       both typical AND edge/error_case examples."
     )]
     pub case_tag:        Option<CaseTag>,
     #[serde(default)]
-    #[schemars(
-        description = "Coverage tags describing which cases/conditions this support covers."
-    )]
+    #[schemars(description = "Specific constraints this scaffold covers. Example: \
+                              ['negative_input', 'empty_list']. Helps track which edge cases \
+                              are addressed.")]
     pub coverage_tags:   Vec<String>,
     #[serde(default)]
     #[schemars(
-        description = "Source refs for this support (where the example/analogy lives in the text)."
+        description = "Optional source locations for this scaffold. Array of {path, start_line, \
+                       end_line}. Do NOT include 'revision'."
     )]
     pub evidence_refs:   Vec<SourceRef>,
     #[serde(default = "default_confidence")]
+    #[schemars(description = "Your confidence in this edge (0.0-1.0). Default 1.0.")]
     pub confidence:      f32,
     #[serde(default)]
     #[builder(default = false)]
+    #[schemars(
+        description = "Set true to create. Default false = preview. IMPORTANT: Supports must be \
+                       fadeable—they cannot be the only path to an assessment. Run \
+                       graph_fadeability_view() to check."
+    )]
     pub apply:           bool,
 }
 
@@ -495,10 +654,7 @@ impl MaybeApply for AddSupportsArgs {
 crate::graph_action_tool!(
     add_supports_meta,
     id: ADD_SUPPORTS,
-    description: "Add a supports edge (worked example / analogy / counterexample / misconception \
-                  fix / strategy hint / rubric note) from one knowledge node to another \
-                  knowledge/LO. Supports are scaffolds (Cognitive Load Theory) and must remain \
-                  fadeable.",
+    description: "Add a scaffolding (supports) edge connecting an example/analogy/hint to the knowledge it supports. CRITICAL: Supports must stay 'fadeable'—they cannot be the only path to an assessment. If removing all supports would break assessment reachability, the supports edge should be a requires edge instead. Check with graph_fadeability_view().",
     args: AddSupportsArgs,
     prepare: |raw| super::common::parse_args_with_builder(
         ADD_SUPPORTS,
@@ -549,31 +705,42 @@ crate::graph_action_tool!(
 #[derive(Debug, Clone, Builder, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AddAssessesArgs {
-    #[schemars(description = "Assessment item slug (must be an assessment_item node).")]
+    #[schemars(description = "Source node slug. MUST be an AssessmentItem \
+                              (knowledge_type=assessment_item). Example: 'A.docstring_exercise'")]
     #[builder(with = |v: String| -> ToolInputResult<_> {
         require_string(v, ADD_ASSESSES, "from_slug")
     })]
     pub from_slug:            String,
-    #[schemars(description = "Learning outcome slug being assessed.")]
+    #[schemars(description = "Target node slug. MUST be a LearningOutcome \
+                              (knowledge_type=learning_outcome). Example: \
+                              'LO.write_documented_function'")]
     #[builder(with = |v: String| -> ToolInputResult<_> {
         require_string(v, ADD_ASSESSES, "to_slug")
     })]
     pub to_slug:              String,
     #[schemars(
-        description = "Scope of the evidence link: target (assesses LO directly) or enabling \
-                       (assesses a supporting sub-skill)."
+        description = "Coverage scope: target (assessment directly measures this LO—every LO \
+                       needs at least one target), enabling (assessment measures a prerequisite \
+                       or sub-part of the LO)"
     )]
     pub scope:                AssessmentScope,
     #[serde(default)]
     #[schemars(
-        description = "Observable features/scoring dimensions this item elicits; should cover the \
-                       LO's rubric_criteria for target scope."
+        description = "CRITICAL: Observable behaviors that can be scored from this assessment. \
+                       MUST cover the LO's rubric_criteria. Example: ['test suite passes', \
+                       'docstring includes raises clause']. Use graph_get_node() to check the \
+                       LO's criteria first."
     )]
     pub observation_features: Vec<String>,
     #[serde(default = "default_confidence")]
+    #[schemars(description = "Your confidence in this link (0.0-1.0). Default 1.0.")]
     pub confidence:           f32,
     #[serde(default)]
     #[builder(default = false)]
+    #[schemars(
+        description = "Set true to create. Default false = preview. After creating, run \
+                       graph_lo_alignment_summary(lo_slug=...) to verify coverage."
+    )]
     pub apply:                bool,
 }
 
@@ -586,8 +753,7 @@ impl MaybeApply for AddAssessesArgs {
 crate::graph_action_tool!(
     add_assesses_meta,
     id: ADD_ASSESSES,
-    description: "Add an assesses edge (assessment_item -> learning_outcome). Claim is set to the \
-                  target LO slug automatically.",
+    description: "Link an AssessmentItem to a LearningOutcome. This is how you prove an LO is measurable. Each LO MUST have at least one assesses edge with scope=target. The observation_features list MUST cover the LO's rubric_criteria. Check coverage with graph_lo_alignment_summary().",
     args: AddAssessesArgs,
     prepare: |raw| super::common::parse_args_with_builder(
         ADD_ASSESSES,
@@ -638,28 +804,39 @@ crate::graph_action_tool!(
 #[derive(Debug, Clone, Builder, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AddPrecedesArgs {
-    #[schemars(description = "Slug of earlier teaching step in the episode.")]
+    #[schemars(
+        description = "Earlier TeachingStep slug. Must be a TeachingStep node. Example: \
+                       'TS.motivation'"
+    )]
     #[builder(with = |v: String| -> ToolInputResult<_> {
         require_string(v, ADD_PRECEDES, "from_slug")
     })]
     pub from_slug:  String,
-    #[schemars(description = "Slug of later teaching step in the episode.")]
+    #[schemars(
+        description = "Later TeachingStep slug. Must be a TeachingStep node. Example: \
+                       'TS.definition'"
+    )]
     #[builder(with = |v: String| -> ToolInputResult<_> {
         require_string(v, ADD_PRECEDES, "to_slug")
     })]
     pub to_slug:    String,
-    #[schemars(description = "Episode identifier; precedes edges must stay within this episode.")]
+    #[schemars(
+        description = "Episode/section identifier. MUST match both steps' episode field. Precedes \
+                       edges are scoped within episodes. Example: '02_contracts'"
+    )]
     #[builder(with = |v: String| -> ToolInputResult<_> {
         require_string(v, ADD_PRECEDES, "episode")
     })]
     pub episode:    String,
-    #[schemars(
-        description = "Confidence for this discourse ordering; defaults to 1.0 when omitted."
-    )]
     #[serde(default = "default_confidence")]
+    #[schemars(description = "Your confidence (0.0-1.0). Default 1.0.")]
     pub confidence: f32,
     #[serde(default)]
     #[builder(default = false)]
+    #[schemars(
+        description = "Set true to create. Default false = preview. Precedes edges must be \
+                       acyclic within each episode."
+    )]
     pub apply:      bool,
 }
 
@@ -672,8 +849,7 @@ impl MaybeApply for AddPrecedesArgs {
 crate::graph_action_tool!(
     add_precedes_meta,
     id: ADD_PRECEDES,
-    description: "Add a precedes edge between TeachingSteps in the same episode (acyclic). \
-                  Captures authored narrative order, not logical prerequisite.",
+    description: "Order TeachingSteps within an episode (section/lesson). Creates a sequence representing the authored reading order. Both steps must belong to the same episode. The sequence must be acyclic.",
     args: AddPrecedesArgs,
     prepare: |raw| super::common::parse_args_with_builder(
         ADD_PRECEDES,
@@ -724,26 +900,36 @@ crate::graph_action_tool!(
 #[derive(Debug, Clone, Builder, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AddAnchorsArgs {
-    #[schemars(description = "TeachingStep slug anchoring to knowledge/LO/assessment.")]
+    #[schemars(description = "TeachingStep slug. Example: 'TS.docstring_definition'")]
     #[builder(with = |v: String| -> ToolInputResult<_> {
         require_string(v, ADD_ANCHORS, "from_slug")
     })]
     pub from_slug:  String,
-    #[schemars(description = "Target knowledge/LO/assessment slug this step touches.")]
+    #[schemars(
+        description = "Target Knowledge, LO, or AssessmentItem. What does this teaching step \
+                       interact with? Example: 'C.contract_components', 'LO.write_docstring', \
+                       'A.exercise'"
+    )]
     #[builder(with = |v: String| -> ToolInputResult<_> {
         require_string(v, ADD_ANCHORS, "to_slug")
     })]
     pub to_slug:    String,
     #[schemars(
-        description = "Impact of this step on the target: introduce | use | refine | motivate | \
-                       target."
+        description = "How does this step interact with the target? introduce (first \
+                       presentation), use (applies known knowledge), refine (adds \
+                       nuance/specialization), motivate (creates desire to learn), target \
+                       (articulates LO expectations/rubric)"
     )]
     pub impact:     AnchorImpact,
     #[serde(default = "default_confidence")]
-    #[schemars(description = "Confidence for this anchor; defaults to 1.0 if omitted.")]
+    #[schemars(description = "Your confidence (0.0-1.0). Default 1.0.")]
     pub confidence: f32,
     #[serde(default)]
     #[builder(default = false)]
+    #[schemars(
+        description = "Set true to create. Default false = preview. Each TeachingStep should have \
+                       at least one anchor (or a rationale explaining why not)."
+    )]
     pub apply:      bool,
 }
 
@@ -756,10 +942,7 @@ impl MaybeApply for AddAnchorsArgs {
 crate::graph_action_tool!(
     add_anchors_meta,
     id: ADD_ANCHORS,
-    description: "Add an anchors edge from a TeachingStep to knowledge/LO/assessment with a \
-                  specific impact: introduce/refine (instructional knowledge), target (LO), \
-                  use/motivate (any; assessment targets must use). Enforces discourse \
-                  impact/target rules.",
+    description: "Connect a TeachingStep to the Knowledge/LO/Assessment it interacts with. The impact describes HOW: introduce (first presentation of concept), use (applies known knowledge), refine (adds nuance), motivate (frames why it matters), target (articulates LO rubric).",
     args: AddAnchorsArgs,
     prepare: |raw| super::common::parse_args_with_builder(
         ADD_ANCHORS,
@@ -836,7 +1019,7 @@ impl MaybeApply for RenameNodeArgs {
 crate::graph_action_tool!(
     rename_node_meta,
     id: RENAME_NODE,
-    description: "Rename a node slug and update assesses.claim if needed.",
+    description: "Rename a node's slug. Automatically updates all edge references (from_slug, to_slug, evidence_link.claim). Use this instead of delete+recreate to preserve edges.",
     args: RenameNodeArgs,
     prepare: |raw| super::common::parse_args_with_builder(RENAME_NODE, raw, |mut input: RenameNodeArgs| {
         input.old_slug = require_string(input.old_slug, RENAME_NODE, "old_slug")?;
@@ -874,7 +1057,7 @@ impl MaybeApply for RemoveNodeArgs {
 crate::graph_action_tool!(
     remove_node_meta,
     id: REMOVE_NODE,
-    description: "Delete a node and all connected edges.",
+    description: "Delete a node and ALL edges connected to it (both incoming and outgoing). Use with caution—this is destructive. Consider graph_rename_node if you just need to change the slug.",
     args: RemoveNodeArgs,
     prepare: |raw| super::common::parse_args_with_builder(
         REMOVE_NODE,

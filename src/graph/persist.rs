@@ -1,4 +1,5 @@
 use std::{
+    io::ErrorKind,
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -78,17 +79,24 @@ pub async fn save_graph(
             .await
             .with_context(|| format!("fsync temp snapshot {}", tmp_path.display()))?;
     }
-    // On Windows, rename fails if the destination exists; remove it first to
-    // preserve atomic replace semantics across platforms.
-    if fs::metadata(path).await.is_ok() {
-        fs::remove_file(path)
-            .await
-            .with_context(|| format!("remove existing snapshot {}", path.display()))?;
+    match fs::rename(&tmp_path, path).await {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::AlreadyExists || cfg!(windows) => {
+            // Windows refuses to overwrite; take a backup to avoid data loss.
+            let backup = path.with_extension("bak");
+            if fs::rename(path, &backup).await.is_err() {
+                // If we can't move the old file aside, return the original error.
+                return Err(err)
+                    .with_context(|| format!("rename temp snapshot to {}", path.display()));
+            }
+            fs::rename(&tmp_path, path)
+                .await
+                .with_context(|| format!("rename temp snapshot to {}", path.display()))?;
+            let _ = fs::remove_file(&backup).await;
+            Ok(())
+        }
+        Err(err) => Err(err).with_context(|| format!("rename temp snapshot to {}", path.display())),
     }
-
-    fs::rename(&tmp_path, path)
-        .await
-        .with_context(|| format!("rename temp snapshot to {}", path.display()))
 }
 
 /// Load a snapshot from disk and reconstruct GraphService.

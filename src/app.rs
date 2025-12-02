@@ -1,16 +1,17 @@
 use std::{
     convert::Infallible,
     fs,
-    io::{IsTerminal, stderr},
-    path::{Component, Path, PathBuf},
+    io::{IsTerminal, Write, stderr},
+    path::{Path, PathBuf},
     process::Command,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use bpaf::{OptionParser, Parser, construct, long, positional};
-use futures::future::{BoxFuture, join_all};
+use chrono::Local;
+use futures::future::BoxFuture;
 use kameo::{error::SendError, prelude::*};
 use kameo_actors::scheduler::{Scheduler, SetInterval};
 use kameo_persistence::PersistentActor;
@@ -20,19 +21,19 @@ use tokio::{
     time::{sleep, timeout},
 };
 use tracing::{debug, error, info, warn};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{
+    EnvFilter,
+    fmt::writer::{BoxMakeWriter, MakeWriterExt},
+};
 use url::Url;
 
 use crate::{
     agents::deduplication::{DeduplicationAgent, RunDeduplication},
     constants::PRETEXT_SUBDIR,
-    file_reader::{
-        FileReader, FileReaderQuery, HarvesterFocus, HarvesterReader, WeaverFocus, WeaverReader,
-    },
+    file_reader::{FileReader, FileReaderQuery},
     graph::{
         CurriculumGraph, GraphConfig,
         audit::{FanoutMutationSink, RerunMutationSink},
-        commands::ListNodesByTag,
         manager::{
             ApplyRuntimeConfig, AuditInvariants, GetCourseCommit, GraphManager, GraphManagerState,
             PersistSnapshot, RedundantRequires, SaveSnapshot, SetAuditSink,
@@ -46,6 +47,10 @@ use crate::{
     rerun_sink::{RerunSink, RerunTarget},
     ui::{BackendEvent, UiAction},
 };
+
+pub mod two_phase;
+
+pub use two_phase::run_two_phase_construction;
 
 fn log_scalar(rerun: &Option<ActorRef<RerunSink>>, path: impl Into<String>, value: f64) {
     if let Some(sink) = rerun {
@@ -255,14 +260,6 @@ struct AutosaveTick;
 #[derive(Clone)]
 struct PruneTick;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RerunMode {
-    Grpc,
-    File,
-    Both,
-    None,
-}
-
 #[derive(Clone)]
 struct AutosaveWorker {
     graph:         ActorRef<GraphManager>,
@@ -362,8 +359,7 @@ impl Message<PruneTick> for PruneWorker {
 
 #[derive(Clone, Debug)]
 pub struct Cli {
-    pub rerun_mode:                  RerunMode,
-    pub rerun_file:                  PathBuf,
+    pub rerun_file:                  Option<PathBuf>,
     pub graph_snapshot_path:         PathBuf,
     pub graph_autosave_secs:         u64,
     pub graph_course_commit:         Option<String>,
@@ -375,6 +371,9 @@ pub struct Cli {
     pub dedup_auto_merge_threshold:  f64,
     pub skip_dedup_on_insert:        bool,
     pub interactive:                 bool,
+    pub harvest_timeout_hours:       Option<f64>,
+    pub weave_timeout_hours:         Option<f64>,
+    pub max_concurrent_chapters:     usize,
     pub chapters_pattern:            Option<String>,
     pub chapters_dir:                Option<PathBuf>,
     pub workspace:                   PathBuf,
@@ -470,294 +469,20 @@ fn ensure_parent_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn chapter_scope_tag(workspace_root: &Path, chapter_path: &Path) -> String {
-    let relative = if chapter_path.is_absolute() {
-        pathdiff::diff_paths(chapter_path, workspace_root)
-            .unwrap_or_else(|| chapter_path.to_path_buf())
-    } else {
-        chapter_path.to_path_buf()
-    };
-
-    let normalized = relative
-        .components()
-        .filter_map(|component| match component {
-            Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("/");
-
-    if normalized.is_empty() {
-        chapter_path.display().to_string()
-    } else {
-        normalized
-    }
-}
-
-/// Orchestrate two-phase autonomous graph construction: harvest nodes, run
-/// dedup, then weave edges.
-pub async fn run_two_phase_construction(cli: Cli, chapters: Vec<PathBuf>) -> Result<()> {
-    if chapters.is_empty() {
-        bail!("--chapters matched no files; provide at least one chapter");
-    }
-
-    let mut modified_cli = cli.clone();
-    modified_cli.skip_demo = true;
-    modified_cli.skip_dedup_on_insert = true;
-
-    let workspace_root = modified_cli.workspace.clone();
-    let dedup_threshold = modified_cli.dedup_auto_merge_threshold;
-    let chapters_for_hook = chapters.clone();
-
-    let hook: AppHook = Arc::new(move |handles: AppHandles| -> BoxFuture<'static, Result<()>> {
-        let workspace_root = workspace_root.clone();
-        let chapters = chapters_for_hook.clone();
-        Box::pin(async move {
-            let course_commit = handles
-                .graph
-                .ask(GetCourseCommit)
-                .await
-                .unwrap_or_else(|_| String::new());
-            let metrics = handles
-                .gateway
-                .ask(GetGatewayMetrics)
-                .await
-                .unwrap_or_else(|_| Arc::new(GatewayMetrics::default()));
-
-            let graph = handles.graph.clone();
-            let gateway = handles.gateway.clone();
-            let rerun = handles.rerun.clone();
-            let dedup_agent = handles.dedup.clone();
-            let harvester_focus = HarvesterFocus::All;
-            let weaver_focus = WeaverFocus::All;
-
-            info!(chapters = chapters.len(), "Phase 1: harvesting nodes");
-            let course_commit_for_tasks = course_commit.clone();
-            let harvester_tasks = chapters.iter().map(|chapter_path| {
-                let chapter_path = chapter_path.clone();
-                let chapter_tag = chapter_scope_tag(&workspace_root, &chapter_path);
-                let tag = format!("source:{chapter_tag}");
-                let graph_for_reader = graph.clone();
-                let graph_for_check = graph.clone();
-                let gateway_ref = gateway.clone();
-                let metrics_ref = Arc::clone(&metrics);
-                let dedup_ref = dedup_agent.clone();
-                let rerun_ref = rerun.clone();
-                let workspace = workspace_root.clone();
-                let course_commit = course_commit_for_tasks.clone();
-
-                async move {
-                    let actor = HarvesterReader::from_env(
-                        workspace,
-                        gateway_ref,
-                        metrics_ref,
-                        graph_for_reader,
-                        dedup_ref,
-                        rerun_ref,
-                        course_commit,
-                    )?;
-                    let reader = HarvesterReader::spawn(actor);
-                    let prompt = format!(
-                        "PHASE 1: Harvest EVERY node from {chapter}\n\n- Extract all concepts, \
-                         facts, procedures, strategies, learning outcomes, teaching steps, \
-                         assessments, and worked examples.\n- Do NOT create edges.\n- Tag every \
-                         node with {tag} and add req:/sup:/ref: hints in tags when you see \
-                         dependencies.\n- Focus: {harvester_focus} \
-                         ({harvester_focus_directive}).\n- Aim for 80-150 nodes from this \
-                         chapter; completeness is more important than brevity.",
-                        chapter = chapter_path.display(),
-                        tag = tag,
-                        harvester_focus = harvester_focus,
-                        harvester_focus_directive = harvester_focus.directive(),
-                    );
-                    reader.ask(FileReaderQuery { prompt }).await?;
-
-                    let tagged = graph_for_check
-                        .ask(ListNodesByTag { tag: tag.clone() })
-                        .await
-                        .map_err(anyhow::Error::from)?;
-                    if tagged.is_empty() {
-                        bail!(
-                            "Phase 1 produced no nodes tagged {tag} for chapter {}",
-                            chapter_path.display()
-                        );
-                    }
-
-                    Ok::<_, anyhow::Error>((chapter_path, chapter_tag, tag, tagged.len()))
-                }
-            });
-            let harvester_results: Vec<Result<(PathBuf, String, String, usize)>> =
-                join_all(harvester_tasks).await;
-
-            let mut successful_chapters = Vec::new();
-            let mut failed_harvests = Vec::new();
-
-            for result in harvester_results {
-                match result {
-                    Ok((chapter_path, chapter_tag, tag, tagged_count)) => {
-                        info!(
-                            chapter = %chapter_path.display(),
-                            %tag,
-                            tagged_count,
-                            "Harvest complete for chapter"
-                        );
-                        successful_chapters.push((chapter_path, chapter_tag, tag));
-                    }
-                    Err(err) => {
-                        warn!(error = ?err, "Harvest failed for chapter");
-                        failed_harvests.push(err);
-                    }
-                }
-            }
-
-            if successful_chapters.is_empty() {
-                let errors = failed_harvests
-                    .into_iter()
-                    .map(|e| e.to_string())
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                bail!("Harvest failed for all chapters: {errors}");
-            }
-
-            if !failed_harvests.is_empty() {
-                warn!(
-                    successful = successful_chapters.len(),
-                    failed = failed_harvests.len(),
-                    total = chapters.len(),
-                    "Continuing with successfully harvested chapters only"
-                );
-            }
-
-            info!("Deduplication barrier starting");
-            let dedup_report = dedup_agent
-                .ask(RunDeduplication {
-                    auto_merge_threshold: dedup_threshold,
-                    dry_run:              false,
-                })
-                .await
-                .map_err(anyhow::Error::from)?;
-            info!(
-                clusters = dedup_report.clusters_analyzed,
-                auto_merged = dedup_report.auto_merged.len(),
-                pending_review = dedup_report.pending_review.len(),
-                "Deduplication complete"
-            );
-
-            graph
-                .ask(AuditInvariants)
-                .await
-                .map_err(anyhow::Error::from)?;
-            graph
-                .ask(PersistSnapshot)
-                .await
-                .map_err(anyhow::Error::from)?;
-
-            info!(chapters = successful_chapters.len(), "Phase 2: weaving edges");
-            let course_commit_for_weavers = course_commit.clone();
-            let weaver_tasks = successful_chapters.iter().map(
-                |(chapter_path, _chapter_tag, tag): &(PathBuf, String, String)| {
-                    let chapter_path = chapter_path.clone();
-                    let tag = tag.clone();
-                    let graph_ref = graph.clone();
-                    let gateway_ref = gateway.clone();
-                    let metrics_ref = Arc::clone(&metrics);
-                    let rerun_ref = rerun.clone();
-                    let dedup_ref = dedup_agent.clone();
-                    let workspace = workspace_root.clone();
-                    let course_commit = course_commit_for_weavers.clone();
-
-                    async move {
-                        let actor = WeaverReader::from_env(
-                            workspace,
-                            gateway_ref,
-                            metrics_ref,
-                            graph_ref,
-                            dedup_ref,
-                            rerun_ref,
-                            course_commit,
-                        )?;
-                        let reader = WeaverReader::spawn(actor);
-                        let prompt = format!(
-                            "PHASE 2: Connect ALL nodes for {chapter}\n\n- Start with \
-                             graph_list_nodes_by_tag {tag} to scope the inventory.\n- Use \
-                             graph_search_nodes when slugs are fuzzy; avoid creating new \
-                             nodes.\n- Create requires/supports/assesses/precedes/anchors edges \
-                             with strong rationales and evidence refs.\n- Focus: {weaver_focus} \
-                             ({weaver_focus_directive}).\n- Run graph_gap_summary, \
-                             graph_lo_alignment_summary, and graph_dag_check near the end. Target \
-                             200-400 edges.",
-                            chapter = chapter_path.display(),
-                            tag = tag,
-                            weaver_focus = weaver_focus,
-                            weaver_focus_directive = weaver_focus.directive(),
-                        );
-                        reader
-                            .ask(FileReaderQuery { prompt })
-                            .await
-                            .map(|_| ())
-                            .map_err(anyhow::Error::from)
-                    }
-                },
-            );
-            let weaver_results: Vec<Result<()>> = join_all(weaver_tasks).await;
-            let total_weaves = weaver_results.len();
-            let mut failed_weaves = Vec::new();
-            for ((chapter_path, tag), result) in successful_chapters
-                .into_iter()
-                .map(|(chapter_path, _tag, tag)| (chapter_path, tag))
-                .zip(weaver_results)
-            {
-                if let Err(err) = result {
-                    warn!(
-                        chapter = %chapter_path.display(),
-                        %tag,
-                        error = ?err,
-                        "Weaving failed for chapter"
-                    );
-                    failed_weaves.push(err);
-                }
-            }
-
-            if !failed_weaves.is_empty() {
-                warn!(failed = failed_weaves.len(), "Phase 2 completed with weaving failures");
-            }
-            if total_weaves > 0 && failed_weaves.len() == total_weaves {
-                bail!("Weaving failed for all harvested chapters");
-            }
-
-            graph
-                .ask(AuditInvariants)
-                .await
-                .map_err(anyhow::Error::from)?;
-            info!("Two-phase construction completed");
-            Ok(())
-        })
-    });
-
-    let runtime = RuntimeOptions {
-        on_started: Some(hook),
-        ..RuntimeOptions::default()
-    };
-
-    run_app(modified_cli, runtime).await
+fn default_rerun_file() -> PathBuf {
+    let now = Local::now();
+    let pid = std::process::id();
+    PathBuf::from(format!("weaver-{}-p{pid}.rrd", now.format("%Y%m%d-%H%M%S")))
 }
 
 pub fn cli() -> OptionParser<Cli> {
-    let rerun_mode = long("rerun-mode")
-        .help("Rerun sink mode: grpc | file | both | none (default grpc)")
-        .argument::<String>("mode")
-        .parse(|s| match s.as_str() {
-            "grpc" => Ok(RerunMode::Grpc),
-            "file" => Ok(RerunMode::File),
-            "both" => Ok(RerunMode::Both),
-            "none" => Ok(RerunMode::None),
-            other => Err(format!("invalid rerun mode: {other}")),
-        })
-        .fallback(RerunMode::Grpc);
     let rerun_file = long("rerun-file")
-        .help("Path to write Rerun .rrd when rerun-mode includes file (default weaver.rrd)")
+        .help(
+            "Path to write the Rerun .rrd (live viewer always enabled; default \
+             weaver-YYYYMMDD-HHMMSS-pppp.rrd)",
+        )
         .argument::<PathBuf>("path")
-        .fallback(PathBuf::from("weaver.rrd"));
+        .optional();
     let graph_snapshot_path = long("graph-snapshot-path")
         .help("Path for the legacy JSON graph snapshot (default graph_snapshot.json)")
         .argument::<PathBuf>("path")
@@ -807,14 +532,26 @@ pub fn cli() -> OptionParser<Cli> {
     let interactive = long("interactive")
         .help("Run the legacy interactive FileReader demo instead of two-phase automation")
         .switch();
+    let harvest_timeout_hours = long("harvest-timeout-hours")
+        .help("Two-phase: maximum hours to spend harvesting before proceeding to weaving")
+        .argument::<f64>("hours")
+        .optional();
+    let weave_timeout_hours = long("weave-timeout-hours")
+        .help("Two-phase: maximum hours to spend weaving before finishing")
+        .argument::<f64>("hours")
+        .optional();
+    let max_concurrent_chapters = long("max-concurrent-chapters")
+        .help("Two-phase: maximum chapters to process in parallel (default 4)")
+        .argument::<usize>("count")
+        .fallback(4);
     let chapters_pattern = long("chapters")
         .help(
-            "Glob pattern for chapter files (e.g., 'source/sec-*.ptx'); required with --two-phase",
+            "Glob pattern for chapter entrypoints (defaults to source/*/toctree.ptx when omitted)",
         )
         .argument::<String>("pattern")
         .optional();
     let chapters_dir = long("chapters-dir")
-        .help("Directory containing chapter files; expands to all *.ptx within (recursive)")
+        .help("Directory containing chapter files; expands to all toctree.ptx within (recursive)")
         .argument::<PathBuf>("dir")
         .optional();
     let workspace = positional::<PathBuf>("workspace")
@@ -823,7 +560,6 @@ pub fn cli() -> OptionParser<Cli> {
 
     construct! {
         Cli {
-            rerun_mode,
             rerun_file,
             graph_snapshot_path,
             graph_autosave_secs,
@@ -836,6 +572,9 @@ pub fn cli() -> OptionParser<Cli> {
             dedup_auto_merge_threshold,
             skip_dedup_on_insert,
             interactive,
+            harvest_timeout_hours,
+            weave_timeout_hours,
+            max_concurrent_chapters,
             chapters_pattern,
             chapters_dir,
             workspace,
@@ -937,34 +676,35 @@ async fn reconcile_course_commit(
 async fn spawn_gateway(
     state_url: Url,
     mode: GatewayMode,
+    skip_restore: bool,
 ) -> Result<(ActorRef<LLMGateway>, Arc<GatewayMetrics>)> {
-    match LLMGateway::respawn_persistent(state_url.clone()).await {
-        Ok(actor) => {
-            debug!(path = %state_url, "restored LLM gateway from persistent snapshot");
-            let metrics = actor.ask(GetGatewayMetrics).await.unwrap_or_else(|err| {
-                error!(error = ?err, "failed to fetch gateway metrics after restore");
-                Arc::new(GatewayMetrics::default())
-            });
+    if !skip_restore && let Ok(actor) = LLMGateway::respawn_persistent(state_url.clone()).await {
+        debug!(path = %state_url, "restored LLM gateway from persistent snapshot");
+        let metrics = actor.ask(GetGatewayMetrics).await.unwrap_or_else(|err| {
+            error!(error = ?err, "failed to fetch gateway metrics after restore");
+            Arc::new(GatewayMetrics::default())
+        });
+        return Ok((actor, metrics));
+    }
+
+    debug!(
+        skip_restore,
+        path = %state_url,
+        "gateway state restore unavailable or skipped; starting fresh"
+    );
+    match mode {
+        GatewayMode::Real => {
+            let instance = LLMGateway::from_env()?;
+            let metrics = instance.metrics();
+            let actor = LLMGateway::spawn_persistent(state_url.clone(), instance).await?;
             Ok((actor, metrics))
         }
-        Err(err) => {
-            debug!(error = %err, path = %state_url, "gateway state restore unavailable");
-            match mode {
-                GatewayMode::Real => {
-                    let instance = LLMGateway::from_env()?;
-                    let metrics = instance.metrics();
-                    let actor = LLMGateway::spawn_persistent(state_url.clone(), instance).await?;
-                    Ok((actor, metrics))
-                }
-                GatewayMode::Stub => {
-                    let instance = LLMGateway::from(LLMGatewayState::new(
-                        GatewayMetrics::default().to_state(),
-                    ));
-                    let metrics = instance.metrics();
-                    let actor = LLMGateway::spawn_persistent(state_url.clone(), instance).await?;
-                    Ok((actor, metrics))
-                }
-            }
+        GatewayMode::Stub => {
+            let instance =
+                LLMGateway::from(LLMGatewayState::new(GatewayMetrics::default().to_state()));
+            let metrics = instance.metrics();
+            let actor = LLMGateway::spawn_persistent(state_url.clone(), instance).await?;
+            Ok((actor, metrics))
         }
     }
 }
@@ -1036,7 +776,7 @@ async fn interactive_backend(
 
 pub async fn run_app(cli: Cli, runtime: RuntimeOptions) -> Result<()> {
     if cli.graph_autosave_secs == 0 {
-        anyhow::bail!("--graph-autosave-secs must be at least 1 second");
+        bail!("--graph-autosave-secs must be at least 1 second");
     }
     let interactive_tui = cli.interactive && std::io::stdout().is_terminal();
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -1044,23 +784,64 @@ pub async fn run_app(cli: Cli, runtime: RuntimeOptions) -> Result<()> {
     let (action_tx, action_rx) = mpsc::unbounded_channel();
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let event_tx_for_logs = event_tx.clone();
+    let log_path = {
+        let candidate = PathBuf::from("logs/weaver.log");
+        let resolved = if let Some(parent) = candidate.parent() {
+            if parent.exists() && !parent.is_dir() {
+                PathBuf::from("weaver.log")
+            } else {
+                candidate
+            }
+        } else {
+            candidate
+        };
+        ensure_parent_dir(&resolved)?;
+        resolved
+    };
+    let make_file_writer = |path: PathBuf| -> BoxMakeWriter {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap_or_else(|err| {
+                let _ = writeln!(stderr(), "failed to open log file {}: {err}", path.display());
+                fs::File::create(&path)
+                    .unwrap_or_else(|_| panic!("unable to create log file {}", path.display()))
+            });
+        let shared = Arc::new(Mutex::new(file));
+        BoxMakeWriter::new(move || {
+            shared
+                .lock()
+                .expect("log writer mutex")
+                .try_clone()
+                .unwrap_or_else(|err| {
+                    let _ =
+                        writeln!(stderr(), "failed to clone log file {}: {err}", path.display());
+                    fs::File::create(&path)
+                        .unwrap_or_else(|_| panic!("unable to create log file {}", path.display()))
+                })
+        })
+    };
 
     if interactive_tui {
+        let file_writer = make_file_writer(log_path.clone());
+        let event_writer = BoxMakeWriter::new(move || EventLogWriter {
+            tx:              event_tx_for_logs.clone(),
+            also_stderr:     log_tui_to_stderr,
+            stderr_fallback: stderr(),
+        });
+        let writer = event_writer.and(file_writer);
         let _ = tracing_subscriber::fmt()
             .with_timer(tracing_subscriber::fmt::time::ChronoLocal::new(
                 "%Y-%m-%d %H:%M:%S%.3f".into(),
             ))
             .with_env_filter(filter.clone())
-            .with_writer(move || EventLogWriter {
-                tx:              event_tx_for_logs.clone(),
-                also_stderr:     log_tui_to_stderr,
-                stderr_fallback: stderr(),
-            })
+            .with_writer(writer)
             .try_init();
     } else if let Err(err) = tracing_subscriber::fmt()
         .with_timer(tracing_subscriber::fmt::time::ChronoLocal::new("%Y-%m-%d %H:%M:%S%.3f".into()))
         .with_env_filter(filter)
-        .with_writer(stderr)
+        .with_writer(BoxMakeWriter::new(stderr).and(make_file_writer(log_path.clone())))
         .try_init()
     {
         debug!(error = %err, "tracing subscriber already initialized; continuing");
@@ -1105,7 +886,8 @@ pub async fn run_app(cli: Cli, runtime: RuntimeOptions) -> Result<()> {
         .with_context(|| format!("create graph state dir {}", graph_state_dir.display()))?;
     fs::create_dir_all(&gateway_state_dir)
         .with_context(|| format!("create gateway state dir {}", gateway_state_dir.display()))?;
-    ensure_parent_dir(&cli.rerun_file)?;
+    let rerun_file = cli.rerun_file.clone().unwrap_or_else(default_rerun_file);
+    ensure_parent_dir(&rerun_file)?;
 
     let git_head = git_head_hash();
     let desired_course_commit = cli.graph_course_commit.clone();
@@ -1187,27 +969,21 @@ pub async fn run_app(cli: Cli, runtime: RuntimeOptions) -> Result<()> {
         std::process::exit(1);
     }
 
-    let (gateway, metrics) = spawn_gateway(gateway_state_url.clone(), runtime.gateway_mode).await?;
+    let (gateway, metrics) =
+        spawn_gateway(gateway_state_url.clone(), runtime.gateway_mode, false).await?;
 
     let scheduler = Scheduler::spawn(Scheduler::new());
 
-    let mut rerun_targets = Vec::new();
-    if matches!(cli.rerun_mode, RerunMode::Grpc | RerunMode::Both) {
-        rerun_targets.push(RerunTarget::Grpc {
+    let rerun_targets = vec![
+        RerunTarget::Grpc {
             name: "weaver".into(),
-        });
-    }
-    if matches!(cli.rerun_mode, RerunMode::File | RerunMode::Both) {
-        rerun_targets.push(RerunTarget::File {
+        },
+        RerunTarget::File {
             name: "weaver".into(),
-            path: cli.rerun_file.clone(),
-        });
-    }
-    let rerun_actor = if rerun_targets.is_empty() {
-        None
-    } else {
-        Some(RerunSink::spawn(rerun_targets))
-    };
+            path: rerun_file.clone(),
+        },
+    ];
+    let rerun_actor = Some(RerunSink::spawn(rerun_targets));
     let rerun_viz_actor = rerun_actor.as_ref().map(|rerun| {
         GraphVisualizer::spawn(GraphVisualizer::new(
             graph_actor.clone(),

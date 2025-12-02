@@ -12,7 +12,7 @@
 ## Build, Test, and Development Commands
 
 - `cargo fmt` — format per `rustfmt.toml` (run every time).
-- `cargo clippy --all-targets` — lint; fail on warnings (run every time).
+- `cargo clippy` — lint; fail on warnings (run every time).
 - `cargo test` — unit + property tests; `PROPTEST_CASES=128` for sweeps (run every time).
 - `cargo test --all --locked` — includes the CLI lifecycle integration (`cli_lifecycle`) that covers autosave clamping and `--skip-demo`.
 - `cargo run -- <workspace-root>` — launch FileReader + graph pipeline (default `uncc_cs2-pretext-project/`).
@@ -22,7 +22,7 @@
   - `--graph-course-commit <hash>` (embedded in snapshots; snapshot commit wins by default, overrides warn on mismatch)
   - `-q|--graph-strict-quality` (promote warnings to errors)
   - `--graph-prune-requires-secs <u64>` (optional; disables when omitted)
-  - `--rerun-mode grpc|file|both|none` (default grpc), `--rerun-file <path>` (default `weaver.rrd`)
+  - `--rerun-file <path>` (default `weaver-YYYYMMDD-HHMMSS-pPID.rrd`); rerun always streams live **and** saves an `.rrd`
   - `--skip-demo` (omit the startup FileReader run; useful for headless/CI)
   - positional `<workspace-root>` (default `uncc_cs2-pretext-project/`)
   - Env retained only for OpenAI (`OPENAI_MODEL` required, `OPENAI_API_BASE` optional).

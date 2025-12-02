@@ -11,11 +11,11 @@ use ignore::WalkBuilder;
 use tokio::time::{Duration, timeout};
 use tracing::{debug, trace};
 
+use crate::constants::search::DEFAULT_BLOCKED_DIRS;
+
 /// Directories skipped by default during recursive search to cut noise and
 /// expensive traversals. Keep this list small and overridable via
 /// `SearchOptions::allow`.
-const DEFAULT_BLOCKED_DIRS: &[&str] = &[".git", "target", "node_modules", "vendor"];
-
 /// Result of a regex search within a file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchMatch {

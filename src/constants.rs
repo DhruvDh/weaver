@@ -1,7 +1,7 @@
 /// Default temperature applied to LLM requests. Some models only accept the
 /// default of 1.0, so keep this at the neutral setting.
 /// TODO: Change to 0.6 when running with gpt-oss-120b
-pub const DEFAULT_TEMPERATURE: f32 = 1.0;
+pub const DEFAULT_TEMPERATURE: f32 = 0.6;
 
 /// Default nucleus sampling value applied to LLM requests.
 pub const DEFAULT_TOP_P: f32 = 1.0;
@@ -18,6 +18,49 @@ pub const DEFAULT_MAX_SUBDELEGATIONS: usize = 6;
 
 /// Hard ceiling on delegate task parallelism to prevent runaway fan-out.
 pub const MAX_PARALLEL_DELEGATIONS: usize = 8;
+
+/// --- Graph visualization ---
+pub mod viz {
+    /// Inflate collision circles to keep the layout sparse in force layouts.
+    pub const NODE_RADIUS_SCALE: f32 = 6.0;
+}
+
+/// --- Search tools ---
+pub mod search {
+    /// Directories skipped by filesystem search to avoid noise and slowness.
+    pub const DEFAULT_BLOCKED_DIRS: &[&str] = &[".git", "target", "node_modules", "vendor"];
+}
+
+/// --- LLM tool configuration and metadata ---
+pub mod tools {
+    pub mod search_text {
+        pub const IDENTIFIER: &str = "search_text";
+        pub const DESCRIPTION: &str =
+            "Search for text patterns using regex (ripgrep-style). Use to find specific content \
+             before reading files, like '<section' to find section boundaries or 'def\\s+\\w+' to \
+             find function definitions. Returns file paths and line numbers of matches. Use \
+             fetch_body=false to preview match count, then true to get content.";
+        pub const PREVIEW_MATCH_CAP: usize = 200;
+        pub const PREVIEW_BYTE_CAP: u64 = 64 * 1024;
+        pub const BODY_MATCH_CAP: usize = 2_000;
+        pub const BODY_BYTE_CAP: u64 = 1_000_000;
+    }
+
+    pub mod read_file_range {
+        pub const IDENTIFIER: &str = "read_file_range";
+        pub const DESCRIPTION: &str = "Read a specific line range from a file. Use for targeted \
+                                       reads instead of reading entire files. Lines are 1-based \
+                                       and inclusive. First call with fetch_body=false to preview \
+                                       size, then fetch_body=true to get content. Prefer this \
+                                       over read_file_full for large files.";
+    }
+}
+
+/// --- UI ---
+pub mod ui {
+    /// Maximum number of log lines shown in UI summaries.
+    pub const MAX_LOG_LINES: usize = 3;
+}
 
 /// Maximum number of in-flight OpenAI requests handled by the gateway.
 pub const LLM_MAX_CONCURRENT_REQUESTS: usize = 128;
@@ -85,9 +128,6 @@ pub const MAX_TOOL_PATH_LEN: usize = 4_096;
 
 /// Maximum number of delegated tasks accepted per call.
 pub const MAX_DELEGATED_TASKS: usize = 24;
-
-/// Maximum length of a delegated task description.
-pub const MAX_DELEGATED_TASK_LEN: usize = 512;
 
 /// Maximum regex pattern length accepted by search tools.
 pub const MAX_SEARCH_PATTERN_LEN: usize = 256;

@@ -19,6 +19,7 @@ use async_openai::{
         ChatCompletionRequestMessage, ChatCompletionRequestToolMessageArgs,
         ChatCompletionResponseMessage, ChatCompletionTool, CompletionUsage,
         CreateChatCompletionRequest, CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
+        ReasoningEffort,
     },
 };
 use dashmap::DashMap;
@@ -34,6 +35,7 @@ use tokio::{
     sync::Semaphore,
     time::{sleep, timeout},
 };
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use url::Url;
 
@@ -769,6 +771,7 @@ impl LLMGateway {
             .temperature(temperature)
             .top_p(top_p)
             .tools(tools)
+            .reasoning_effort(ReasoningEffort::Medium)
             .build()
             .context("failed to build chat completion request")
     }
@@ -940,15 +943,17 @@ impl LLMGateway {
                 Ok(value) => value,
                 Err(SendError::HandlerError(err)) => match err {
                     llm::ToolExecutionError::Input(input_err) => {
+                        let code = Self::tool_input_code(&input_err);
                         warn!(
                             iteration,
                             tool = tool_name.as_str(),
+                            code,
                             error = %input_err,
                             "tool reported invalid input"
                         );
                         Self::tool_error_output(
                             &tool_name,
-                            Self::tool_input_code(&input_err),
+                            code,
                             parsed_args.clone(),
                             input_err.to_string(),
                         )
@@ -991,6 +996,7 @@ impl LLMGateway {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn call_with_retry<F>(
         client: Client<OpenAIConfig>,
         config: &GatewayConfig,
@@ -998,6 +1004,7 @@ impl LLMGateway {
         rerun: Option<ActorRef<RerunSink>>,
         iteration: usize,
         model_label: &str,
+        cancellation: CancellationToken,
         mut build_payload: F,
     ) -> Result<CreateChatCompletionResponse>
     where
@@ -1006,12 +1013,19 @@ impl LLMGateway {
         let mut attempt = 0usize;
         let base = format!("metrics/llm/{}", model_label);
         loop {
+            if cancellation.is_cancelled() {
+                return Err(anyhow!("chat completion cancelled"));
+            }
             attempt += 1;
             let payload = build_payload()?;
             let started = Instant::now();
             let client = client.clone();
-            let call =
-                timeout(config.timeout, async move { client.chat().create(payload).await }).await;
+            let call = tokio::select! {
+                _ = cancellation.cancelled() => {
+                    return Err(anyhow!("chat completion cancelled"));
+                }
+                result = timeout(config.timeout, async move { client.chat().create(payload).await }) => result,
+            };
             match call {
                 Ok(Ok(resp)) => {
                     let elapsed = started.elapsed();
@@ -1208,6 +1222,9 @@ impl LLMGateway {
         let tools = llm::tool_specs(&request.tool_ids)
             .context("failed to render tool specifications for request")?;
         for iteration in 0..request.max_iterations {
+            if request.cancellation_token.is_cancelled() {
+                return Err(anyhow!("chat completion cancelled"));
+            }
             debug!(iteration, "Starting LLM tool iteration");
             let response = Self::call_with_retry(
                 client.clone(),
@@ -1216,6 +1233,7 @@ impl LLMGateway {
                 request.rerun.clone(),
                 iteration,
                 request.model.as_str(),
+                request.cancellation_token.clone(),
                 || {
                     Self::build_request(
                         request.model.as_str(),
@@ -1257,6 +1275,9 @@ impl LLMGateway {
                     &mut iter_state,
                 )
                 .await?;
+                if request.cancellation_token.is_cancelled() {
+                    return Err(anyhow!("chat completion cancelled"));
+                }
                 continue;
             }
 
@@ -1290,16 +1311,17 @@ impl Message<GetGatewayMetrics> for LLMGateway {
 
 #[derive(Clone, Debug)]
 pub struct ChatCompletionRequest {
-    pub model:           Arc<String>,
-    pub messages:        Vec<ChatCompletionRequestMessage>,
-    pub temperature:     f32,
-    pub top_p:           f32,
-    pub tool_ids:        Vec<&'static str>,
-    pub max_iterations:  usize,
-    pub tool_host:       ToolHost,
-    pub actor_name:      String,
-    pub conversation_id: String,
-    pub rerun:           Option<ActorRef<RerunSink>>,
+    pub model:              Arc<String>,
+    pub messages:           Vec<ChatCompletionRequestMessage>,
+    pub temperature:        f32,
+    pub top_p:              f32,
+    pub tool_ids:           Vec<&'static str>,
+    pub max_iterations:     usize,
+    pub tool_host:          ToolHost,
+    pub actor_name:         String,
+    pub conversation_id:    String,
+    pub rerun:              Option<ActorRef<RerunSink>>,
+    pub cancellation_token: CancellationToken,
 }
 
 impl Message<ChatCompletionRequest> for LLMGateway {
@@ -1314,11 +1336,16 @@ impl Message<ChatCompletionRequest> for LLMGateway {
         let semaphore = Arc::clone(&self.semaphore);
         let config = self.config.clone();
         let metrics = Arc::clone(&self.metrics);
+        let cancellation = msg.cancellation_token.clone();
         ctx.spawn(async move {
-            let _permit = semaphore
-                .acquire_owned()
-                .await
-                .map_err(|_| anyhow!("llm gateway shutting down"))?;
+            let _permit = tokio::select! {
+                _ = cancellation.cancelled() => {
+                    return Err(anyhow!("chat completion cancelled"));
+                }
+                permit = semaphore.acquire_owned() => {
+                    permit.map_err(|_| anyhow!("llm gateway shutting down"))?
+                }
+            };
             Self::run_conversation(client, msg, config, metrics).await
         })
     }

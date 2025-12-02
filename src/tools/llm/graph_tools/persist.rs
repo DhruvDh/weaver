@@ -1,6 +1,8 @@
 use std::{
     env,
     path::{Path, PathBuf},
+    pin::Pin,
+    sync::Arc,
 };
 
 use anyhow::anyhow;
@@ -13,7 +15,10 @@ use tracing::info;
 use super::common::{MaybeApply, map_send_err_anyhow, parse_args_with_builder};
 use crate::{
     graph::{commands::LoadSnapshot, manager::SaveSnapshot},
-    tools::llm::{ToolExecutionError, ToolInputError, ToolPrototype, require_string},
+    tools::llm::{
+        CallState, ToolExecutionError, ToolInputError, ToolPrototype, require_string,
+        resolve_workspace_path,
+    },
 };
 
 fn command_ok(tool: &'static str, extra: serde_json::Value) -> serde_json::Value {
@@ -75,7 +80,20 @@ crate::graph_action_tool!(
         info!(tool = SAVE_SNAPSHOT, path = %path, "graph save snapshot");
         ok_save_snapshot(args, reply)
     },
-    map_err: map_send_err_anyhow
+    map_err: map_send_err_anyhow,
+    preflight: Some(Arc::new(
+        |args: &SaveSnapshotArgs, state: &CallState| -> Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<(), crate::tools::llm::ToolExecutionError>
+                    > + Send,
+            >,
+        > {
+            let provided = args.path.clone();
+            let root = Arc::clone(&state.workspace_root);
+            Box::pin(async move { preflight_snapshot_path(provided, SAVE_SNAPSHOT, root).await })
+        },
+    ))
 );
 
 #[derive(Debug, Clone, Builder, Deserialize, Serialize, JsonSchema)]
@@ -152,12 +170,36 @@ crate::graph_action_tool!(
         info!(tool = LOAD_SNAPSHOT, path = %args.path, "graph load snapshot");
         command_ok(LOAD_SNAPSHOT, json!({"path": args.path}))
     },
-    map_err: map_load_snapshot_err
+    map_err: map_load_snapshot_err,
+    preflight: Some(Arc::new(
+        |args: &LoadSnapshotArgs, state: &CallState| -> Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<(), crate::tools::llm::ToolExecutionError>
+                    > + Send,
+            >,
+        > {
+            let provided = Some(args.path.clone());
+            let root = Arc::clone(&state.workspace_root);
+            Box::pin(async move { preflight_snapshot_path(provided, LOAD_SNAPSHOT, root).await })
+        },
+    ))
 );
 
 fn resolve_snapshot_path(path: Option<String>) -> String {
     path.or_else(|| env::var("GRAPH_SNAPSHOT_PATH").ok())
         .unwrap_or_else(|| "graph_snapshot.json".to_string())
+}
+
+async fn preflight_snapshot_path(
+    provided: Option<String>,
+    tool: &'static str,
+    workspace_root: Arc<PathBuf>,
+) -> Result<(), ToolExecutionError> {
+    let path = resolve_snapshot_path(provided);
+    resolve_workspace_path(workspace_root.as_ref(), Path::new(&path), tool)
+        .map_err(ToolExecutionError::Input)?;
+    Ok(())
 }
 
 pub(super) fn tool_prototypes() -> Vec<ToolPrototype> {

@@ -201,9 +201,11 @@ fn ensure_cost_block(
                 .or_insert_with(|| json!(hints));
         }
         _ => {
+            let data = std::mem::take(payload);
             *payload = json!({
                 "type": "preview",
                 "tool": "<unknown>",
+                "data": data,
                 "cost": {
                     "bytes_total": bytes_total,
                     "approx_tokens": approx_tokens,

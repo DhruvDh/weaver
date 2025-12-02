@@ -4,13 +4,13 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use fjadra::{Center, Collide, Link, ManyBody, Node, SimulationBuilder};
 use kameo::prelude::*;
 use rerun::{Color, GraphEdges, GraphNodes, archetypes::Arrows2D, components::GraphType};
 use tokio::{task, time::sleep};
 use tracing::debug;
 
 use crate::{
+    constants::viz::NODE_RADIUS_SCALE,
     graph::{
         CurriculumGraph, EdgeKind, NodeKind,
         audit::{MutationEvent, MutationEventSink},
@@ -77,20 +77,10 @@ impl Palette {
             NodeKind::TeachingStep(_) => Color::from_rgb(102, 194, 165),
         }
     }
-
-    fn edge_color(kind: &EdgeKind) -> Color {
-        match kind {
-            EdgeKind::Requires(_) => Color::from_rgb(55, 126, 184),
-            EdgeKind::Supports(_) => Color::from_rgb(255, 127, 0),
-            EdgeKind::Assesses(_) => Color::from_rgb(152, 78, 163),
-            EdgeKind::Precedes(_) => Color::from_rgb(153, 153, 153),
-            EdgeKind::Anchors(_) => Color::from_rgb(77, 175, 74),
-        }
-    }
 }
 
 fn node_radius(kind: &NodeKind) -> f32 {
-    match kind {
+    let base = match kind {
         NodeKind::Knowledge(k) => match k.knowledge_type {
             KnowledgeType::LearningOutcome => 9.5,
             KnowledgeType::AssessmentItem => 9.0,
@@ -100,27 +90,9 @@ fn node_radius(kind: &NodeKind) -> f32 {
             KnowledgeType::Factual => 6.0,
         },
         NodeKind::TeachingStep(_) => 5.0,
-    }
-}
+    };
 
-fn edge_distance(kind: &EdgeKind) -> f64 {
-    match kind {
-        EdgeKind::Requires(_) => 55.0,
-        EdgeKind::Supports(_) => 70.0,
-        EdgeKind::Assesses(_) => 72.0,
-        EdgeKind::Precedes(_) => 60.0,
-        EdgeKind::Anchors(_) => 64.0,
-    }
-}
-
-fn edge_strength(kind: &EdgeKind) -> f64 {
-    match kind {
-        EdgeKind::Requires(_) => 1.2,
-        EdgeKind::Supports(_) => 0.75,
-        EdgeKind::Assesses(_) => 1.05,
-        EdgeKind::Precedes(_) => 0.4,
-        EdgeKind::Anchors(_) => 0.55,
-    }
+    base * NODE_RADIUS_SCALE
 }
 
 #[derive(Default, Clone, Copy)]
@@ -209,65 +181,33 @@ fn first_source_ref(node: &NodePayload) -> Option<String> {
     })
 }
 
-fn summarize_edge(kind: &EdgeKind, confidence: f32) -> String {
-    match kind {
-        EdgeKind::Requires(attrs) => format!(
-            "requires · strength={:?} · conf={:.0}%\nrationale: {}",
-            attrs.strength,
-            confidence * 100.0,
-            truncate(&attrs.rationale, 140)
-        ),
-        EdgeKind::Supports(attrs) => format!(
-            "supports · kind={:?} · effect={:?} · conf={:.0}%\ncoverage: {}\nrefs: {}",
-            attrs.support_kind,
-            attrs.intended_effect,
-            confidence * 100.0,
-            truncate(&attrs.coverage_tags.join(", "), 120),
-            attrs.evidence_refs.len()
-        ),
-        EdgeKind::Assesses(attrs) => format!(
-            "assesses · scope={:?} · conf={:.0}%\nclaim: {}\nfeatures: {}",
-            attrs.evidence_link.scope,
-            confidence * 100.0,
-            attrs.evidence_link.claim,
-            truncate(&attrs.evidence_link.observation_features.join(", "), 140)
-        ),
-        EdgeKind::Precedes(attrs) => {
-            format!("precedes · episode={} · conf={:.0}%", attrs.episode, confidence * 100.0)
-        }
-        EdgeKind::Anchors(attrs) => {
-            format!("anchors · impact={:?} · conf={:.0}%", attrs.impact, confidence * 100.0)
-        }
-    }
-}
-
 fn truncate(s: &str, max: usize) -> String {
     let trimmed = s.trim();
     if trimmed.len() <= max {
         return trimmed.to_string();
     }
-    let mut out = trimmed[..max].to_string();
+    let mut end = max;
+    while end > 0 && !trimmed.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = trimmed[..end].to_string();
     out.push('…');
     out
 }
 
 #[derive(Clone, Debug)]
 pub struct GraphVizConfig {
-    pub entity_path:    String,
-    pub edge_path:      String,
-    pub debounce_ms:    u64,
-    pub layout_ticks:   usize,
-    pub velocity_decay: f64,
+    pub entity_path: String,
+    pub edge_path:   String,
+    pub debounce_ms: u64,
 }
 
 impl Default for GraphVizConfig {
     fn default() -> Self {
         Self {
-            entity_path:    "graph/live".to_string(),
-            edge_path:      "graph/live/edges".to_string(),
-            debounce_ms:    150,
-            layout_ticks:   30,
-            velocity_decay: 0.75,
+            entity_path: "graph/live".to_string(),
+            edge_path:   "graph/live/edges".to_string(),
+            debounce_ms: 150,
         }
     }
 }
@@ -276,7 +216,6 @@ pub struct GraphVisualizer {
     graph:            ActorRef<GraphManager>,
     rerun:            ActorRef<RerunSink>,
     config:           GraphVizConfig,
-    positions:        HashMap<String, [f32; 2]>,
     pending_version:  Option<u64>,
     pending_time_ns:  Option<i64>,
     render_scheduled: bool,
@@ -293,7 +232,6 @@ impl GraphVisualizer {
             graph,
             rerun,
             config,
-            positions: HashMap::new(),
             pending_version: None,
             pending_time_ns: None,
             render_scheduled: false,
@@ -403,8 +341,7 @@ impl Message<RenderNow> for GraphVisualizer {
                 .and_then(|d| i64::try_from(d.as_nanos()).ok())
         });
 
-        if let Some(frame) = build_frame(graph.as_ref(), &mut self.positions, &self.config, time_ns)
-        {
+        if let Some(frame) = build_frame(graph.as_ref(), &self.config, time_ns) {
             let msg = LogGraphFrame {
                 entity_path:       self.config.entity_path.clone(),
                 edge_overlay_path: self.config.edge_path.clone(),
@@ -437,17 +374,9 @@ struct Frame {
     time_ns: Option<i64>,
 }
 
-struct EdgeEntry {
-    from_ix:    usize,
-    to_ix:      usize,
-    kind:       EdgeKind,
-    confidence: f32,
-}
-
 fn build_frame(
     graph: &CurriculumGraph,
-    positions: &mut HashMap<String, [f32; 2]>,
-    config: &GraphVizConfig,
+    _config: &GraphVizConfig,
     time_ns: Option<i64>,
 ) -> Option<Frame> {
     if graph.node_count() == 0 {
@@ -461,9 +390,8 @@ fn build_frame(
     nodes.sort_by(|(_, a), (_, b)| a.slug.cmp(&b.slug));
 
     let mut index_by_id = HashMap::new();
-    for (ix, (node_id, payload)) in nodes.iter().enumerate() {
+    for (ix, (node_id, _payload)) in nodes.iter().enumerate() {
         index_by_id.insert(*node_id, ix);
-        positions.entry(payload.slug.clone()).or_insert([0.0, 0.0]);
     }
 
     let node_ids: Vec<String> = nodes.iter().map(|(_, n)| n.slug.clone()).collect();
@@ -473,17 +401,7 @@ fn build_frame(
         .map(|(_, n)| Palette::node_color(&n.kind))
         .collect();
 
-    let initial_positions: Vec<[f64; 2]> = nodes
-        .iter()
-        .map(|(_, n)| positions.get(&n.slug).copied().unwrap_or([0.0, 0.0]))
-        .map(|[x, y]| [x as f64, y as f64])
-        .collect();
-
-    let mut link_pairs = Vec::new();
-    let mut distances = Vec::new();
-    let mut strengths = Vec::new();
     let mut edge_pairs = Vec::new();
-    let mut edge_entries = Vec::new();
     let mut stats = vec![NodeStats::default(); nodes.len()];
 
     for edge_id in graph.edge_indices() {
@@ -501,15 +419,6 @@ fn build_frame(
 
         let payload = &graph[edge_id];
         edge_pairs.push((graph[from].slug.clone(), graph[to].slug.clone()));
-        link_pairs.push((from_ix, to_ix));
-        distances.push(edge_distance(&payload.kind));
-        strengths.push(edge_strength(&payload.kind));
-        edge_entries.push(EdgeEntry {
-            from_ix,
-            to_ix,
-            kind: payload.kind.clone(),
-            confidence: payload.confidence,
-        });
 
         if from_ix == to_ix {
             let stat = &mut stats[from_ix];
@@ -562,88 +471,13 @@ fn build_frame(
         }
     }
 
-    let mut simulation = SimulationBuilder::default()
-        .with_velocity_decay(config.velocity_decay)
-        .build(initial_positions.iter().map(|pos| Node::from(*pos)));
-
-    if !link_pairs.is_empty() {
-        let avg_distance =
-            distances.iter().copied().sum::<f64>() / (distances.len() as f64).max(1.0);
-        let avg_strength =
-            strengths.iter().copied().sum::<f64>() / (strengths.len() as f64).max(1.0);
-        let link = Link::new(link_pairs)
-            .distance(avg_distance)
-            .strength(avg_strength)
-            .iterations(2);
-        simulation = simulation.add_force("link", link);
-    }
-
-    let radii_for_collide: Vec<f64> = radii.iter().map(|r| (*r as f64).max(2.0) * 1.1).collect();
-    simulation = simulation
-        .add_force("charge", ManyBody::new().strength(-80.0))
-        .add_force("center", Center::new())
-        .add_force(
-            "collide",
-            Collide::new()
-                .radius({
-                    let radii_for_collide = radii_for_collide.clone();
-                    move |i| radii_for_collide[i]
-                })
-                .strength(0.8)
-                .iterations(2),
-        );
-
-    simulation.tick(config.layout_ticks);
-    let final_positions: Vec<[f32; 2]> = simulation
-        .positions()
-        .map(|[x, y]| [x as f32, y as f32])
-        .collect();
-
-    for (slug, pos) in node_ids.iter().zip(final_positions.iter()) {
-        positions.insert(slug.clone(), *pos);
-    }
-
     let node_labels: Vec<String> = nodes
         .iter()
         .enumerate()
         .map(|(ix, (_, n))| summarize_node(n, &stats[ix]))
         .collect();
 
-    let arrows = if edge_entries.is_empty() {
-        None
-    } else {
-        let origins: Vec<[f32; 2]> = edge_entries
-            .iter()
-            .map(|e| final_positions[e.from_ix])
-            .collect();
-        let vectors: Vec<[f32; 2]> = edge_entries
-            .iter()
-            .map(|e| {
-                let from = final_positions[e.from_ix];
-                let to = final_positions[e.to_ix];
-                [to[0] - from[0], to[1] - from[1]]
-            })
-            .collect();
-        let colors: Vec<Color> = edge_entries
-            .iter()
-            .map(|e| Palette::edge_color(&e.kind))
-            .collect();
-        let labels: Vec<String> = edge_entries
-            .iter()
-            .map(|e| summarize_edge(&e.kind, e.confidence))
-            .collect();
-
-        Some(
-            Arrows2D::from_vectors(vectors)
-                .with_origins(origins)
-                .with_colors(colors)
-                .with_labels(labels)
-                .with_radii(vec![1.0_f32; edge_entries.len()]),
-        )
-    };
-
     let nodes = GraphNodes::new(node_ids)
-        .with_positions(final_positions)
         .with_labels(node_labels)
         .with_colors(colors)
         .with_radii(radii);
@@ -652,7 +486,7 @@ fn build_frame(
     Some(Frame {
         nodes,
         edges,
-        arrows,
+        arrows: None,
         time_ns,
     })
 }

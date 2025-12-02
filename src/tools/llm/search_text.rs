@@ -13,23 +13,24 @@ use super::{
     render_relative_path, resolve_workspace_path, trim_optional,
 };
 use crate::{
-    constants::{MAX_SEARCH_PATTERN_LEN, MAX_TOOL_PATH_LEN},
+    constants::{
+        MAX_SEARCH_PATTERN_LEN, MAX_TOOL_PATH_LEN,
+        tools::search_text::{
+            BODY_BYTE_CAP, BODY_MATCH_CAP, DESCRIPTION, IDENTIFIER, PREVIEW_BYTE_CAP,
+            PREVIEW_MATCH_CAP,
+        },
+    },
     tools::search::{self, SearchOptions},
 };
-
-const IDENTIFIER: &str = "search_text";
-const DESCRIPTION: &str = "Run a regex search (ripgrep-style) within the workspace.";
-const PREVIEW_MATCH_CAP: usize = 200;
-const PREVIEW_BYTE_CAP: u64 = 64 * 1024;
-const BODY_MATCH_CAP: usize = 2_000;
-const BODY_BYTE_CAP: u64 = 1_000_000;
 
 #[derive(Debug, Clone, Builder, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SearchTextArgs {
     #[schemars(
         length(min = 1, max = MAX_SEARCH_PATTERN_LEN),
-        description = "Rust-style regular expression."
+        description = "Regex pattern (Rust/ripgrep style). Examples: '<section' (XML tags), \
+                       'def\\s+\\w+' (function defs), 'TODO|FIXME' (comments). Case-sensitive by \
+                       default; use (?i) prefix for case-insensitive."
     )]
     #[builder(with = |value: String| -> ToolInputResult<_> {
         let pattern = super::require_string(value, IDENTIFIER, "pattern")?;
@@ -40,7 +41,8 @@ pub struct SearchTextArgs {
     #[serde(default)]
     #[schemars(
         length(min = 1, max = MAX_TOOL_PATH_LEN),
-        description = "Optional directory to scope the search. Defaults to root."
+        description = "Directory or file to search within (relative to workspace). Omit to search \
+                       entire workspace. Example: '02_contracts' to search only that chapter."
     )]
     #[builder(with = |value: String| -> ToolInputResult<_> {
         let path = super::require_string(value, IDENTIFIER, "path")?;
@@ -50,15 +52,15 @@ pub struct SearchTextArgs {
     pub path:       Option<String>,
     #[serde(default)]
     #[schemars(
-        description = "Directory names to include even if normally excluded (target, .git, \
-                       node_modules, vendor)."
+        description = "Include normally-excluded directories in search. Rarely needed. Examples: \
+                       ['vendor'] to search vendored code, ['.git'] to search git metadata."
     )]
     #[builder(default)]
     pub allow:      Vec<String>,
     #[serde(default)]
     #[schemars(
-        description = "When true, return all search matches immediately; otherwise return a \
-                       preview header.",
+        description = "Set true to return match content. Default false = returns match count and \
+                       locations only. Use false first to check result size, then true to fetch.",
         default = "crate::tools::llm::default_false"
     )]
     #[builder(default = false)]

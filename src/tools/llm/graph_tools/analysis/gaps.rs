@@ -23,7 +23,7 @@ const PRACTICE_GAPS_VIEW: &str = "graph_practice_gaps_view";
 pub struct GapSummaryArgs {
     #[serde(default)]
     #[schemars(
-        description = "When true, return the summary payload; otherwise return a cost preview.",
+        description = "Return payload if true.",
         default = "crate::tools::llm::default_false"
     )]
     pub fetch_body: bool,
@@ -33,10 +33,10 @@ pub struct GapSummaryArgs {
 #[serde(deny_unknown_fields)]
 pub struct GapViewArgs {
     #[serde(default)]
-    #[schemars(description = "Maximum items to return (default 50, max 200).")]
+    #[schemars(description = "Max results (default 50, max 200).")]
     pub limit:  Option<usize>,
     #[serde(default)]
-    #[schemars(description = "Offset into the result set (default 0).")]
+    #[schemars(description = "Pagination offset.")]
     pub offset: Option<usize>,
 }
 
@@ -52,8 +52,7 @@ pub(super) fn tool_prototypes() -> Vec<ToolPrototype> {
 crate::analysis_tool!(
     gap_summary_meta,
     id: GAP_SUMMARY,
-    description: "Compact summary of example gaps, fadeability issues, and practice gaps with \
-                  preview/cost support.",
+    description: "Master gap analysis showing all structural issues: (1) Example gaps—procedural nodes missing typical+edge examples, (2) Fadeability violations—supports edges carrying prerequisite load, (3) Practice gaps—procedural nodes without assessment paths. Returns counts and actionable lists. Run after weaving to find remaining issues.",
     args: GapSummaryArgs,
     prepare: |raw| crate::tools::llm::common::parse_args(GAP_SUMMARY, raw),
     runner: |args: GapSummaryArgs, state: &CallState| GapSummaryTool {
@@ -65,7 +64,7 @@ crate::analysis_tool!(
 crate::analysis_tool!(
     example_gaps_view_meta,
     id: EXAMPLE_GAPS_VIEW,
-    description: "View example/variety gaps with pagination.",
+    description: "List procedural and conceptual nodes missing required examples. Procedural nodes need at least 2 supports edges with support_kind=worked_example: one with case_tag=typical and one with case_tag=edge or error_case. Conceptual nodes need at least one counterexample or analogy. Returns a list of slugs to fix.",
     args: GapViewArgs,
     prepare: |raw| crate::tools::llm::common::parse_args(EXAMPLE_GAPS_VIEW, raw),
     runner: |args: GapViewArgs, state: &CallState| ExampleGapsViewTool {
@@ -77,8 +76,7 @@ crate::analysis_tool!(
 crate::analysis_tool!(
     fadeability_view_meta,
     id: FADEABILITY_VIEW,
-    description: "View assessments that fail fadeability (supports acting as hidden \
-                  prerequisites).",
+    description: "Find supports edges that violate fadeability—they're the only path to an assessment. Supports should be removable scaffolding, not prerequisites. Fix by either: (1) adding a requires edge to provide an alternate path, or (2) converting the supports edge to requires if it's actually a prerequisite.",
     args: GapViewArgs,
     prepare: |raw| crate::tools::llm::common::parse_args(FADEABILITY_VIEW, raw),
     runner: |args: GapViewArgs, state: &CallState| FadeabilityViewTool {
@@ -90,7 +88,7 @@ crate::analysis_tool!(
 crate::analysis_tool!(
     practice_gaps_view_meta,
     id: PRACTICE_GAPS_VIEW,
-    description: "View procedural practice gaps with pagination.",
+    description: "Find procedural nodes that aren't connected to any practice assessment. Procedural knowledge must reach an AssessmentItem that targets a LearningOutcome (scope=target). If disconnected, add requires edges from the procedure to relevant assessments.",
     args: GapViewArgs,
     prepare: |raw| crate::tools::llm::common::parse_args(PRACTICE_GAPS_VIEW, raw),
     runner: |args: GapViewArgs, state: &CallState| PracticeGapsViewTool {

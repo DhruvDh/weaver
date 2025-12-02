@@ -12,17 +12,20 @@ use super::{
     common::{ToolRunPayload, ToolRunner},
     ensure_ordering, render_relative_path, resolve_workspace_path,
 };
-use crate::{constants::MAX_TOOL_PATH_LEN, tools::filesystem};
-
-const IDENTIFIER: &str = "read_file_range";
-const DESCRIPTION: &str = "Read a specific inclusive line range from a UTF-8 text file.";
+use crate::{
+    constants::{
+        MAX_TOOL_PATH_LEN,
+        tools::read_file_range::{DESCRIPTION, IDENTIFIER},
+    },
+    tools::filesystem,
+};
 
 #[derive(Debug, Clone, Builder, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReadFileRangeArgs {
     #[schemars(
         length(min = 1, max = MAX_TOOL_PATH_LEN),
-        description = "File path relative to workspace root."
+        description = "File path relative to workspace root. Example: '02_contracts/sec_component.ptx'. Use list_directory first to discover available files."
     )]
     #[builder(with = |value: String| -> ToolInputResult<_> {
         let path = super::require_string(value, IDENTIFIER, "path")?;
@@ -30,20 +33,28 @@ pub struct ReadFileRangeArgs {
         Ok(path)
     })]
     pub path:       String,
-    #[schemars(range(min = 1), description = "1-based inclusive start line (>= 1).")]
+    #[schemars(
+        range(min = 1),
+        description = "First line to read (1-based, inclusive). Example: 10 reads from line 10."
+    )]
     #[builder(with = |value: usize| -> ToolInputResult<_> {
         super::require_usize_min(value, 1, IDENTIFIER, "start_line")
     })]
     pub start_line: usize,
-    #[schemars(range(min = 1), description = "1-based inclusive end line (>= 1).")]
+    #[schemars(
+        range(min = 1),
+        description = "Last line to read (1-based, inclusive). Must be >= start_line. Example: \
+                       start_line=10, end_line=50 reads lines 10-50."
+    )]
     #[builder(with = |value: usize| -> ToolInputResult<_> {
         super::require_usize_min(value, 1, IDENTIFIER, "end_line")
     })]
     pub end_line:   usize,
     #[serde(default)]
     #[schemars(
-        description = "When true, return the requested range immediately; otherwise respond with \
-                       a preview.",
+        description = "Set true to return actual file content. Default false = returns size \
+                       preview only. Use false first to check size, then true to fetch. Saves \
+                       context budget.",
         default = "crate::tools::llm::default_false"
     )]
     #[builder(default = false)]

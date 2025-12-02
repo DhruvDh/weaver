@@ -40,8 +40,7 @@ const DAG_CHECK: &str = "graph_dag_check";
 crate::analysis_tool!(
     dag_check_meta,
     id: DAG_CHECK,
-    description: "Check the Requires DAG invariant: ensures all requires edges are acyclic \
-                  (Knowledge Space Theory). Returns is_dag and topological order length.",
+    description: "Verify that 'requires' edges form an acyclic DAG (Directed Acyclic Graph). Returns is_dag=true if valid, false if cycles exist. ALWAYS run after adding requires edges. If cycles detected, identify and remove the weakest edge (prefer removing 'helpful' before 'strong', 'strong' before 'necessary').",
     args: NoArgs,
     prepare: |raw| crate::tools::llm::common::parse_args(DAG_CHECK, raw),
     runner: |_: NoArgs, state: &CallState| DAGCheckTool {
@@ -107,10 +106,10 @@ const FIRST_PRINCIPLES_SUMMARY: &str = "graph_first_principles_summary";
 #[serde(deny_unknown_fields)]
 pub struct FirstPrinciplesViewArgs {
     #[serde(default)]
-    #[schemars(description = "Maximum items to return (default 50, max 200).")]
+    #[schemars(description = "Max results (default 50, max 200).")]
     pub limit:  Option<usize>,
     #[serde(default)]
-    #[schemars(description = "Offset into the first-principles list (default 0).")]
+    #[schemars(description = "Pagination offset.")]
     pub offset: Option<usize>,
 }
 
@@ -119,7 +118,7 @@ pub struct FirstPrinciplesViewArgs {
 pub struct FirstPrinciplesSummaryArgs {
     #[serde(default)]
     #[schemars(
-        description = "When true, return the summary payload; otherwise return a cost preview.",
+        description = "Return payload if true.",
         default = "crate::tools::llm::default_false"
     )]
     pub fetch_body: bool,
@@ -128,8 +127,7 @@ pub struct FirstPrinciplesSummaryArgs {
 crate::analysis_tool!(
     first_principles_meta,
     id: FIRST_PRINCIPLES_VIEW,
-    description: "View first-principles (requires in-degree 0 instructional knowledge) with \
-                  pagination.",
+    description: "List 'first principles'—knowledge nodes with no incoming requires edges. These are the foundational concepts that don't depend on other course content. They form the starting points for learning paths. All assessments should be reachable from first principles via requires edges.",
     args: FirstPrinciplesViewArgs,
     prepare: |raw| crate::tools::llm::common::parse_args(FIRST_PRINCIPLES_VIEW, raw),
     runner: |args: FirstPrinciplesViewArgs, state: &CallState| FirstPrinciplesViewTool {
@@ -141,8 +139,7 @@ crate::analysis_tool!(
 crate::analysis_tool!(
     first_principles_summary_meta,
     id: FIRST_PRINCIPLES_SUMMARY,
-    description: "Summary of first-principles counts by knowledge type; returns preview \
-                  unless fetch_body=true.",
+    description: "Summary statistics of first-principle nodes by knowledge type. Shows how many factual, conceptual, procedural, and metacognitive nodes have no prerequisites. Useful for understanding the foundation layer of the curriculum.",
     args: FirstPrinciplesSummaryArgs,
     prepare: |raw| crate::tools::llm::common::parse_args(FIRST_PRINCIPLES_SUMMARY, raw),
     runner: |args: FirstPrinciplesSummaryArgs, state: &CallState| FirstPrinciplesSummaryTool {
@@ -286,66 +283,60 @@ const LO_ANCHORS_VIEW: &str = "graph_lo_anchors_view";
 #[derive(Debug, Clone, Builder, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LoReachArgs {
-    #[schemars(
-        description = "Learning Outcome slug to inspect. Must already exist in the graph and be \
-                       knowledge_type = learning_outcome."
-    )]
+    #[schemars(description = "LO slug.")]
     pub lo_slug: String,
 }
 
 #[derive(Debug, Clone, Builder, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LoAssessmentsViewArgs {
-    #[schemars(description = "Learning Outcome slug to inspect.")]
+    #[schemars(description = "LO slug.")]
     pub lo_slug:        String,
     #[serde(default)]
-    #[schemars(
-        description = "Return only reachable assessments when true; only unreachable when false; \
-                       default includes all."
-    )]
+    #[schemars(description = "true = reachable only; false = unreachable only.")]
     pub reachable_only: Option<bool>,
     #[serde(default)]
-    #[schemars(description = "Maximum items to return (default 50, max 200).")]
+    #[schemars(description = "Max results (default 50, max 200).")]
     pub limit:          Option<usize>,
     #[serde(default)]
-    #[schemars(description = "Offset into the assessments list (default 0).")]
+    #[schemars(description = "Pagination offset.")]
     pub offset:         Option<usize>,
 }
 
 #[derive(Debug, Clone, Builder, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LoMissingCriteriaViewArgs {
-    #[schemars(description = "Learning Outcome slug to inspect.")]
+    #[schemars(description = "LO slug.")]
     pub lo_slug: String,
     #[serde(default)]
-    #[schemars(description = "Maximum items to return (default 50, max 200).")]
+    #[schemars(description = "Max results (default 50, max 200).")]
     pub limit:   Option<usize>,
     #[serde(default)]
-    #[schemars(description = "Offset into the missing criteria list (default 0).")]
+    #[schemars(description = "Pagination offset.")]
     pub offset:  Option<usize>,
 }
 
 #[derive(Debug, Clone, Builder, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LoAnchorsViewArgs {
-    #[schemars(description = "Learning Outcome slug to inspect.")]
+    #[schemars(description = "LO slug.")]
     pub lo_slug: String,
     #[serde(default)]
-    #[schemars(description = "Maximum items to return (default 50, max 200).")]
+    #[schemars(description = "Max results (default 50, max 200).")]
     pub limit:   Option<usize>,
     #[serde(default)]
-    #[schemars(description = "Offset into the anchors list (default 0).")]
+    #[schemars(description = "Pagination offset.")]
     pub offset:  Option<usize>,
 }
 
 #[derive(Debug, Clone, Builder, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LoAlignmentArgs {
-    #[schemars(description = "Learning Outcome slug to summarize.")]
+    #[schemars(description = "LO slug.")]
     pub lo_slug:    String,
     #[serde(default)]
     #[schemars(
-        description = "When true, return the summary payload; otherwise return a cost preview.",
+        description = "Return payload if true.",
         default = "crate::tools::llm::default_false"
     )]
     pub fetch_body: bool,
@@ -353,8 +344,7 @@ pub struct LoAlignmentArgs {
 crate::analysis_tool!(
     lo_reach_meta,
     id: LO_REACH,
-    description: "Constructive Alignment predicate for a Learning Outcome: which assessments \
-                  are reachable from first principles via requires* paths and target this LO.",
+    description: "Check if a Learning Outcome's assessments are reachable from first principles via requires edges. Each assessment shows whether it can be reached. If not reachable, the LO may not be properly aligned (students couldn't learn prerequisites to attempt assessment).",
     args: LoReachArgs,
     prepare: |raw| super::common::parse_args_with_builder(
         LO_REACH,
@@ -373,10 +363,7 @@ crate::analysis_tool!(
 crate::analysis_tool!(
     lo_alignment_meta,
     id: LO_ALIGNMENT,
-    description: "High-level alignment summary for a Learning Outcome: reachability from \
-                  first principles via assessments (constructive alignment), rubric coverage \
-                  vs observation_features, and target anchors. Use this first when checking \
-                  LO alignment; use reachability/coverage tools for deeper debugging.",
+    description: "Comprehensive alignment summary for a Learning Outcome. Shows: (1) assessment reachability from first principles, (2) rubric criteria coverage by observation_features, (3) TeachingStep anchors with target impact. Use to verify an LO is properly connected and measurable.",
     args: LoAlignmentArgs,
     prepare: |raw| super::common::parse_args_with_builder(
         LO_ALIGNMENT,
@@ -395,7 +382,7 @@ crate::analysis_tool!(
 crate::analysis_tool!(
     lo_assessments_view_meta,
     id: LO_ASSESSMENTS_VIEW,
-    description: "View assessments linked to an LO with reachability flags (paged).",
+    description: "List all AssessmentItems linked to a LearningOutcome via assesses edges. Shows which assessments are reachable from first principles. Filter by reachable_only=true/false. Every LO should have at least one reachable assessment with scope=target.",
     args: LoAssessmentsViewArgs,
     prepare: |raw| super::common::parse_args_with_builder(
         LO_ASSESSMENTS_VIEW,
@@ -414,7 +401,7 @@ crate::analysis_tool!(
 crate::analysis_tool!(
     lo_missing_criteria_view_meta,
     id: LO_MISSING_CRITERIA_VIEW,
-    description: "View missing rubric criteria for an LO (paged).",
+    description: "List uncovered rubric criteria for LO.",
     args: LoMissingCriteriaViewArgs,
     prepare: |raw| super::common::parse_args_with_builder(
         LO_MISSING_CRITERIA_VIEW,
@@ -433,7 +420,7 @@ crate::analysis_tool!(
 crate::analysis_tool!(
     lo_anchors_view_meta,
     id: LO_ANCHORS_VIEW,
-    description: "View anchors (teaching steps) targeting an LO (paged).",
+    description: "List TeachingSteps anchoring to LO.",
     args: LoAnchorsViewArgs,
     prepare: |raw| super::common::parse_args_with_builder(
         LO_ANCHORS_VIEW,
@@ -452,9 +439,7 @@ crate::analysis_tool!(
 crate::analysis_tool!(
     coverage_meta,
     id: COVERAGE,
-    description: "Coverage report for a Learning Outcome: compares rubric_criteria to \
-                  observation_features on target assesses edges; use to find rubric coverage \
-                  gaps.",
+    description: "Show rubric coverage for a LearningOutcome. For each rubric_criterion, shows which assesses edges' observation_features cover it. Missing coverage means that criterion isn't being measured by any assessment. Add observation_features to existing assesses edges or create new assessments.",
     args: LoReachArgs,
     prepare: |raw| super::common::parse_args_with_builder(
         COVERAGE,
@@ -887,10 +872,7 @@ const KEYSTONE: &str = "graph_keystone";
 crate::analysis_tool!(
     keystone_meta,
     id: KEYSTONE,
-    description: "Compute keystone scores (in_reach * out_reach) for knowledge nodes to \
-                  identify structurally critical concepts in the requires DAG (betweenness \
-                  approximation). Higher scores imply more reasoning paths depend on the \
-                  node. Returns top nodes only to keep output bounded.",
+    description: "Identify 'keystone' nodes that are critical to the graph structure (high betweenness centrality). These nodes appear on many paths between first principles and assessments. Keystones are high-priority for scaffolding—if students struggle here, many downstream concepts are affected.",
     args: NoArgs,
     prepare: |raw| crate::tools::llm::common::parse_args(KEYSTONE, raw),
     runner: |_: NoArgs, state: &CallState| KeystoneTool {
@@ -978,9 +960,12 @@ const ALIGNMENT_GAPS: &str = "graph_assessment_gaps";
 #[derive(Debug, Clone, Builder, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ExtraneousArgs {
+    #[schemars(description = "AssessmentItem slug.")]
     pub assessment_slug: String,
+    #[schemars(description = "LO slug.")]
     pub lo_slug:         String,
     #[serde(default)]
+    #[schemars(description = "Optional intended prereqs to compare.")]
     pub intended_slugs:  Vec<String>,
 }
 
@@ -989,7 +974,7 @@ pub struct ExtraneousArgs {
 pub struct AlignmentGapsArgs {
     #[serde(default)]
     #[schemars(
-        description = "When true, return the full payload; otherwise return a cost preview.",
+        description = "Return payload if true.",
         default = "crate::tools::llm::default_false"
     )]
     pub fetch_body: bool,
@@ -997,9 +982,7 @@ pub struct AlignmentGapsArgs {
 crate::analysis_tool!(
     extraneous_meta,
     id: EXTRANEOUS,
-    description: "Extraneous(A,L): knowledge required by an assessment via requires* but not \
-                  intended for the target LO. Compares to construct_irrelevant_demands to \
-                  surface construct-irrelevant demands.",
+    description: "Identify construct-irrelevant demands for an AssessmentItem—skills the assessment requires but doesn't intend to measure. For example, an assessment of 'write a function with docstring' might have construct-irrelevant demands of 'prose writing ability'. These should be minimized to improve construct validity.",
     args: ExtraneousArgs,
     prepare: |raw| super::common::parse_args_with_builder(
         EXTRANEOUS,
@@ -1101,9 +1084,7 @@ impl ToolInstance for ExtraneousTool {
 crate::analysis_tool!(
     alignment_gaps_meta,
     id: ALIGNMENT_GAPS,
-    description: "Course-wide alignment gaps: LOs with no target assessments, assessments \
-                  with no LO, and assessments unreachable from first principles (constructive \
-                  alignment scan).",
+    description: "Scan all LearningOutcomes for alignment issues: LOs without assessments, assessments not reachable from first principles, and missing rubric coverage. Returns a prioritized list of problems to fix. Use graph_lo_alignment_summary for detailed per-LO analysis.",
     args: AlignmentGapsArgs,
     prepare: |raw| crate::tools::llm::common::parse_args(ALIGNMENT_GAPS, raw),
     runner: |args: AlignmentGapsArgs, state: &CallState| AlignmentGapsTool {

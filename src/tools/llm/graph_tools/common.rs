@@ -25,6 +25,16 @@ pub(crate) fn map_graph_err(err: GraphError, tool: &'static str) -> ToolExecutio
                 message: format!("slug `{}` not found", slug),
             })
         }
+        GraphError::AmbiguousSlug { slug, matches } => {
+            let options = matches.join(", ");
+            ToolExecutionError::Input(ToolInputError::InvalidPayload {
+                tool,
+                message: format!(
+                    "slug `{}` is ambiguous; specify full slug. Candidates: {}",
+                    slug, options
+                ),
+            })
+        }
         GraphError::InvalidEndpoints { .. } | GraphError::Schema(_) => {
             ToolExecutionError::Input(ToolInputError::InvalidPayload {
                 tool,
@@ -48,6 +58,11 @@ pub(crate) fn map_graph_err(err: GraphError, tool: &'static str) -> ToolExecutio
         GraphError::Operational(crate::graph::GraphOperationalError::InvariantTaskFailed {
             message,
         }) => ToolExecutionError::Internal(anyhow!(message)),
+        GraphError::Operational(crate::graph::GraphOperationalError::Poisoned) => {
+            ToolExecutionError::Internal(anyhow!(
+                "graph service is poisoned after a rollback failure; restart and retry"
+            ))
+        }
         GraphError::InvariantViolation { violations } => {
             let joined = violations
                 .iter()

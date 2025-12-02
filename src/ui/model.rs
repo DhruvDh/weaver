@@ -2,7 +2,7 @@ use ratatui::text::{Line, Span, Text};
 use tui_textarea::TextArea;
 use uuid::Uuid;
 
-const MAX_LOG_LINES: usize = 3;
+use crate::constants::ui::MAX_LOG_LINES;
 
 fn render_markdown(content: &str) -> Text<'static> {
     let parsed = tui_markdown::from_str(content);

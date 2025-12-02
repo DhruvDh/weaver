@@ -2,9 +2,10 @@
 //! keeping derived caches in sync.
 use std::{
     collections::{HashMap, HashSet},
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc, RwLock,
-        atomic::{AtomicU16, Ordering},
+        atomic::{AtomicBool, AtomicU16, Ordering},
     },
     time::Duration,
 };
@@ -38,6 +39,46 @@ type GuardCallback<'a> = Box<dyn FnOnce(&mut GraphService) + 'a>;
 
 struct ValidationState {
     dirty: AtomicU16,
+}
+
+#[derive(Clone)]
+struct GraphSnapshot {
+    graph:            Arc<CurriculumGraph>,
+    slug_to_node:     HashMap<String, NodeId>,
+    rubric_hashes:    HashMap<String, u64>,
+    validation_dirty: u16,
+    fade_cache:       Option<(u64, analysis::FadeabilityContext)>,
+    graph_version:    u64,
+}
+
+impl GraphSnapshot {
+    fn capture(svc: &GraphService) -> Self {
+        let fade_cache = svc.fade_cache.read().expect("fade_cache lock").clone();
+        let validation_dirty = svc.validation_state.dirty.load(Ordering::Relaxed);
+        Self {
+            graph: Arc::clone(&svc.graph),
+            slug_to_node: svc.slug_to_node.clone(),
+            rubric_hashes: svc
+                .rubric_hashes
+                .read()
+                .expect("rubric_hashes lock")
+                .clone(),
+            validation_dirty,
+            fade_cache,
+            graph_version: svc.graph_version,
+        }
+    }
+
+    fn restore(self, svc: &mut GraphService) {
+        svc.graph = self.graph;
+        svc.slug_to_node = self.slug_to_node;
+        svc.graph_version = self.graph_version;
+        svc.validation_state
+            .dirty
+            .store(self.validation_dirty, Ordering::Relaxed);
+        *svc.rubric_hashes.write().expect("rubric_hashes lock") = self.rubric_hashes;
+        *svc.fade_cache.write().expect("fade_cache lock") = self.fade_cache;
+    }
 }
 
 struct GraphValidator<'a> {
@@ -147,6 +188,7 @@ impl ValidationState {
 struct ValidationGuard<'a> {
     svc:        &'a mut GraphService,
     scope:      ValidationScope,
+    snapshot:   Option<GraphSnapshot>,
     rollback:   Option<GuardCallback<'a>>,
     on_success: Option<GuardCallback<'a>>,
     committed:  bool,
@@ -157,12 +199,14 @@ impl<'a> ValidationGuard<'a> {
         svc: &'a mut GraphService,
         families: InvariantFamilies,
         scope: ValidationScope,
+        snapshot: GraphSnapshot,
         rollback: impl FnOnce(&mut GraphService) + 'a,
     ) -> Self {
         svc.mark_dirty(families);
         Self {
             svc,
             scope,
+            snapshot: Some(snapshot),
             rollback: Some(Box::new(rollback)),
             on_success: None,
             committed: false,
@@ -175,6 +219,9 @@ impl<'a> ValidationGuard<'a> {
     }
 
     fn commit(mut self) -> Result<(), GraphError> {
+        if self.svc.poisoned.load(Ordering::Relaxed) {
+            return Err(GraphError::Operational(GraphOperationalError::Poisoned));
+        }
         let result = match &self.scope {
             ValidationScope::Full => {
                 let families = self.svc.planned_families(InvariantFamilies::ALL);
@@ -199,25 +246,44 @@ impl<'a> ValidationGuard<'a> {
                 }
                 self.svc.bump_version();
                 self.committed = true;
+                self.snapshot = None;
                 Ok(())
             }
             Err(err) => {
-                if let Some(rb) = self.rollback.take() {
-                    rb(self.svc);
-                }
+                let rollback_error = self.run_rollback();
+                self.restore_snapshot();
                 self.committed = true;
-                Err(err)
+                if let Err(rb_err) = rollback_error {
+                    Err(rb_err)
+                } else {
+                    Err(err)
+                }
             }
+        }
+    }
+
+    fn run_rollback(&mut self) -> Result<(), GraphError> {
+        if let Some(rb) = self.rollback.take()
+            && catch_unwind(AssertUnwindSafe(|| rb(self.svc))).is_err()
+        {
+            self.svc.poison();
+            return Err(GraphError::Operational(GraphOperationalError::Poisoned));
+        }
+        Ok(())
+    }
+
+    fn restore_snapshot(&mut self) {
+        if let Some(snapshot) = self.snapshot.take() {
+            snapshot.restore(self.svc);
         }
     }
 }
 
 impl<'a> Drop for ValidationGuard<'a> {
     fn drop(&mut self) {
-        if !self.committed
-            && let Some(rb) = self.rollback.take()
-        {
-            rb(self.svc);
+        if !self.committed {
+            let _ = self.run_rollback();
+            self.restore_snapshot();
         }
     }
 }
@@ -231,6 +297,7 @@ pub struct GraphService {
     expected_revision:    Option<String>,
     rubric_hashes:        RwLock<HashMap<String, u64>>,
     validation_state:     ValidationState,
+    poisoned:             AtomicBool,
     fade_cache:           RwLock<Option<(u64, analysis::FadeabilityContext)>>,
     audit_sink:           audit::SharedMutationSink,
     dedup:                NodeDeduplicator,
@@ -286,6 +353,7 @@ impl GraphService {
             expected_revision: expected_revision.filter(|s| !s.is_empty()),
             rubric_hashes,
             validation_state: ValidationState::new_empty(),
+            poisoned: AtomicBool::new(false),
             fade_cache: RwLock::new(None),
             audit_sink: Arc::new(audit::NoopMutationSink),
             dedup: NodeDeduplicator::new(),
@@ -309,6 +377,18 @@ impl GraphService {
     fn record_mutation(&self, kind: MutationKind, payload: serde_json::Value) {
         let event = audit::MutationEvent::new(kind, self.graph_version, payload);
         self.audit_sink.record(&event);
+    }
+
+    fn ensure_healthy(&self) -> Result<(), GraphError> {
+        if self.poisoned.load(Ordering::Relaxed) {
+            Err(GraphError::Operational(GraphOperationalError::Poisoned))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn poison(&self) {
+        self.poisoned.store(true, Ordering::Relaxed);
     }
 
     /// Cheap shared pointer for read-heavy callers.
@@ -462,6 +542,10 @@ impl GraphService {
         self.graph_version = self.graph_version.saturating_add(1);
     }
 
+    fn snapshot_state(&self) -> GraphSnapshot {
+        GraphSnapshot::capture(self)
+    }
+
     pub fn upsert_slug(&mut self, slug: String, id: NodeId) {
         self.slug_to_node.insert(slug, id);
     }
@@ -538,7 +622,7 @@ impl GraphService {
             return Ok(*id);
         }
         if !slug.contains('.') {
-            let mut found = None;
+            let mut matches: Vec<(String, NodeId)> = Vec::new();
             for kind in [
                 KnowledgeType::Factual,
                 KnowledgeType::Conceptual,
@@ -549,12 +633,19 @@ impl GraphService {
             ] {
                 let generated = Slug::generate(kind, slug);
                 if let Some(id) = self.slug_to_node.get(generated.as_str()) {
-                    found = Some(*id);
-                    break;
+                    matches.push((generated.as_str().to_string(), *id));
                 }
             }
-            if let Some(id) = found {
-                return Ok(id);
+            match matches.len() {
+                0 => {}
+                1 => return Ok(matches[0].1),
+                _ => {
+                    let slugs = matches.into_iter().map(|(s, _)| s).collect();
+                    return Err(GraphError::AmbiguousSlug {
+                        slug:    slug.to_string(),
+                        matches: slugs,
+                    });
+                }
             }
         }
         Err(GraphError::MissingSlug(slug.to_string()))
@@ -687,6 +778,7 @@ impl GraphService {
         payload: KnowledgeNode,
         tags: Vec<String>,
     ) -> Result<NodeId, GraphError> {
+        self.ensure_healthy()?;
         self.ensure_node_capacity()?;
         let parsed_slug = self.normalize_knowledge_slug(&slug, payload.knowledge_type)?;
         let slug = parsed_slug.as_str().to_string();
@@ -728,6 +820,7 @@ impl GraphService {
             kind: NodeKind::Knowledge(payload),
             tags,
         };
+        let snapshot = self.snapshot_state();
         let id = self.graph_mut().add_node(node);
         self.upsert_slug(slug.clone(), id);
         let coverage_los = match &self.graph()[id].kind {
@@ -744,6 +837,7 @@ impl GraphService {
                 skip_requires_dag: true,
                 skip_fadeability: true,
             },
+            snapshot,
             move |svc| {
                 svc.graph_mut().remove_node(id);
                 svc.slug_to_node.remove(&slug);
@@ -775,6 +869,7 @@ impl GraphService {
         payload: KnowledgeNode,
         tags: Vec<String>,
     ) -> Result<NodeId, GraphError> {
+        self.ensure_healthy()?;
         let id = self.node_by_slug(slug)?;
         let old_kind = self.graph()[id].kind.clone();
         let old_tags = self.graph()[id].tags.clone();
@@ -830,6 +925,7 @@ impl GraphService {
         if needs_purity {
             dirty.insert(InvariantFamilies::PURITY);
         }
+        let snapshot = self.snapshot_state();
 
         // apply tentative change
         self.graph_mut()[id].kind = NodeKind::Knowledge(payload);
@@ -877,6 +973,7 @@ impl GraphService {
                 skip_requires_dag: true,
                 skip_fadeability: true,
             },
+            snapshot,
             move |svc| {
                 svc.graph_mut()[id].kind = old_kind;
                 svc.graph_mut()[id].tags = old_tags;
@@ -947,6 +1044,7 @@ impl GraphService {
     }
 
     pub fn rename_node(&mut self, old_slug: &str, new_slug: String) -> Result<(), GraphError> {
+        self.ensure_healthy()?;
         let id = self.node_by_slug(old_slug)?;
         let target_slug = match &self.graph()[id].kind {
             NodeKind::Knowledge(k) => self
@@ -971,6 +1069,7 @@ impl GraphService {
             .map(|e| e.id())
             .collect();
         let incoming_for_rollback = incoming.clone();
+        let snapshot = self.snapshot_state();
 
         self.slug_to_node.remove(&stored_slug);
         self.slug_to_node.insert(target_slug.clone(), id);
@@ -983,23 +1082,24 @@ impl GraphService {
             }
         }
 
-        let guard = ValidationGuard::new(self, InvariantFamilies::ALL, ValidationScope::Full, {
-            let old_slug = old_slug.to_string();
-            let old_index = old_index.clone();
-            let old_rubric = old_rubric.clone();
-            let incoming = incoming_for_rollback.clone();
-            move |svc| {
-                svc.slug_to_node = old_index;
-                svc.graph_mut()[id].slug = old_slug.clone();
-                for edge_id in incoming.iter().copied() {
-                    if let EdgeKind::Assesses(attrs) = &mut svc.graph_mut()[edge_id].kind {
-                        attrs.evidence_link.claim = old_slug.clone();
+        let guard =
+            ValidationGuard::new(self, InvariantFamilies::ALL, ValidationScope::Full, snapshot, {
+                let old_slug = old_slug.to_string();
+                let old_index = old_index.clone();
+                let old_rubric = old_rubric.clone();
+                let incoming = incoming_for_rollback.clone();
+                move |svc| {
+                    svc.slug_to_node = old_index;
+                    svc.graph_mut()[id].slug = old_slug.clone();
+                    for edge_id in incoming.iter().copied() {
+                        if let EdgeKind::Assesses(attrs) = &mut svc.graph_mut()[edge_id].kind {
+                            attrs.evidence_link.claim = old_slug.clone();
+                        }
                     }
+                    *svc.rubric_hashes.write().expect("rubric_hashes lock") = old_rubric;
                 }
-                *svc.rubric_hashes.write().expect("rubric_hashes lock") = old_rubric;
-            }
-        })
-        .on_success(|svc| svc.refresh_rubric_hashes());
+            })
+            .on_success(|svc| svc.refresh_rubric_hashes());
         guard.commit()?;
         self.record_mutation(
             MutationKind::RenameNode,
@@ -1016,6 +1116,7 @@ impl GraphService {
         canonical_slug: &str,
         duplicate_slug: &str,
     ) -> Result<MergeSummary, GraphError> {
+        self.ensure_healthy()?;
         let canonical = self.node_by_slug(canonical_slug)?;
         let duplicate = self.node_by_slug(duplicate_slug)?;
         if canonical == duplicate {
@@ -1180,6 +1281,7 @@ impl GraphService {
         confidence: Option<f32>,
         clear_conflicts: bool,
     ) -> Result<EdgeId, GraphError> {
+        self.ensure_healthy()?;
         let Some((from, to)) = self.graph.edge_endpoints(edge_id) else {
             return Err(GraphError::Schema(format!("edge_id {:?} not found", edge_id.index())));
         };
@@ -1200,6 +1302,7 @@ impl GraphService {
         let (coverage_los, skip_requires_dag, skip_fadeability, dirty) =
             self.edge_validation_plan(edge_name(&updated.kind), from, to);
 
+        let snapshot = self.snapshot_state();
         self.graph_mut()[edge_id] = updated;
         let guard = ValidationGuard::new(
             self,
@@ -1209,6 +1312,7 @@ impl GraphService {
                 skip_requires_dag,
                 skip_fadeability,
             },
+            snapshot,
             move |svc| {
                 svc.graph_mut()[edge_id] = current;
             },
@@ -1226,6 +1330,7 @@ impl GraphService {
     }
 
     pub fn remove_node(&mut self, slug: &str) -> Result<(), GraphError> {
+        self.ensure_healthy()?;
         let id = self.node_by_slug(slug)?;
 
         // Stash current state for rollback on invariant failure.
@@ -1239,15 +1344,8 @@ impl GraphService {
                 "kind": "teaching_step"
             }),
         };
-        let old_graph = self.graph.clone();
-        let old_index = self.slug_to_node.clone();
-        let old_version = self.graph_version;
-        let old_rubric = self
-            .rubric_hashes
-            .read()
-            .expect("rubric_hashes lock")
-            .clone();
         let stored_slug = self.graph()[id].slug.clone();
+        let snapshot = self.snapshot_state();
 
         if matches!(self.graph()[id].kind, NodeKind::Knowledge(_)) {
             self.dedup.remove(id);
@@ -1255,15 +1353,16 @@ impl GraphService {
         self.slug_to_node.remove(&stored_slug);
         self.graph_mut().remove_node(id);
 
-        let guard =
-            ValidationGuard::new(self, InvariantFamilies::ALL, ValidationScope::Full, move |svc| {
-                svc.graph = old_graph;
-                svc.slug_to_node = old_index;
-                svc.graph_version = old_version;
-                *svc.rubric_hashes.write().expect("rubric_hashes lock") = old_rubric;
+        let guard = ValidationGuard::new(
+            self,
+            InvariantFamilies::ALL,
+            ValidationScope::Full,
+            snapshot,
+            move |svc| {
                 svc.rebuild_dedup();
-            })
-            .on_success(|svc| svc.refresh_rubric_hashes());
+            },
+        )
+        .on_success(|svc| svc.refresh_rubric_hashes());
         guard.commit()?;
         self.rebuild_dedup();
         self.record_mutation(
@@ -1291,6 +1390,7 @@ impl GraphService {
         mut graph: CurriculumGraph,
         graph_version: u64,
     ) -> Result<(), GraphError> {
+        self.ensure_healthy()?;
         normalize_assesses_claims_graph(&mut graph);
         if graph.node_count() > crate::constants::MAX_GRAPH_NODES {
             return Err(GraphError::Schema(format!(
@@ -1371,6 +1471,7 @@ impl GraphService {
         payload: TeachingStepNode,
         tags: Vec<String>,
     ) -> Result<NodeId, GraphError> {
+        self.ensure_healthy()?;
         self.ensure_node_capacity()?;
         if self.slug_to_node.contains_key(&slug) {
             return Err(GraphError::Schema(format!(
@@ -1397,6 +1498,7 @@ impl GraphService {
             kind: NodeKind::TeachingStep(payload),
             tags,
         };
+        let snapshot = self.snapshot_state();
         let id = self.graph_mut().add_node(node);
         self.upsert_slug(slug.clone(), id);
         let guard = ValidationGuard::new(
@@ -1409,6 +1511,7 @@ impl GraphService {
                 skip_requires_dag: true,
                 skip_fadeability:  true,
             },
+            snapshot,
             move |svc| {
                 svc.graph_mut().remove_node(id);
                 svc.slug_to_node.remove(&slug);
@@ -1432,6 +1535,7 @@ impl GraphService {
         payload: TeachingStepNode,
         tags: Vec<String>,
     ) -> Result<NodeId, GraphError> {
+        self.ensure_healthy()?;
         let id = self.node_by_slug(slug)?;
         let old_kind = self.graph()[id].kind.clone();
         let old_tags = self.graph()[id].tags.clone();
@@ -1453,6 +1557,7 @@ impl GraphService {
         }
         validate_source_refs(&payload.source_refs)?;
         self.validate_revision(&payload.source_refs, "teaching_step")?;
+        let snapshot = self.snapshot_state();
         self.graph_mut()[id].kind = NodeKind::TeachingStep(payload);
 
         if let Err(err) = self.validate_incident_edges(id) {
@@ -1470,6 +1575,7 @@ impl GraphService {
                 skip_requires_dag: true,
                 skip_fadeability:  true,
             },
+            snapshot,
             move |svc| {
                 svc.graph_mut()[id].kind = old_kind;
                 svc.graph_mut()[id].tags = old_tags;
@@ -1495,6 +1601,7 @@ impl GraphService {
         attrs: S::Attrs,
         confidence: f32,
     ) -> Result<EdgeId, GraphError> {
+        self.ensure_healthy()?;
         self.ensure_edge_capacity()?;
         S::validate(self, from, to, &attrs, confidence)?;
         let payload = S::make_payload(attrs, confidence);
@@ -1505,6 +1612,7 @@ impl GraphService {
             return self.merge_existing_edge(S::NAME, from, to, existing_edge_id, payload);
         }
 
+        let snapshot = self.snapshot_state();
         let edge_id = self.graph_mut().add_edge(from, to, payload);
         let (coverage_los, skip_requires_dag, skip_fadeability, dirty) =
             self.edge_validation_plan(S::NAME, from, to);
@@ -1517,6 +1625,7 @@ impl GraphService {
                 skip_requires_dag,
                 skip_fadeability,
             },
+            snapshot,
             move |svc| {
                 svc.graph_mut().remove_edge(edge_id);
             },
@@ -1543,6 +1652,7 @@ impl GraphService {
         edge_id: EdgeId,
         incoming: EdgePayload,
     ) -> Result<EdgeId, GraphError> {
+        self.ensure_healthy()?;
         let merged = merge_edge_payload(self.graph()[edge_id].clone(), incoming);
         let had_conflict = matches!(merged, MergeResult::Conflict { .. });
         let updated_payload = match merged {
@@ -1554,6 +1664,7 @@ impl GraphService {
 
         self.validate_edge_kind(from, to, &updated_payload.kind, updated_payload.confidence)?;
         let rollback_payload = self.graph()[edge_id].clone();
+        let snapshot = self.snapshot_state();
         self.graph_mut()[edge_id] = updated_payload;
 
         let (coverage_los, skip_requires_dag, skip_fadeability, dirty) =
@@ -1566,6 +1677,7 @@ impl GraphService {
                 skip_requires_dag,
                 skip_fadeability,
             },
+            snapshot,
             move |svc| {
                 svc.graph_mut()[edge_id] = rollback_payload;
             },

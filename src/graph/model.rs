@@ -76,33 +76,46 @@ pub struct TeachingStepNode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TeachingPurpose {
+    #[serde(alias = "Setup")]
     Setup,
+    #[serde(alias = "Idea")]
     Idea,
+    #[serde(alias = "Use")]
     Use,
+    #[serde(alias = "Consolidate")]
     Consolidate,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GrainLevel {
+    #[serde(alias = "Macro")]
     Macro,
+    #[serde(alias = "Mid")]
     Mid,
+    #[serde(alias = "Micro")]
     Micro,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum IntrinsicLoad {
+    #[serde(alias = "Low")]
     Low,
+    #[serde(alias = "Medium")]
     Medium,
+    #[serde(alias = "High")]
     High,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum IntroductionScope {
+    #[serde(alias = "InCourse", alias = "In_Course")]
     InCourse,
+    #[serde(alias = "Prior")]
     Prior,
+    #[serde(alias = "External")]
     External,
 }
 
@@ -162,8 +175,11 @@ pub struct SupportsAttrs {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum CaseTag {
+    #[serde(alias = "Typical")]
     Typical,
+    #[serde(alias = "Edge")]
     Edge,
+    #[serde(alias = "ErrorCase", alias = "Error_Case")]
     ErrorCase,
 }
 
@@ -185,10 +201,15 @@ pub struct AnchorsAttrs {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AnchorImpact {
+    #[serde(alias = "Introduce")]
     Introduce,
+    #[serde(alias = "Use")]
     Use,
+    #[serde(alias = "Refine")]
     Refine,
+    #[serde(alias = "Motivate")]
     Motivate,
+    #[serde(alias = "Target")]
     Target,
 }
 
@@ -258,6 +279,8 @@ pub enum GraphOperationalError {
     InvariantTimeout { timeout_ms: u64 },
     #[error("graph invariant validation task failed: {message}")]
     InvariantTaskFailed { message: String },
+    #[error("graph service entered a poisoned state after rollback failure")]
+    Poisoned,
 }
 
 /// Errors returned by GraphService.
@@ -265,6 +288,11 @@ pub enum GraphOperationalError {
 pub enum GraphError {
     #[error("slug `{0}` not found")]
     MissingSlug(String),
+    #[error("ambiguous slug `{slug}`; matches: {matches:?}")]
+    AmbiguousSlug {
+        slug:    String,
+        matches: Vec<String>,
+    },
     #[error("invalid edge endpoints for {edge}: from={from:?}, to={to:?}")]
     InvalidEndpoints {
         edge: &'static str,
