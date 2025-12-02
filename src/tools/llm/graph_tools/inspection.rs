@@ -335,8 +335,8 @@ pub struct ListNodesByTagArgs {
 crate::analysis_tool!(
     list_nodes_by_tag_meta,
     id: LIST_NODES_BY_TAG,
-    description: "List nodes carrying a specific tag. Use chapter tags like `source:<chapter>` \
-                  to scope work for harvesters/weavers.",
+    description: "List nodes carrying a specific tag. Use workspace-relative chapter tags like \
+                  `source:<chapter_path>` to scope work for harvesters/weavers.",
     args: ListNodesByTagArgs,
     prepare: |raw| parse_args_with_builder(LIST_NODES_BY_TAG, raw, |mut input: ListNodesByTagArgs| {
         input.tag = require_string(input.tag, LIST_NODES_BY_TAG, "tag")?;

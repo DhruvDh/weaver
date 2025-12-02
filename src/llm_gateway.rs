@@ -43,7 +43,7 @@ use crate::{
         LLM_MAX_RETRIES, REQUEST_TIMEOUT_SECS, RETRY_BASE_DELAY_MS, RETRY_MAX_BACKOFF_MS,
         RETRY_MAX_EXP,
     },
-    file_reader::{ExecuteTool, FileReader},
+    file_reader::{ExecuteTool, ToolHost},
     rerun_sink::{LogScalar, RerunSink},
     tools::llm::{self, ToolOutput},
 };
@@ -831,7 +831,7 @@ impl LLMGateway {
 
     async fn handle_tool_calls(
         iteration: usize,
-        tool_host: &ActorRef<FileReader>,
+        tool_host: &ToolHost,
         tool_calls: Vec<ChatCompletionMessageToolCall>,
         messages: &mut Vec<ChatCompletionRequestMessage>,
         state: &mut IterationState,
@@ -931,7 +931,7 @@ impl LLMGateway {
 
             debug!(iteration, tool = tool_name.as_str(), "Executing assistant-requested tool");
             let result = tool_host
-                .ask(ExecuteTool {
+                .ask_execute(ExecuteTool {
                     identifier: tool_name.clone(),
                     arguments:  parsed_args.clone(),
                 })
@@ -1296,7 +1296,7 @@ pub struct ChatCompletionRequest {
     pub top_p:           f32,
     pub tool_ids:        Vec<&'static str>,
     pub max_iterations:  usize,
-    pub tool_host:       ActorRef<FileReader>,
+    pub tool_host:       ToolHost,
     pub actor_name:      String,
     pub conversation_id: String,
     pub rerun:           Option<ActorRef<RerunSink>>,

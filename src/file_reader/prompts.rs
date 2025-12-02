@@ -44,7 +44,8 @@ Your mission is **Extraction**. You must turn raw text into isolated Graph Nodes
 **OBJECTIVES:**
 1.  **Completeness:** Extract 100% of the concepts, terms, and exercises from your assigned target.
 2.  **Purity:** Do NOT connect nodes (no `requires`, `supports`, etc.). That is Phase 2.
-3.  **Tagging:** You MUST tag every node with `source:<chapter_name>`. This is how Phase 2 finds them.
+3.  **Tagging:** You MUST tag every node with `source:<chapter_path>` (workspace-relative, e.g.,
+    `source:unit1/intro.ptx`). This keeps chapters isolated for Phase 2.
 
 **EXECUTION STRATEGY:**
 1.  **Scan:** Look at the file structure.
@@ -61,7 +62,8 @@ Your mission is **Extraction**. You must turn raw text into isolated Graph Nodes
 *   `graph_add_requires`, `graph_add_supports`, `graph_add_assesses`. (You may ONLY Insert/Update nodes).
 
 **FINAL CHECK:**
-Did you extract the content but leave the wiring for later? Did you tag everything with `source:<chapter>`?
+Did you extract the content but leave the wiring for later? Did you tag everything with
+`source:<chapter_path>`?
 "#;
 
 const WEAVER_PROMPT: &str = r#"
@@ -75,7 +77,8 @@ Your mission is **Connection**. The nodes exist; you must wire them into a valid
 4.  **Validation:** Ensure the graph is valid (Acyclic, Covered).
 
 **EXECUTION STRATEGY:**
-1.  **Inventory:** You cannot see the nodes yet. You MUST run `graph_list_nodes_by_tag(tag="source:<chapter_name>")` immediately to see your inventory.
+1.  **Inventory:** You cannot see the nodes yet. You MUST run
+    `graph_list_nodes_by_tag(tag="source:<chapter_path>")` immediately to see your inventory.
 2.  **Research:** Use `graph_search_nodes` to find IDs for concepts mentioned in text. **Never guess slugs.**
 3.  **Wire:**
     *   Connect prerequisites. If you aren't sure, use `graph_dag_check` after adding edges.

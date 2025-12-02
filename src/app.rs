@@ -1,7 +1,7 @@
 use std::{
     convert::Infallible,
     fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::Command,
     sync::Arc,
     time::Duration,
@@ -20,10 +20,13 @@ use url::Url;
 use crate::{
     agents::deduplication::{DeduplicationAgent, RunDeduplication},
     constants::PRETEXT_SUBDIR,
-    file_reader::{AgentMode, FileReader, FileReaderQuery, HarvesterFocus, WeaverFocus},
+    file_reader::{
+        FileReader, FileReaderQuery, HarvesterFocus, HarvesterReader, WeaverFocus, WeaverReader,
+    },
     graph::{
-        CurriculumGraph, GraphConfig, commands::ListNodesByTag,
+        CurriculumGraph, GraphConfig,
         audit::RerunMutationSink,
+        commands::ListNodesByTag,
         manager::{
             ApplyRuntimeConfig, AuditInvariants, GetCourseCommit, GraphManager, GraphManagerState,
             PersistSnapshot, RedundantRequires, SaveSnapshot, SetAuditSink,
@@ -429,6 +432,30 @@ fn ensure_parent_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn chapter_scope_tag(workspace_root: &Path, chapter_path: &Path) -> String {
+    let relative = if chapter_path.is_absolute() {
+        pathdiff::diff_paths(chapter_path, workspace_root)
+            .unwrap_or_else(|| chapter_path.to_path_buf())
+    } else {
+        chapter_path.to_path_buf()
+    };
+
+    let normalized = relative
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+
+    if normalized.is_empty() {
+        chapter_path.display().to_string()
+    } else {
+        normalized
+    }
+}
+
 /// Orchestrate two-phase autonomous graph construction: harvest nodes, run
 /// dedup, then weave edges.
 pub async fn run_two_phase_construction(cli: Cli, chapters: Vec<PathBuf>) -> Result<()> {
@@ -470,10 +497,7 @@ pub async fn run_two_phase_construction(cli: Cli, chapters: Vec<PathBuf>) -> Res
             let course_commit_for_tasks = course_commit.clone();
             let harvester_tasks = chapters.iter().map(|chapter_path| {
                 let chapter_path = chapter_path.clone();
-                let chapter_tag = chapter_path
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| chapter_path.display().to_string());
+                let chapter_tag = chapter_scope_tag(&workspace_root, &chapter_path);
                 let tag = format!("source:{chapter_tag}");
                 let graph_for_reader = graph.clone();
                 let graph_for_check = graph.clone();
@@ -485,17 +509,16 @@ pub async fn run_two_phase_construction(cli: Cli, chapters: Vec<PathBuf>) -> Res
                 let course_commit = course_commit_for_tasks.clone();
 
                 async move {
-                    let actor = FileReader::from_env_with_mode(
+                    let actor = HarvesterReader::from_env(
                         workspace,
                         gateway_ref,
                         metrics_ref,
                         graph_for_reader,
                         dedup_ref,
                         rerun_ref,
-                        AgentMode::Harvester,
                         course_commit,
                     )?;
-                    let reader = FileReader::spawn(actor);
+                    let reader = HarvesterReader::spawn(actor);
                     let prompt = format!(
                         "PHASE 1: Harvest EVERY node from {chapter}\n\n- Extract all concepts, \
                          facts, procedures, strategies, learning outcomes, teaching steps, \
@@ -593,53 +616,51 @@ pub async fn run_two_phase_construction(cli: Cli, chapters: Vec<PathBuf>) -> Res
 
             info!(chapters = successful_chapters.len(), "Phase 2: weaving edges");
             let course_commit_for_weavers = course_commit.clone();
-            let weaver_tasks =
-                successful_chapters
-                    .iter()
-                    .map(|(chapter_path, _chapter_tag, tag): &(PathBuf, String, String)| {
-                        let chapter_path = chapter_path.clone();
-                        let tag = tag.clone();
-                        let graph_ref = graph.clone();
-                        let gateway_ref = gateway.clone();
-                        let metrics_ref = Arc::clone(&metrics);
-                        let rerun_ref = rerun.clone();
-                        let dedup_ref = dedup_agent.clone();
-                        let workspace = workspace_root.clone();
-                        let course_commit = course_commit_for_weavers.clone();
+            let weaver_tasks = successful_chapters.iter().map(
+                |(chapter_path, _chapter_tag, tag): &(PathBuf, String, String)| {
+                    let chapter_path = chapter_path.clone();
+                    let tag = tag.clone();
+                    let graph_ref = graph.clone();
+                    let gateway_ref = gateway.clone();
+                    let metrics_ref = Arc::clone(&metrics);
+                    let rerun_ref = rerun.clone();
+                    let dedup_ref = dedup_agent.clone();
+                    let workspace = workspace_root.clone();
+                    let course_commit = course_commit_for_weavers.clone();
 
-                        async move {
-                            let actor = FileReader::from_env_with_mode(
-                                workspace,
-                                gateway_ref,
-                                metrics_ref,
-                                graph_ref,
-                                dedup_ref,
-                                rerun_ref,
-                                AgentMode::Weaver,
-                                course_commit,
-                            )?;
-                            let reader = FileReader::spawn(actor);
-                            let prompt = format!(
-                                "PHASE 2: Connect ALL nodes for {chapter}\n\n- Start with \
-                                 graph_list_nodes_by_tag {tag} to scope the inventory.\n- Use \
-                                 graph_search_nodes when slugs are fuzzy; avoid creating new \
-                                 nodes.\n- Create requires/supports/assesses/precedes/anchors \
-                                 edges with strong rationales and evidence refs.\n- Focus: \
-                                 {weaver_focus} ({weaver_focus_directive}).\n- Run \
-                                 graph_gap_summary, graph_lo_alignment_summary, and \
-                                 graph_dag_check near the end. Target 200-400 edges.",
-                                chapter = chapter_path.display(),
-                                tag = tag,
-                                weaver_focus = weaver_focus,
-                                weaver_focus_directive = weaver_focus.directive(),
-                            );
-                            reader
-                                .ask(FileReaderQuery { prompt })
-                                .await
-                                .map(|_| ())
-                                .map_err(anyhow::Error::from)
-                        }
-                    });
+                    async move {
+                        let actor = WeaverReader::from_env(
+                            workspace,
+                            gateway_ref,
+                            metrics_ref,
+                            graph_ref,
+                            dedup_ref,
+                            rerun_ref,
+                            course_commit,
+                        )?;
+                        let reader = WeaverReader::spawn(actor);
+                        let prompt = format!(
+                            "PHASE 2: Connect ALL nodes for {chapter}\n\n- Start with \
+                             graph_list_nodes_by_tag {tag} to scope the inventory.\n- Use \
+                             graph_search_nodes when slugs are fuzzy; avoid creating new \
+                             nodes.\n- Create requires/supports/assesses/precedes/anchors edges \
+                             with strong rationales and evidence refs.\n- Focus: {weaver_focus} \
+                             ({weaver_focus_directive}).\n- Run graph_gap_summary, \
+                             graph_lo_alignment_summary, and graph_dag_check near the end. Target \
+                             200-400 edges.",
+                            chapter = chapter_path.display(),
+                            tag = tag,
+                            weaver_focus = weaver_focus,
+                            weaver_focus_directive = weaver_focus.directive(),
+                        );
+                        reader
+                            .ask(FileReaderQuery { prompt })
+                            .await
+                            .map(|_| ())
+                            .map_err(anyhow::Error::from)
+                    }
+                },
+            );
             let weaver_results: Vec<Result<()>> = join_all(weaver_tasks).await;
             let total_weaves = weaver_results.len();
             let mut failed_weaves = Vec::new();

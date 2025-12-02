@@ -1,5 +1,6 @@
 use std::{
     env, fmt,
+    marker::PhantomData,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -55,6 +56,77 @@ pub enum WeaverFocus {
     Supports,
     Assesses,
     All,
+}
+
+#[derive(Clone, Debug)]
+pub enum ToolHost {
+    Interactive(ActorRef<Reader<InteractiveSpec>>),
+    Harvester(ActorRef<Reader<HarvesterSpec>>),
+    Weaver(ActorRef<Reader<WeaverSpec>>),
+}
+
+impl ToolHost {
+    pub fn mode(&self) -> AgentMode {
+        match self {
+            ToolHost::Interactive(_) => AgentMode::Interactive,
+            ToolHost::Harvester(_) => AgentMode::Harvester,
+            ToolHost::Weaver(_) => AgentMode::Weaver,
+        }
+    }
+
+    pub fn tool_ids(&self) -> Result<Vec<&'static str>> {
+        tool_identifiers_for_mode(self.mode())
+    }
+
+    pub async fn ask_execute(
+        &self,
+        msg: ExecuteTool,
+    ) -> Result<ToolOutput, kameo::error::SendError<ExecuteTool, ToolExecutionError>> {
+        match self {
+            ToolHost::Interactive(actor) => actor.ask(msg).await,
+            ToolHost::Harvester(actor) => actor.ask(msg).await,
+            ToolHost::Weaver(actor) => actor.ask(msg).await,
+        }
+    }
+}
+
+pub trait ModeSpec: Send + Sync + 'static {
+    const MODE: AgentMode;
+    const SUFFIX: &'static str;
+    fn wrap_tool_host(actor: ActorRef<Reader<Self>>) -> ToolHost
+    where
+        Self: Sized;
+}
+
+pub struct HarvesterSpec;
+pub struct WeaverSpec;
+pub struct InteractiveSpec;
+
+impl ModeSpec for HarvesterSpec {
+    const MODE: AgentMode = AgentMode::Harvester;
+    const SUFFIX: &'static str = "/Harvester";
+
+    fn wrap_tool_host(actor: ActorRef<Reader<Self>>) -> ToolHost {
+        ToolHost::Harvester(actor)
+    }
+}
+
+impl ModeSpec for WeaverSpec {
+    const MODE: AgentMode = AgentMode::Weaver;
+    const SUFFIX: &'static str = "/Weaver";
+
+    fn wrap_tool_host(actor: ActorRef<Reader<Self>>) -> ToolHost {
+        ToolHost::Weaver(actor)
+    }
+}
+
+impl ModeSpec for InteractiveSpec {
+    const MODE: AgentMode = AgentMode::Interactive;
+    const SUFFIX: &'static str = "";
+
+    fn wrap_tool_host(actor: ActorRef<Reader<Self>>) -> ToolHost {
+        ToolHost::Interactive(actor)
+    }
 }
 
 impl fmt::Display for HarvesterFocus {
@@ -139,7 +211,7 @@ pub fn make_conversation_id(actor_name: &str) -> String {
 
 /// Actor that exposes local filesystem utilities to LLM collaborators.
 #[derive(Actor)]
-pub struct FileReader {
+pub struct Reader<M: ModeSpec> {
     gateway:            ActorRef<LLMGateway>,
     model:              Arc<String>,
     root:               Arc<PathBuf>,
@@ -153,7 +225,7 @@ pub struct FileReader {
     max_subdelegations: usize,
     actor_name:         Arc<String>,
     conversation_id:    Arc<String>,
-    mode:               AgentMode,
+    _mode:              PhantomData<M>,
 }
 
 #[derive(Clone)]
@@ -167,11 +239,10 @@ struct ReaderDeps {
     dedup:          ActorRef<DeduplicationAgent>,
     analysis_cache: Arc<AnalysisCache>,
     rerun:          Option<ActorRef<crate::rerun_sink::RerunSink>>,
-    mode:           AgentMode,
 }
 
-impl FileReader {
-    /// Build a new [`FileReader`] using `OPENAI_MODEL`/`OPENAI_API_BASE`.
+impl<M: ModeSpec> Reader<M> {
+    /// Build a new reader using `OPENAI_MODEL`/`OPENAI_API_BASE`.
     pub fn from_env(
         root: impl AsRef<Path>,
         gateway: ActorRef<LLMGateway>,
@@ -181,7 +252,7 @@ impl FileReader {
         rerun: Option<ActorRef<crate::rerun_sink::RerunSink>>,
         course_commit: impl Into<String>,
     ) -> Result<Self> {
-        Self::from_env_with_limit_and_mode(
+        Self::from_env_with_limit(
             root,
             gateway,
             metrics,
@@ -189,38 +260,11 @@ impl FileReader {
             dedup,
             rerun,
             DEFAULT_MAX_SUBDELEGATIONS,
-            AgentMode::Interactive,
             course_commit,
         )
     }
 
-    /// Build a new [`FileReader`] using `OPENAI_MODEL`/`OPENAI_API_BASE` with a
-    /// specific mode.
-    #[allow(clippy::too_many_arguments)]
-    pub fn from_env_with_mode(
-        root: impl AsRef<Path>,
-        gateway: ActorRef<LLMGateway>,
-        metrics: Arc<GatewayMetrics>,
-        graph: ActorRef<crate::graph::manager::GraphManager>,
-        dedup: ActorRef<DeduplicationAgent>,
-        rerun: Option<ActorRef<crate::rerun_sink::RerunSink>>,
-        mode: AgentMode,
-        course_commit: impl Into<String>,
-    ) -> Result<Self> {
-        Self::from_env_with_limit_and_mode(
-            root,
-            gateway,
-            metrics,
-            graph,
-            dedup,
-            rerun,
-            DEFAULT_MAX_SUBDELEGATIONS,
-            mode,
-            course_commit,
-        )
-    }
-
-    /// Build a new [`FileReader`] with a custom delegation limit.
+    /// Build a new reader with a custom delegation limit.
     #[allow(clippy::too_many_arguments)]
     pub fn from_env_with_limit(
         root: impl AsRef<Path>,
@@ -230,33 +274,6 @@ impl FileReader {
         dedup: ActorRef<DeduplicationAgent>,
         rerun: Option<ActorRef<crate::rerun_sink::RerunSink>>,
         max_subdelegations: usize,
-        course_commit: impl Into<String>,
-    ) -> Result<Self> {
-        Self::from_env_with_limit_and_mode(
-            root,
-            gateway,
-            metrics,
-            graph,
-            dedup,
-            rerun,
-            max_subdelegations,
-            AgentMode::Interactive,
-            course_commit,
-        )
-    }
-
-    /// Build a new [`FileReader`] with a custom delegation limit and explicit
-    /// mode.
-    #[allow(clippy::too_many_arguments)]
-    pub fn from_env_with_limit_and_mode(
-        root: impl AsRef<Path>,
-        gateway: ActorRef<LLMGateway>,
-        metrics: Arc<GatewayMetrics>,
-        graph: ActorRef<crate::graph::manager::GraphManager>,
-        dedup: ActorRef<DeduplicationAgent>,
-        rerun: Option<ActorRef<crate::rerun_sink::RerunSink>>,
-        max_subdelegations: usize,
-        mode: AgentMode,
         course_commit: impl Into<String>,
     ) -> Result<Self> {
         let model = Arc::new(
@@ -282,17 +299,12 @@ impl FileReader {
             dedup,
             analysis_cache,
             rerun,
-            mode,
         };
         Ok(Self::new(deps, 0, max_subdelegations))
     }
 
     fn new(deps: ReaderDeps, depth: usize, max_subdelegations: usize) -> Self {
-        let suffix = match deps.mode {
-            AgentMode::Harvester => "/Harvester",
-            AgentMode::Weaver => "/Weaver",
-            AgentMode::Interactive => "",
-        };
+        let suffix = M::SUFFIX;
         let actor_name = if depth == 0 {
             format!("FileReader/Root{suffix}")
         } else {
@@ -313,12 +325,12 @@ impl FileReader {
             max_subdelegations,
             actor_name: Arc::new(actor_name),
             conversation_id: Arc::new(conversation_id),
-            mode: deps.mode,
+            _mode: PhantomData,
         }
     }
 
     fn system_prompt(&self) -> String {
-        prompts::build_system_prompt(self.mode, self.root.as_ref(), self.course_commit.as_ref())
+        prompts::build_system_prompt(M::MODE, self.root.as_ref(), self.course_commit.as_ref())
     }
 
     pub fn workspace_root(&self) -> &Path {
@@ -326,75 +338,80 @@ impl FileReader {
     }
 
     pub fn tool_identifiers() -> Result<Vec<&'static str>> {
-        Self::tool_identifiers_for_mode(AgentMode::Interactive)
+        tool_identifiers_for_mode(M::MODE)
     }
+}
 
-    pub fn tool_identifiers_for_mode(mode: AgentMode) -> Result<Vec<&'static str>> {
-        let all_tools = llm::all_tools()?;
+pub type FileReader = Reader<InteractiveSpec>;
+pub type InteractiveReader = Reader<InteractiveSpec>;
+pub type HarvesterReader = Reader<HarvesterSpec>;
+pub type WeaverReader = Reader<WeaverSpec>;
 
-        let tools: Vec<&'static str> = match mode {
-            AgentMode::Interactive => all_tools.iter().map(|meta| meta.id).collect(),
-            AgentMode::Harvester => {
-                let allowed = [
-                    "graph_insert_knowledge",
-                    "graph_update_knowledge",
-                    "graph_insert_teaching_step",
-                    "graph_update_teaching_step",
-                    "delegate_tasks",
-                    "graph_list_nodes_by_tag",
-                    "graph_list_nodes_by_kind",
-                    "graph_list_tags",
-                    "graph_course_commit",
-                    "graph_get_node",
-                    "graph_neighbors",
-                    "graph_first_principles",
-                    "locate_snippet",
-                    "list_directory",
-                    "read_file_full",
-                    "read_file_range",
-                    "search_text",
-                ];
-                all_tools
-                    .iter()
-                    .filter(|meta| allowed.contains(&meta.id))
-                    .map(|meta| meta.id)
-                    .collect()
-            }
-            AgentMode::Weaver => {
-                let allowed = [
-                    "graph_add_requires",
-                    "graph_add_supports",
-                    "graph_add_assesses",
-                    "graph_add_precedes",
-                    "graph_add_anchors",
-                    "delegate_tasks",
-                    "graph_get_node",
-                    "graph_list_nodes_by_tag",
-                    "graph_list_nodes_by_kind",
-                    "graph_list_tags",
-                    "graph_search_nodes",
-                    "graph_course_commit",
-                    "graph_neighbors",
-                    "graph_first_principles",
-                    "graph_dag_check",
-                    "graph_lo_alignment_summary",
-                    "graph_gap_summary",
-                    "locate_snippet",
-                    "list_directory",
-                    "read_file_full",
-                    "read_file_range",
-                    "search_text",
-                ];
-                all_tools
-                    .iter()
-                    .filter(|meta| allowed.contains(&meta.id))
-                    .map(|meta| meta.id)
-                    .collect()
-            }
-        };
+pub fn tool_identifiers_for_mode(mode: AgentMode) -> Result<Vec<&'static str>> {
+    let all_tools = llm::all_tools()?;
 
-        Ok(tools)
-    }
+    let tools: Vec<&'static str> = match mode {
+        AgentMode::Interactive => all_tools.iter().map(|meta| meta.id).collect(),
+        AgentMode::Harvester => {
+            let allowed = [
+                "graph_insert_knowledge",
+                "graph_update_knowledge",
+                "graph_insert_teaching_step",
+                "graph_update_teaching_step",
+                "delegate_tasks",
+                "graph_list_nodes_by_tag",
+                "graph_list_nodes_by_kind",
+                "graph_list_tags",
+                "graph_course_commit",
+                "graph_get_node",
+                "graph_neighbors",
+                "graph_first_principles",
+                "locate_snippet",
+                "list_directory",
+                "read_file_full",
+                "read_file_range",
+                "search_text",
+            ];
+            all_tools
+                .iter()
+                .filter(|meta| allowed.contains(&meta.id))
+                .map(|meta| meta.id)
+                .collect()
+        }
+        AgentMode::Weaver => {
+            let allowed = [
+                "graph_add_requires",
+                "graph_add_supports",
+                "graph_add_assesses",
+                "graph_add_precedes",
+                "graph_add_anchors",
+                "delegate_tasks",
+                "graph_get_node",
+                "graph_list_nodes_by_tag",
+                "graph_list_nodes_by_kind",
+                "graph_list_tags",
+                "graph_search_nodes",
+                "graph_course_commit",
+                "graph_neighbors",
+                "graph_first_principles",
+                "graph_dag_check",
+                "graph_lo_alignment_summary",
+                "graph_gap_summary",
+                "locate_snippet",
+                "list_directory",
+                "read_file_full",
+                "read_file_range",
+                "search_text",
+            ];
+            all_tools
+                .iter()
+                .filter(|meta| allowed.contains(&meta.id))
+                .map(|meta| meta.id)
+                .collect()
+        }
+    };
+
+    Ok(tools)
 }
 
 #[derive(Clone)]
@@ -441,16 +458,42 @@ pub(crate) async fn run_delegate_batch_with_state(
                 dedup:          ctx.dedup.clone(),
                 analysis_cache: Arc::clone(&ctx.analysis_cache),
                 rerun:          ctx.rerun.clone(),
-                mode:           ctx.mode,
                 course_commit:  Arc::clone(&ctx.course_commit),
             };
             let depth = ctx.depth;
             let max_subdelegations = ctx.max_subdelegations;
             async move {
-                let child = FileReader::new(deps, depth + 1, max_subdelegations);
-                let actor = FileReader::spawn(child);
                 let prompt = task.clone();
-                match actor.ask(FileReaderQuery { prompt }).await {
+                let result = match ctx.mode {
+                    AgentMode::Harvester => {
+                        let child = Reader::<HarvesterSpec>::new(
+                            deps.clone(),
+                            depth + 1,
+                            max_subdelegations,
+                        );
+                        Reader::<HarvesterSpec>::spawn(child)
+                            .ask(FileReaderQuery { prompt })
+                            .await
+                    }
+                    AgentMode::Weaver => {
+                        let child =
+                            Reader::<WeaverSpec>::new(deps.clone(), depth + 1, max_subdelegations);
+                        Reader::<WeaverSpec>::spawn(child)
+                            .ask(FileReaderQuery { prompt })
+                            .await
+                    }
+                    AgentMode::Interactive => {
+                        let child = Reader::<InteractiveSpec>::new(
+                            deps.clone(),
+                            depth + 1,
+                            max_subdelegations,
+                        );
+                        Reader::<InteractiveSpec>::spawn(child)
+                            .ask(FileReaderQuery { prompt })
+                            .await
+                    }
+                };
+                match result {
                     Ok(content) => {
                         json!({
                             "task": task,
@@ -459,10 +502,11 @@ pub(crate) async fn run_delegate_batch_with_state(
                         })
                     }
                     Err(err) => {
+                        let error = err.to_string();
                         json!({
                             "task": task,
                             "status": "error",
-                            "error": err.to_string(),
+                            "error": error,
                         })
                     }
                 }
@@ -486,7 +530,7 @@ pub struct FileReaderQuery {
     pub prompt: String,
 }
 
-impl Message<FileReaderQuery> for FileReader {
+impl<M: ModeSpec> Message<FileReaderQuery> for Reader<M> {
     type Reply = DelegatedReply<Result<String>>;
 
     async fn handle(
@@ -494,14 +538,13 @@ impl Message<FileReaderQuery> for FileReader {
         FileReaderQuery { prompt }: FileReaderQuery,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let tool_host = ctx.actor_ref().clone();
+        let tool_host = M::wrap_tool_host(ctx.actor_ref().clone());
         let gateway = self.gateway.clone();
         let system_prompt = self.system_prompt();
         let model = self.model.clone();
         let actor_name = (*self.actor_name).clone();
         let conversation_id = (*self.conversation_id).clone();
         let rerun = self.rerun.clone();
-        let mode = self.mode;
 
         ctx.spawn(async move {
             let system_msg: ChatCompletionRequestMessage =
@@ -519,7 +562,7 @@ impl Message<FileReaderQuery> for FileReader {
                 messages: vec![system_msg, user_msg],
                 temperature: DEFAULT_TEMPERATURE,
                 top_p: DEFAULT_TOP_P,
-                tool_ids: Self::tool_identifiers_for_mode(mode)?,
+                tool_ids: Self::tool_identifiers()?,
                 max_iterations: MAX_TOOL_ITERATIONS,
                 tool_host,
                 actor_name,
@@ -533,7 +576,7 @@ impl Message<FileReaderQuery> for FileReader {
     }
 }
 
-impl Message<ExecuteTool> for FileReader {
+impl<M: ModeSpec> Message<ExecuteTool> for Reader<M> {
     type Reply = Result<ToolOutput, ToolExecutionError>;
 
     async fn handle(
@@ -564,7 +607,7 @@ impl Message<ExecuteTool> for FileReader {
             conversation_id:    Arc::clone(&self.conversation_id),
             rerun:              self.rerun.clone(),
             analysis_cache:     Arc::clone(&self.analysis_cache),
-            mode:               self.mode,
+            mode:               M::MODE,
             course_commit:      Arc::clone(&self.course_commit),
         };
 

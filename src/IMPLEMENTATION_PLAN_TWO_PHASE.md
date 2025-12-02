@@ -19,7 +19,9 @@ Implement a two-phase autonomous curriculum graph construction system:
 
 **Key constraints baked into this plan**:
 - Use existing tools correctly: assessments/LOs are created via `graph_insert_knowledge` with `knowledge_type=assessment_item` or `learning_outcome`; TeachingSteps stay in Harvester scope; Weavers get `graph_neighbors` and other read-only tools but no node mutations.
-- Tags are standardized: every node gets `source:<chapter>` (provenance only); Weavers discover nodes via `graph_list_nodes_by_tag` + `graph_search_nodes` instead of relying on slug hints.
+- Tags are standardized: every node gets `source:<chapter_path>` (workspace-relative for uniqueness,
+  e.g., `source:unit1/intro.ptx`); Weavers discover nodes via `graph_list_nodes_by_tag` +
+  `graph_search_nodes` instead of relying on slug hints.
 
 **Engineering choices (flexible)**:
 - Step ordering, concurrency, and exact prompts are suggested defaults; adapt per chapter/model/runtime.
@@ -211,7 +213,9 @@ QUALITY STANDARDS:
 - **Slugs**: Normalized `{kind}.{snake_case_name}` (e.g., c.loop_invariant, p.insertion_sort, lo.write_test_cases)
 - **Statements**: Complete, standalone text (someone reading just the node should understand it)
 - **Source refs**: Exact file:line or section IDs
-- **Tags for context**: Always add `source:<chapter>` for this chapter and dependency hints as `req:slug`, `sup:slug`, or `ref:slug` (no other prefixes)
+- **Tags for context**: Always add `source:<chapter_path>` for this chapter (workspace-relative,
+  e.g., `source:unit1/intro.ptx`) and dependency hints as `req:slug`, `sup:slug`, or `ref:slug`
+  (no other prefixes)
 - **Coverage**: If you finish and have <50 knowledge nodes from a typical chapter, you missed content. Go back and extract more.
 
 FORBIDDEN TOOLS (Phase 2 only):
@@ -262,7 +266,8 @@ You must create 100% of the curriculum relationships:
 STRATEGY:
 1. Start with `graph_first_principles` to find entry-point nodes
 2. Use `graph_neighbors` to explore the local neighborhood
-3. Read node `tags` for `req:`, `sup:`, or `ref:` hints from harvesters (and the `source:<chapter>` tag to scope work)
+3. Read node `tags` for `req:`, `sup:`, or `ref:` hints from harvesters (and the
+   `source:<chapter_path>` tag to scope work)
 4. Use `source_refs` to read ONLY relevant passages (don't re-read full chapter)
 5. Work systematically: requires → supports → assesses → discourse
 6. Use `graph_lo_alignment_summary` and `graph_gap_summary` to find missing edges
@@ -378,14 +383,14 @@ pub fn tool_identifiers_for_mode(mode: AgentMode) -> Result<Vec<&'static str>> {
 **Problem**: Weavers lack a way to enumerate orphan nodes or resolve fuzzy names; tags like `req:slug` can go stale after dedup.
 
 **Add two read-only tools (graph_tools)**:
-- `graph_list_nodes_by_tag(tag: String, limit: Option<usize>)` — returns slugs + titles for nodes matching a tag (use `source:<chapter>` to scope the working set).
+- `graph_list_nodes_by_tag(tag: String, limit: Option<usize>)` — returns slugs + titles for nodes matching a tag (use `source:<chapter_path>` to scope the working set).
 - `graph_search_nodes(query: String, limit: usize)` — fuzzy search over titles/statements (substring/Jaro-Winkler) to resolve edge endpoints from text.
 - (Optional) `graph_list_tags()` — enumerate available tags when chapters are numerous.
 - (Optional) `graph_list_nodes_by_kind(kind: KnowledgeType, limit: Option<usize>)` — quick filtering when inventories get large.
   - Implementation note: start with case-insensitive substring on slug/title/statement; add Jaro-Winkler fallback. Keep it lightweight—no semantic/embedding search needed for demo.
 
 **Prompt change for Weavers**:
-1) Call `graph_list_nodes_by_tag(source:<chapter>)` to get inventory.
+1) Call `graph_list_nodes_by_tag(source:<chapter_path>)` to get inventory.
 2) For each node, use its `source_refs` to read spans, derive relationships.
 3) Resolve targets via `graph_search_nodes` (not slug tags), then create edges.
 
@@ -703,7 +708,8 @@ pub async fn run_two_phase_construction(
                 // ===== PHASE 2: WEAVING =====
                 info!("Starting Phase 2: Edge Weaving");
 
-                // Gather chapter-scoped node lists (via `source:<chapter>` tags or graph_version delta) and inject into prompts
+                // Gather chapter-scoped node lists (via `source:<chapter_path>` tags or graph_version
+                // delta) and inject into prompts
 
                 let weaver_tasks: Vec<_> = chapters
                     .iter()
