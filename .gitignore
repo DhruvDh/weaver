@@ -1,3 +1,6 @@
 target/
 *.log
 .envrc/st.envrc
+
+graph_snapshot.state
+graph_snapshot.json

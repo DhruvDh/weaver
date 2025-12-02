@@ -77,6 +77,9 @@ fn base_cli(root: &Path, snapshot: &Path, commit: &str, autosave_secs: u64) -> C
         dedup_interval_secs:         0,
         dedup_auto_merge_threshold:  0.95,
         skip_dedup_on_insert:        false,
+        interactive:                 true,
+        chapters_pattern:            None,
+        chapters_dir:                None,
     }
 }
 

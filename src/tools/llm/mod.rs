@@ -23,6 +23,7 @@ use self::{
 };
 use crate::{
     agents::deduplication::DeduplicationAgent,
+    file_reader::AgentMode,
     graph::manager::GraphManager,
     llm_gateway::{GatewayMetrics, LLMGateway},
 };
@@ -32,6 +33,7 @@ pub mod dedup_tools;
 mod delegate_tasks;
 pub mod graph_tools;
 mod list_directory;
+mod locate_snippet;
 mod read_file_full;
 mod read_file_range;
 mod search_text;
@@ -46,6 +48,7 @@ const BASE_TOOL_IDS: &[&str] = &[
     "read_file_full",
     "read_file_range",
     "search_text",
+    "locate_snippet",
     "delegate_tasks",
 ];
 
@@ -304,6 +307,7 @@ fn build_tool_prototypes() -> Result<Vec<ToolPrototype>, ToolRegistryError> {
         read_file_full_meta(),
         read_file_range_meta(),
         search_text_meta(),
+        locate_snippet::locate_snippet_meta(),
         delegate_tasks_meta(),
     ];
 
@@ -366,6 +370,8 @@ pub struct CallState {
     pub conversation_id:    Arc<String>,
     pub rerun:              Option<ActorRef<crate::rerun_sink::RerunSink>>,
     pub analysis_cache:     Arc<AnalysisCache>,
+    pub mode:               AgentMode,
+    pub course_commit:      Arc<String>,
 }
 
 pub const fn default_false() -> bool {

@@ -538,6 +538,7 @@ mod tests {
     use super::*;
     use crate::{
         constants::DEFAULT_MAX_SUBDELEGATIONS,
+        file_reader::AgentMode,
         graph::{
             CaseTag, EdgeKind, IntroductionScope, KnowledgeNode, SupportsAttrs, SupportsSpec,
             commands::{GetEdgeConflicts, GetGraphVersion, ResolveSlug},
@@ -630,6 +631,8 @@ mod tests {
             conversation_id: Arc::new("test-convo".into()),
             rerun: None,
             analysis_cache: Arc::new(AnalysisCache::new()),
+            mode: AgentMode::Interactive,
+            course_commit: Arc::new("deadbeef".into()),
         };
 
         (call_state, graph_actor, dedup_actor, gateway_actor)

@@ -102,18 +102,19 @@ impl ToolInstance for ReadFileRangeTool {
             &self.args.path,
             IDENTIFIER,
         )?;
-        let range =
-            filesystem::read_file_range(&resolved, self.args.start_line, self.args.end_line)
-                .await
-                .with_context(|| {
-                    format!(
-                        "read_file_range failed for {} ({}-{})",
-                        resolved.display(),
-                        self.args.start_line,
-                        self.args.end_line
-                    )
-                })?;
+        let requested_end = self.args.end_line;
+        let range = filesystem::read_file_range(&resolved, self.args.start_line, requested_end)
+            .await
+            .with_context(|| {
+                format!(
+                    "read_file_range failed for {} ({}-{})",
+                    resolved.display(),
+                    self.args.start_line,
+                    self.args.end_line
+                )
+            })?;
 
+        let truncated = range.end_line < requested_end;
         let line_count = range.end_line.saturating_sub(range.start_line) + 1;
         let range_bytes = range.text.len() as u64;
         let mode = ToolPayloadMode::from_fetch_flag(self.args.fetch_body);
@@ -123,14 +124,22 @@ impl ToolInstance for ReadFileRangeTool {
         let end_line = range.end_line;
         let range_text = range.text.clone();
 
+        let mut hints = vec![
+            format!("Path: {path_hint}"),
+            format!("Span covers {} lines ({}-{}).", line_count, start_line, end_line),
+            "Re-run read_file_range with fetch_body=true to retrieve this span.".to_string(),
+            "Narrow the start/end lines to stay within budget.".to_string(),
+        ];
+        if truncated {
+            hints.push(format!(
+                "Requested end_line {} truncated to file length {}.",
+                requested_end, end_line
+            ));
+        }
+
         let runner = ToolRunner::new(IDENTIFIER, &self.state)
             .with_mode(mode)
-            .hints(vec![
-                format!("Path: {path_hint}"),
-                format!("Span covers {} lines ({}-{}).", line_count, start_line, end_line),
-                "Re-run read_file_range with fetch_body=true to retrieve this span.".to_string(),
-                "Narrow the start/end lines to stay within budget.".to_string(),
-            ]);
+            .hints(hints);
 
         info!(
             mode = ?mode,
@@ -152,9 +161,11 @@ impl ToolInstance for ReadFileRangeTool {
                         "path": body_path,
                         "start_line": start_line,
                         "end_line": end_line,
+                        "requested_end_line": requested_end,
                         "content": range_text,
                         "line_count": line_count,
                         "bytes": range_bytes,
+                        "truncated": truncated,
                     }),
                     approx_bytes:  Some(range_bytes),
                     preview:       Some(json!({
@@ -164,8 +175,10 @@ impl ToolInstance for ReadFileRangeTool {
                         "path": preview_path,
                         "start_line": start_line,
                         "end_line": end_line,
+                        "requested_end_line": requested_end,
                         "bytes": range_bytes,
                         "line_count": line_count,
+                        "truncated": truncated,
                     })),
                     preview_hints: Vec::new(),
                     page:          None,

@@ -126,23 +126,16 @@ pub async fn read_file_range(
         );
     }
 
-    if end_line > total_lines {
-        bail!(
-            "requested end_line {} exceeds file line count {} for {}",
-            end_line,
-            total_lines,
-            path_buf.display()
-        );
-    }
+    let clamped_end = end_line.min(total_lines);
 
-    let count = end_line - start_line + 1;
+    let count = clamped_end - start_line + 1;
     let lines: Vec<&str> = content.lines().skip(start_line - 1).take(count).collect();
 
     if lines.is_empty() {
         bail!(
             "requested range {}-{} is outside the bounds of {}",
             start_line,
-            end_line,
+            clamped_end,
             path_buf.display()
         );
     }

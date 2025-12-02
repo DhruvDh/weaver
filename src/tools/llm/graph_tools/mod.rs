@@ -31,6 +31,11 @@ crate::tool_ids! {
             GRAPH_LOAD_SNAPSHOT = "graph_load_snapshot";
             GRAPH_NEIGHBORS = "graph_neighbors";
             GRAPH_GET_NODE = "graph_get_node";
+            GRAPH_LIST_NODES_BY_TAG = "graph_list_nodes_by_tag";
+            GRAPH_LIST_NODES_BY_KIND = "graph_list_nodes_by_kind";
+            GRAPH_LIST_TAGS = "graph_list_tags";
+            GRAPH_SEARCH_NODES = "graph_search_nodes";
+            GRAPH_COURSE_COMMIT = "graph_course_commit";
             GRAPH_EDGE_CONFLICTS = "graph_edge_conflicts";
             GRAPH_RESOLVE_EDGE_CONFLICT = "graph_resolve_edge_conflict";
             GRAPH_FIRST_PRINCIPLES = "graph_first_principles";

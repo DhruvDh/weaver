@@ -3,9 +3,12 @@ use std::path::PathBuf;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::graph::{
-    AnchorsAttrs, AssessesAttrs, EdgeConflict, EdgeKind, KnowledgeNode, PrecedesAttrs,
-    RequiresAttrs, SupportsAttrs, TeachingStepNode,
+use crate::{
+    graph::{
+        AnchorsAttrs, AssessesAttrs, EdgeConflict, EdgeKind, KnowledgeNode, PrecedesAttrs,
+        RequiresAttrs, SupportsAttrs, TeachingStepNode,
+    },
+    schema::types::KnowledgeType,
 };
 
 #[derive(Clone, Debug, Serialize)]
@@ -31,6 +34,33 @@ pub enum NeighborDirection {
     Incoming,
     Outgoing,
     Both,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct NodeSummary {
+    pub slug:           String,
+    pub title:          String,
+    pub kind:           String,
+    pub knowledge_type: Option<KnowledgeType>,
+    pub tags:           Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct NodeSearchResult {
+    pub slug:           String,
+    pub title:          String,
+    pub kind:           String,
+    pub knowledge_type: Option<KnowledgeType>,
+    pub tags:           Vec<String>,
+    pub score:          f32,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NodeKindSelector {
+    Knowledge { knowledge_type: KnowledgeType },
+    TeachingStep,
+    AnyKnowledge,
 }
 
 pub struct InsertKnowledge {
@@ -104,6 +134,21 @@ pub struct Neighbors {
     pub slug:      String,
     pub edge_kind: Option<EdgeKindFilter>,
     pub direction: Option<NeighborDirection>,
+}
+
+pub struct ListNodesByTag {
+    pub tag: String,
+}
+
+pub struct ListNodesByKind {
+    pub selector: NodeKindSelector,
+}
+
+pub struct ListTags;
+
+pub struct SearchNodes {
+    pub query: String,
+    pub limit: usize,
 }
 
 pub struct RenameNode {

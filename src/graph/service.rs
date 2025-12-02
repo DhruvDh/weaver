@@ -11,6 +11,7 @@ use std::{
 
 use petgraph::{Direction, visit::EdgeRef};
 use serde_json::json;
+use strsim::jaro_winkler;
 use tokio::{task, time::timeout};
 use uuid::Uuid;
 
@@ -18,6 +19,7 @@ use crate::{
     analysis,
     graph::{
         audit::{self, MutationKind},
+        commands::{NodeKindSelector, NodeSearchResult, NodeSummary},
         dedup::{DuplicateCheck, NodeDeduplicator},
         merge::{MergeResult, merge_edge_payload, union_source_refs, union_vecs},
         model::*,
@@ -556,6 +558,127 @@ impl GraphService {
             }
         }
         Err(GraphError::MissingSlug(slug.to_string()))
+    }
+
+    fn summarize_node(&self, id: NodeId) -> NodeSummary {
+        let payload = &self.graph()[id];
+        let (title, kind, knowledge_type) = match &payload.kind {
+            NodeKind::Knowledge(k) => {
+                (k.title.clone(), "knowledge".to_string(), Some(k.knowledge_type))
+            }
+            NodeKind::TeachingStep(ts) => (ts.title.clone(), "teaching_step".to_string(), None),
+        };
+        NodeSummary {
+            slug: payload.slug.clone(),
+            title,
+            kind,
+            knowledge_type,
+            tags: payload.tags.clone(),
+        }
+    }
+
+    pub fn list_nodes_by_tag(&self, tag: &str) -> Vec<NodeSummary> {
+        let needle = tag.to_ascii_lowercase();
+        let mut nodes = Vec::new();
+        for id in self.graph().node_indices() {
+            let has_tag = self.graph()[id]
+                .tags
+                .iter()
+                .any(|t| t.to_ascii_lowercase() == needle);
+            if has_tag {
+                nodes.push(self.summarize_node(id));
+            }
+        }
+        nodes.sort_by(|a, b| a.slug.cmp(&b.slug));
+        nodes
+    }
+
+    pub fn list_nodes_by_kind(&self, selector: &NodeKindSelector) -> Vec<NodeSummary> {
+        let mut nodes = Vec::new();
+        for id in self.graph().node_indices() {
+            let matches = match (&self.graph()[id].kind, selector) {
+                (NodeKind::Knowledge(k), NodeKindSelector::Knowledge { knowledge_type }) => {
+                    k.knowledge_type == *knowledge_type
+                }
+                (NodeKind::Knowledge(_), NodeKindSelector::AnyKnowledge) => true,
+                (NodeKind::TeachingStep(_), NodeKindSelector::TeachingStep) => true,
+                _ => false,
+            };
+            if matches {
+                nodes.push(self.summarize_node(id));
+            }
+        }
+        nodes.sort_by(|a, b| a.slug.cmp(&b.slug));
+        nodes
+    }
+
+    pub fn list_tags(&self) -> Vec<String> {
+        let mut tags: HashSet<String> = HashSet::new();
+        for id in self.graph().node_indices() {
+            for tag in &self.graph()[id].tags {
+                tags.insert(tag.clone());
+            }
+        }
+        let mut collected: Vec<String> = tags.into_iter().collect();
+        collected.sort();
+        collected
+    }
+
+    pub fn search_nodes(&self, query: &str, max_results: usize) -> Vec<NodeSearchResult> {
+        if query.trim().is_empty() || max_results == 0 {
+            return Vec::new();
+        }
+        let needle = query.to_ascii_lowercase();
+        let mut results = Vec::new();
+
+        for id in self.graph().node_indices() {
+            let summary = self.summarize_node(id);
+            let payload = &self.graph()[id];
+            let title_lc = summary.title.to_ascii_lowercase();
+            let slug_lc = summary.slug.to_ascii_lowercase();
+
+            let mut score = 0.0_f64;
+            if slug_lc.contains(&needle) || title_lc.contains(&needle) {
+                score = 1.0;
+            }
+
+            let statement = match &payload.kind {
+                NodeKind::Knowledge(k) => Some(k.statement.as_str()),
+                NodeKind::TeachingStep(ts) => Some(ts.statement.as_str()),
+            };
+            if let Some(stmt) = statement {
+                let stmt_lc = stmt.to_ascii_lowercase();
+                if stmt_lc.contains(&needle) {
+                    score = score.max(0.95);
+                }
+                score = score.max(jaro_winkler(&stmt_lc, &needle));
+            }
+
+            score = score.max(jaro_winkler(&slug_lc, &needle));
+            score = score.max(jaro_winkler(&title_lc, &needle));
+
+            if score < 0.6 {
+                continue;
+            }
+
+            results.push(NodeSearchResult {
+                slug:           summary.slug,
+                title:          summary.title,
+                kind:           summary.kind,
+                knowledge_type: summary.knowledge_type,
+                tags:           summary.tags,
+                score:          score as f32,
+            });
+        }
+
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.slug.cmp(&b.slug))
+        });
+        results.truncate(max_results.clamp(1, 500));
+        results
     }
 
     pub fn add_knowledge_node(

@@ -126,6 +126,8 @@ impl ToolInstance for DelegateTasksTool {
             rerun:              self.state.rerun.clone(),
             depth:              self.state.depth,
             max_subdelegations: self.state.max_subdelegations,
+            mode:               self.state.mode,
+            course_commit:      Arc::clone(&self.state.course_commit),
         };
 
         let result = run_delegate_batch_with_state(ctx, self.args.tasks.clone()).await?;

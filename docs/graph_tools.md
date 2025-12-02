@@ -17,6 +17,10 @@ Command previews also return a cost block with byte/token hints so the gateway c
 | --- | --- | --- | --- |
 | `graph_neighbors` | view | Neighbors of a slug, filtered by edge kind/direction | `slug`, `edge_kind` (requires/supports/assesses/precedes/anchors), `direction` (incoming/outgoing/both), `limit`, `offset` |
 | `graph_get_node` | view | Fetch a node with typed fields by slug | `slug` |
+| `graph_list_nodes_by_tag` | view | Nodes that include a given tag (case-insensitive) | `tag`, `limit`, `offset` |
+| `graph_list_nodes_by_kind` | view | Nodes filtered by knowledge_type, any_knowledge, or teaching_step | `selector`, `limit`, `offset` |
+| `graph_list_tags` | view | Deduped list of all tags in the graph | — |
+| `graph_search_nodes` | view | Fuzzy search across slug/title/statement | `query`, `limit` |
 | `graph_first_principles` | view | Paged list of first-principle instructional nodes | `limit`, `offset` |
 | `graph_first_principles_summary` | analysis | Counts of first principles by knowledge type | `fetch_body` |
 | `graph_lo_reachability` | view | Reachability/coverage bundle for an LO (with anchors) | `lo_slug`, `limit`, `offset` |

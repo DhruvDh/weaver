@@ -836,6 +836,30 @@ impl LLMGateway {
         messages: &mut Vec<ChatCompletionRequestMessage>,
         state: &mut IterationState,
     ) -> Result<()> {
+        const MAX_TOOL_CALLS_PER_MESSAGE: usize = 64;
+        if tool_calls.len() > MAX_TOOL_CALLS_PER_MESSAGE {
+            warn!(
+                iteration,
+                requested = tool_calls.len(),
+                limit = MAX_TOOL_CALLS_PER_MESSAGE,
+                "assistant returned too many tool calls; advising to batch"
+            );
+            let advisory = format!(
+                "Too many tool calls at once ({requested} > {limit}). Batch requests or use \
+                 delegate_tasks; cap concurrent tool_calls to {limit}.",
+                requested = tool_calls.len(),
+                limit = MAX_TOOL_CALLS_PER_MESSAGE
+            );
+            let advisory_msg: ChatCompletionRequestMessage =
+                ChatCompletionRequestAssistantMessageArgs::default()
+                    .content(advisory)
+                    .build()
+                    .context("failed to build advisory assistant message")?
+                    .into();
+            messages.push(advisory_msg);
+            return Ok(());
+        }
+
         let assistant_msg = ChatCompletionRequestAssistantMessageArgs::default()
             .tool_calls(tool_calls.clone())
             .build()

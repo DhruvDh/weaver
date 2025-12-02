@@ -1,5 +1,7 @@
-/// Default temperature applied to LLM requests.
-pub const DEFAULT_TEMPERATURE: f32 = 0.7;
+/// Default temperature applied to LLM requests. Some models only accept the
+/// default of 1.0, so keep this at the neutral setting.
+/// TODO: Change to 0.6 when running with gpt-oss-120b
+pub const DEFAULT_TEMPERATURE: f32 = 1.0;
 
 /// Default nucleus sampling value applied to LLM requests.
 pub const DEFAULT_TOP_P: f32 = 1.0;
@@ -18,7 +20,7 @@ pub const DEFAULT_MAX_SUBDELEGATIONS: usize = 6;
 pub const MAX_PARALLEL_DELEGATIONS: usize = 8;
 
 /// Maximum number of in-flight OpenAI requests handled by the gateway.
-pub const LLM_MAX_CONCURRENT_REQUESTS: usize = 256;
+pub const LLM_MAX_CONCURRENT_REQUESTS: usize = 128;
 
 /// Maximum number of retry attempts for a single OpenAI request.
 pub const LLM_MAX_RETRIES: usize = 5;

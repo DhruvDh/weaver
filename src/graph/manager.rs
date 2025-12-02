@@ -622,6 +622,54 @@ impl Message<Neighbors> for GraphManager {
     }
 }
 
+impl Message<ListNodesByTag> for GraphManager {
+    type Reply = Result<Vec<NodeSummary>, GraphError>;
+
+    async fn handle(
+        &mut self,
+        ListNodesByTag { tag }: ListNodesByTag,
+        _ctx: &mut MsgContext<Self, Self::Reply>,
+    ) -> Self::Reply {
+        Ok(self.service.list_nodes_by_tag(&tag))
+    }
+}
+
+impl Message<ListNodesByKind> for GraphManager {
+    type Reply = Result<Vec<NodeSummary>, GraphError>;
+
+    async fn handle(
+        &mut self,
+        ListNodesByKind { selector }: ListNodesByKind,
+        _ctx: &mut MsgContext<Self, Self::Reply>,
+    ) -> Self::Reply {
+        Ok(self.service.list_nodes_by_kind(&selector))
+    }
+}
+
+impl Message<ListTags> for GraphManager {
+    type Reply = Result<Vec<String>, Infallible>;
+
+    async fn handle(
+        &mut self,
+        _msg: ListTags,
+        _ctx: &mut MsgContext<Self, Self::Reply>,
+    ) -> Self::Reply {
+        Ok(self.service.list_tags())
+    }
+}
+
+impl Message<SearchNodes> for GraphManager {
+    type Reply = Result<Vec<NodeSearchResult>, GraphError>;
+
+    async fn handle(
+        &mut self,
+        SearchNodes { query, limit }: SearchNodes,
+        _ctx: &mut MsgContext<Self, Self::Reply>,
+    ) -> Self::Reply {
+        Ok(self.service.search_nodes(&query, limit))
+    }
+}
+
 impl Message<ResolveSlug> for GraphManager {
     type Reply = Result<NodeId, GraphError>;
 

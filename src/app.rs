@@ -7,9 +7,9 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result, anyhow, bail};
 use bpaf::{OptionParser, Parser, construct, long, positional};
-use futures::future::BoxFuture;
+use futures::future::{BoxFuture, join_all};
 use kameo::{error::SendError, prelude::*};
 use kameo_actors::scheduler::{Scheduler, SetInterval};
 use kameo_persistence::PersistentActor;
@@ -20,9 +20,9 @@ use url::Url;
 use crate::{
     agents::deduplication::{DeduplicationAgent, RunDeduplication},
     constants::PRETEXT_SUBDIR,
-    file_reader::{FileReader, FileReaderQuery},
+    file_reader::{AgentMode, FileReader, FileReaderQuery, HarvesterFocus, WeaverFocus},
     graph::{
-        CurriculumGraph, GraphConfig,
+        CurriculumGraph, GraphConfig, commands::ListNodesByTag,
         audit::RerunMutationSink,
         manager::{
             ApplyRuntimeConfig, AuditInvariants, GetCourseCommit, GraphManager, GraphManagerState,
@@ -353,7 +353,6 @@ impl Message<PruneTick> for PruneWorker {
 pub struct Cli {
     pub rerun_mode:                  RerunMode,
     pub rerun_file:                  PathBuf,
-    pub workspace:                   PathBuf,
     pub graph_snapshot_path:         PathBuf,
     pub graph_autosave_secs:         u64,
     pub graph_course_commit:         Option<String>,
@@ -364,6 +363,10 @@ pub struct Cli {
     pub dedup_interval_secs:         u64,
     pub dedup_auto_merge_threshold:  f64,
     pub skip_dedup_on_insert:        bool,
+    pub interactive:                 bool,
+    pub chapters_pattern:            Option<String>,
+    pub chapters_dir:                Option<PathBuf>,
+    pub workspace:                   PathBuf,
 }
 
 #[derive(Clone)]
@@ -399,6 +402,7 @@ pub struct AppHandles {
     pub gateway:   ActorRef<LLMGateway>,
     pub rerun:     Option<ActorRef<RerunSink>>,
     pub scheduler: ActorRef<Scheduler>,
+    pub dedup:     ActorRef<DeduplicationAgent>,
 }
 
 pub type AppHook = Arc<dyn Fn(AppHandles) -> BoxFuture<'static, Result<()>> + Send + Sync>;
@@ -425,10 +429,261 @@ fn ensure_parent_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Orchestrate two-phase autonomous graph construction: harvest nodes, run
+/// dedup, then weave edges.
+pub async fn run_two_phase_construction(cli: Cli, chapters: Vec<PathBuf>) -> Result<()> {
+    if chapters.is_empty() {
+        bail!("--chapters matched no files; provide at least one chapter");
+    }
+
+    let mut modified_cli = cli.clone();
+    modified_cli.skip_demo = true;
+    modified_cli.skip_dedup_on_insert = true;
+
+    let workspace_root = modified_cli.workspace.clone();
+    let dedup_threshold = modified_cli.dedup_auto_merge_threshold;
+    let chapters_for_hook = chapters.clone();
+
+    let hook: AppHook = Arc::new(move |handles: AppHandles| -> BoxFuture<'static, Result<()>> {
+        let workspace_root = workspace_root.clone();
+        let chapters = chapters_for_hook.clone();
+        Box::pin(async move {
+            let course_commit = handles
+                .graph
+                .ask(GetCourseCommit)
+                .await
+                .unwrap_or_else(|_| String::new());
+            let metrics = handles
+                .gateway
+                .ask(GetGatewayMetrics)
+                .await
+                .unwrap_or_else(|_| Arc::new(GatewayMetrics::default()));
+
+            let graph = handles.graph.clone();
+            let gateway = handles.gateway.clone();
+            let rerun = handles.rerun.clone();
+            let dedup_agent = handles.dedup.clone();
+            let harvester_focus = HarvesterFocus::All;
+            let weaver_focus = WeaverFocus::All;
+
+            info!(chapters = chapters.len(), "Phase 1: harvesting nodes");
+            let course_commit_for_tasks = course_commit.clone();
+            let harvester_tasks = chapters.iter().map(|chapter_path| {
+                let chapter_path = chapter_path.clone();
+                let chapter_tag = chapter_path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| chapter_path.display().to_string());
+                let tag = format!("source:{chapter_tag}");
+                let graph_for_reader = graph.clone();
+                let graph_for_check = graph.clone();
+                let gateway_ref = gateway.clone();
+                let metrics_ref = Arc::clone(&metrics);
+                let dedup_ref = dedup_agent.clone();
+                let rerun_ref = rerun.clone();
+                let workspace = workspace_root.clone();
+                let course_commit = course_commit_for_tasks.clone();
+
+                async move {
+                    let actor = FileReader::from_env_with_mode(
+                        workspace,
+                        gateway_ref,
+                        metrics_ref,
+                        graph_for_reader,
+                        dedup_ref,
+                        rerun_ref,
+                        AgentMode::Harvester,
+                        course_commit,
+                    )?;
+                    let reader = FileReader::spawn(actor);
+                    let prompt = format!(
+                        "PHASE 1: Harvest EVERY node from {chapter}\n\n- Extract all concepts, \
+                         facts, procedures, strategies, learning outcomes, teaching steps, \
+                         assessments, and worked examples.\n- Do NOT create edges.\n- Tag every \
+                         node with {tag} and add req:/sup:/ref: hints in tags when you see \
+                         dependencies.\n- Focus: {harvester_focus} \
+                         ({harvester_focus_directive}).\n- Aim for 80-150 nodes from this \
+                         chapter; completeness is more important than brevity.",
+                        chapter = chapter_path.display(),
+                        tag = tag,
+                        harvester_focus = harvester_focus,
+                        harvester_focus_directive = harvester_focus.directive(),
+                    );
+                    reader.ask(FileReaderQuery { prompt }).await?;
+
+                    let tagged = graph_for_check
+                        .ask(ListNodesByTag { tag: tag.clone() })
+                        .await
+                        .map_err(anyhow::Error::from)?;
+                    if tagged.is_empty() {
+                        bail!(
+                            "Phase 1 produced no nodes tagged {tag} for chapter {}",
+                            chapter_path.display()
+                        );
+                    }
+
+                    Ok::<_, anyhow::Error>((chapter_path, chapter_tag, tag, tagged.len()))
+                }
+            });
+            let harvester_results: Vec<Result<(PathBuf, String, String, usize)>> =
+                join_all(harvester_tasks).await;
+
+            let mut successful_chapters = Vec::new();
+            let mut failed_harvests = Vec::new();
+
+            for result in harvester_results {
+                match result {
+                    Ok((chapter_path, chapter_tag, tag, tagged_count)) => {
+                        info!(
+                            chapter = %chapter_path.display(),
+                            %tag,
+                            tagged_count,
+                            "Harvest complete for chapter"
+                        );
+                        successful_chapters.push((chapter_path, chapter_tag, tag));
+                    }
+                    Err(err) => {
+                        warn!(error = ?err, "Harvest failed for chapter");
+                        failed_harvests.push(err);
+                    }
+                }
+            }
+
+            if successful_chapters.is_empty() {
+                let errors = failed_harvests
+                    .into_iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                bail!("Harvest failed for all chapters: {errors}");
+            }
+
+            if !failed_harvests.is_empty() {
+                warn!(
+                    successful = successful_chapters.len(),
+                    failed = failed_harvests.len(),
+                    total = chapters.len(),
+                    "Continuing with successfully harvested chapters only"
+                );
+            }
+
+            info!("Deduplication barrier starting");
+            let dedup_report = dedup_agent
+                .ask(RunDeduplication {
+                    auto_merge_threshold: dedup_threshold,
+                    dry_run:              false,
+                })
+                .await
+                .map_err(anyhow::Error::from)?;
+            info!(
+                clusters = dedup_report.clusters_analyzed,
+                auto_merged = dedup_report.auto_merged.len(),
+                pending_review = dedup_report.pending_review.len(),
+                "Deduplication complete"
+            );
+
+            graph
+                .ask(AuditInvariants)
+                .await
+                .map_err(anyhow::Error::from)?;
+            graph
+                .ask(PersistSnapshot)
+                .await
+                .map_err(anyhow::Error::from)?;
+
+            info!(chapters = successful_chapters.len(), "Phase 2: weaving edges");
+            let course_commit_for_weavers = course_commit.clone();
+            let weaver_tasks =
+                successful_chapters
+                    .iter()
+                    .map(|(chapter_path, _chapter_tag, tag): &(PathBuf, String, String)| {
+                        let chapter_path = chapter_path.clone();
+                        let tag = tag.clone();
+                        let graph_ref = graph.clone();
+                        let gateway_ref = gateway.clone();
+                        let metrics_ref = Arc::clone(&metrics);
+                        let rerun_ref = rerun.clone();
+                        let dedup_ref = dedup_agent.clone();
+                        let workspace = workspace_root.clone();
+                        let course_commit = course_commit_for_weavers.clone();
+
+                        async move {
+                            let actor = FileReader::from_env_with_mode(
+                                workspace,
+                                gateway_ref,
+                                metrics_ref,
+                                graph_ref,
+                                dedup_ref,
+                                rerun_ref,
+                                AgentMode::Weaver,
+                                course_commit,
+                            )?;
+                            let reader = FileReader::spawn(actor);
+                            let prompt = format!(
+                                "PHASE 2: Connect ALL nodes for {chapter}\n\n- Start with \
+                                 graph_list_nodes_by_tag {tag} to scope the inventory.\n- Use \
+                                 graph_search_nodes when slugs are fuzzy; avoid creating new \
+                                 nodes.\n- Create requires/supports/assesses/precedes/anchors \
+                                 edges with strong rationales and evidence refs.\n- Focus: \
+                                 {weaver_focus} ({weaver_focus_directive}).\n- Run \
+                                 graph_gap_summary, graph_lo_alignment_summary, and \
+                                 graph_dag_check near the end. Target 200-400 edges.",
+                                chapter = chapter_path.display(),
+                                tag = tag,
+                                weaver_focus = weaver_focus,
+                                weaver_focus_directive = weaver_focus.directive(),
+                            );
+                            reader
+                                .ask(FileReaderQuery { prompt })
+                                .await
+                                .map(|_| ())
+                                .map_err(anyhow::Error::from)
+                        }
+                    });
+            let weaver_results: Vec<Result<()>> = join_all(weaver_tasks).await;
+            let total_weaves = weaver_results.len();
+            let mut failed_weaves = Vec::new();
+            for ((chapter_path, tag), result) in successful_chapters
+                .into_iter()
+                .map(|(chapter_path, _tag, tag)| (chapter_path, tag))
+                .zip(weaver_results)
+            {
+                if let Err(err) = result {
+                    warn!(
+                        chapter = %chapter_path.display(),
+                        %tag,
+                        error = ?err,
+                        "Weaving failed for chapter"
+                    );
+                    failed_weaves.push(err);
+                }
+            }
+
+            if !failed_weaves.is_empty() {
+                warn!(failed = failed_weaves.len(), "Phase 2 completed with weaving failures");
+            }
+            if total_weaves > 0 && failed_weaves.len() == total_weaves {
+                bail!("Weaving failed for all harvested chapters");
+            }
+
+            graph
+                .ask(AuditInvariants)
+                .await
+                .map_err(anyhow::Error::from)?;
+            info!("Two-phase construction completed");
+            Ok(())
+        })
+    });
+
+    let runtime = RuntimeOptions {
+        on_started: Some(hook),
+        ..RuntimeOptions::default()
+    };
+
+    run_app(modified_cli, runtime).await
+}
+
 pub fn cli() -> OptionParser<Cli> {
-    let workspace = positional::<PathBuf>("workspace")
-        .help("Workspace root to expose to the assistant")
-        .fallback(PathBuf::from(PRETEXT_SUBDIR));
     let rerun_mode = long("rerun-mode")
         .help("Rerun sink mode: grpc | file | both | none (default grpc)")
         .argument::<String>("mode")
@@ -490,12 +745,27 @@ pub fn cli() -> OptionParser<Cli> {
     let skip_demo = long("skip-demo")
         .help("Skip the startup FileReader demo (useful for tests or headless runs)")
         .switch();
+    let interactive = long("interactive")
+        .help("Run the legacy interactive FileReader demo instead of two-phase automation")
+        .switch();
+    let chapters_pattern = long("chapters")
+        .help(
+            "Glob pattern for chapter files (e.g., 'source/sec-*.ptx'); required with --two-phase",
+        )
+        .argument::<String>("pattern")
+        .optional();
+    let chapters_dir = long("chapters-dir")
+        .help("Directory containing chapter files; expands to all *.ptx within (recursive)")
+        .argument::<PathBuf>("dir")
+        .optional();
+    let workspace = positional::<PathBuf>("workspace")
+        .help("Workspace root to expose to the assistant")
+        .fallback(PathBuf::from(PRETEXT_SUBDIR));
 
     construct! {
         Cli {
             rerun_mode,
             rerun_file,
-            workspace,
             graph_snapshot_path,
             graph_autosave_secs,
             graph_course_commit,
@@ -506,6 +776,10 @@ pub fn cli() -> OptionParser<Cli> {
             dedup_interval_secs,
             dedup_auto_merge_threshold,
             skip_dedup_on_insert,
+            interactive,
+            chapters_pattern,
+            chapters_dir,
+            workspace,
         }
     }
     .to_options()
@@ -863,6 +1137,7 @@ pub async fn run_app(cli: Cli, runtime: RuntimeOptions) -> Result<()> {
             gateway:   gateway.clone(),
             rerun:     rerun_actor.clone(),
             scheduler: scheduler.clone(),
+            dedup:     dedup_agent.clone(),
         })
         .await?;
     }
@@ -886,6 +1161,7 @@ pub async fn run_app(cli: Cli, runtime: RuntimeOptions) -> Result<()> {
             graph_actor.clone(),
             dedup_agent.clone(),
             rerun_actor.clone(),
+            resolved_commit.clone(),
         ) {
             Ok(actor) => actor,
             Err(err) => {
