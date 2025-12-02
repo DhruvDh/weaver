@@ -4,31 +4,31 @@
 
 ---
 
-## Slide 1: The Lens Problem
+## 1: The Lens Problem
 
-Network science tools can reveal simple truths about complex systems. But networks aren't found in nature. The lens for viewing something as a network must be designed. Whether you uncover insight depends on the quality of that design. This is a creative problem.
-
----
-
-## Slide 2: Lens Equals Definition
-
-The lens is the network definition: what is a node, what is an edge, what types exist, what properties they carry. Once you have a definition capable of yielding insight, the next problem is practical—how do you populate it from real data?
+Network science tools can reveal simple truths about complex systems. But networks aren't found in nature. The lens for viewing something as a network must be designed. Whether insight is uncovered depends on the quality of that design. This is a creative problem.
 
 ---
 
-## Slide 3: My Project
+## 2: Lens Equals Definition
 
-I built a system that automates the transformation of unstructured text (a programming textbook) into a structured network representation.
+The lens is the network definition: what is a node, what is an edge, what types exist, what properties they carry. Once a definition capable of yielding insight is in place, the next problem is practical—how to populate it from real data.
 
 ---
 
-## Slide 4: The Approach
+## 3: Project Overview
 
-I used a multi-agent LLM system. Sounds simple. Hard to actually build.
+A system was built to automate the transformation of unstructured text (a programming textbook) into a structured network representation.
+
+---
+
+## 4: Approach
+
+The system uses a multi-agent LLM architecture. It sounds simple; it is hard to build in practice.
 
 **The missing target problem.** Agent reading Chapter 2 wants to create edge "Loops → Variables." But Variables is in Chapter 1, processed by a different agent. If that agent hasn't finished, the target doesn't exist. Race condition.
 
-**Tool access control.** LLMs use whatever tools you give them. Harvesters must only create nodes. Weavers must only create edges. Enforced at compile time (different agent types with different tool sets) and runtime (gateway only advertises permitted tools).
+**Tool access control.** LLMs will use whatever tools they are given. Harvesters must only create nodes. Weavers must only create edges. Enforced at compile time (different agent types with different tool sets) and runtime (gateway only advertises permitted tools).
 
 **Coordination.** Each chapter gets an orchestrator. A supervisor coordinates across chapters—waits for all harvesting to complete before any weaving starts. Handles timeouts, cancellation, failures. Built on the actor model: isolated agents, message-passing, fault tolerance.
 
@@ -36,7 +36,7 @@ I used a multi-agent LLM system. Sounds simple. Hard to actually build.
 
 ---
 
-## Slide 5: My Network Definition
+## 5: Network Definition
 
 **Node types** (from Bloom's Taxonomy):
 - *Factual*: terms, symbols, conventions
@@ -53,29 +53,29 @@ I used a multi-agent LLM system. Sounds simple. Hard to actually build.
 
 *supports* (Knowledge → Knowledge/LO): scaffolding. Worked examples, analogies, counterexamples. Can have cycles but must be "fadeable"—removing them can't break prerequisite paths. Attributes: support_kind, intended_effect, case_tag, coverage_tags.
 
-*assesses* (Assessment → LO): evidence links. Attributes: observation_features (what you measure), scope (target or enabling).
+*assesses* (Assessment → LO): evidence links. Attributes: observation_features (what is measured), scope (target or enabling).
 
 **Design goals**: Constructive Alignment (LOs ↔ assessments ↔ teaching), Knowledge Space Theory (DAG = valid prerequisite structure), Evidence-Centered Design (assesses edges are the evidentiary argument).
 
 ---
 
-## Slide 6: What Analysis Becomes Possible
+## 6: What Analysis Becomes Possible
 
 On a complete graph:
 
-**graph_first_principles**: Nodes with zero incoming requires edges. Should be small—your true foundations.
+**graph_first_principles**: Nodes with zero incoming requires edges. Should be small—the true foundations.
 
 **graph_dag_check**: Verifies requires layer is acyclic. Cycles = incoherent curriculum.
 
 **graph_gap_summary**: Surfaces missing scaffolding, procedures without worked examples, LOs without assessments. A to-do list from structure.
 
-**graph_lo_alignment_summary**: For each LO—is there an assessment reachable from first principles that tests it? If not, you claim to teach it but never measure it.
+**graph_lo_alignment_summary**: For each LO—is there an assessment reachable from first principles that tests it? If not, the course claims to teach it but never measures it.
 
 **graph_keystone**: High centrality nodes in the DAG. If students fail here, large portions become inaccessible. Should have extra scaffolding.
 
 ---
 
-## Slide 7: Two-Phase Architecture
+## 7: Two-Phase Architecture
 
 All nodes must exist before any edges are created.
 
@@ -699,8 +699,8 @@ flowchart LR
 
 ```bash
 # Set environment
-export OPENAI_MODEL="your-model-name"
-export OPENAI_API_BASE="http://your-endpoint:1234/v1"
+export OPENAI_MODEL="MODEL_NAME"
+export OPENAI_API_BASE="http://ENDPOINT:1234/v1"
 
 # Demo run (matches run.sh: 13-way parallel, ~20/31 min timeouts)
 ./run.sh
@@ -803,7 +803,7 @@ A synchronization point that ensures graph consistency before edge creation, pre
 
 ### 6. Read-Only Analyst Mode
 Launch with `--interactive` (or `--analyst`) to open the TUI in read-only mode; add
-`--interactive-writable` only when you explicitly want the legacy writable FileReader tools.
+`--interactive-writable` only when explicit write access to FileReader tools is desired.
 A dedicated analysis agent with **26 inspection tools** for validating curriculum structure:
 - Structural analysis (DAG check, keystones, first principles)
 - Learning outcome alignment (coverage, reachability, criteria gaps)
