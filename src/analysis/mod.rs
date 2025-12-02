@@ -210,20 +210,51 @@ pub fn extraneous_knowledge(
 /// the intended construct set.
 pub fn intended_knowledge_from_anchors(g: &CurriculumGraph, lo: NodeId) -> HashSet<NodeId> {
     let mut intended = HashSet::new();
+    let mut target_steps = Vec::new();
+    let mut target_episodes = HashSet::new();
+
     for edge in g.edges_directed(lo, Direction::Incoming) {
         if let EdgeKind::Anchors(attrs) = &edge.weight().kind
             && matches!(attrs.impact, AnchorImpact::Target)
         {
             let step = edge.source();
+            target_steps.push(step);
+            if let NodeKind::TeachingStep(ts) = &g[step].kind {
+                target_episodes.insert(ts.episode.clone());
+            }
             for out in g.edges_directed(step, Direction::Outgoing) {
                 if let EdgeKind::Anchors(_) = &out.weight().kind
-                    && matches!(&g[out.target()].kind, NodeKind::Knowledge(k) if k.knowledge_type.is_instructional_knowledge())
+                    && matches!(
+                        &g[out.target()].kind,
+                        NodeKind::Knowledge(k) if k.knowledge_type.is_instructional_knowledge()
+                    )
                 {
                     intended.insert(out.target());
                 }
             }
         }
     }
+
+    // Include introductions/refinements to instructional knowledge elsewhere in
+    // the same episode(s) that contain a target anchor for this LO.
+    for step in g.node_indices() {
+        if let NodeKind::TeachingStep(ts) = &g[step].kind
+            && target_episodes.contains(&ts.episode)
+        {
+            for out in g.edges_directed(step, Direction::Outgoing) {
+                if let EdgeKind::Anchors(attrs) = &out.weight().kind
+                    && matches!(attrs.impact, AnchorImpact::Introduce | AnchorImpact::Refine)
+                    && matches!(
+                        &g[out.target()].kind,
+                        NodeKind::Knowledge(k) if k.knowledge_type.is_instructional_knowledge()
+                    )
+                {
+                    intended.insert(out.target());
+                }
+            }
+        }
+    }
+
     intended
 }
 

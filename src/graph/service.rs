@@ -1300,7 +1300,7 @@ impl GraphService {
 
         self.validate_edge_kind(from, to, &updated.kind, updated.confidence)?;
         let (coverage_los, skip_requires_dag, skip_fadeability, dirty) =
-            self.edge_validation_plan(edge_name(&updated.kind), from, to);
+            self.edge_validation_plan(edge_name(&updated.kind), from, to, &updated.kind);
 
         let snapshot = self.snapshot_state();
         self.graph_mut()[edge_id] = updated;
@@ -1615,7 +1615,7 @@ impl GraphService {
         let snapshot = self.snapshot_state();
         let edge_id = self.graph_mut().add_edge(from, to, payload);
         let (coverage_los, skip_requires_dag, skip_fadeability, dirty) =
-            self.edge_validation_plan(S::NAME, from, to);
+            self.edge_validation_plan(S::NAME, from, to, &self.graph()[edge_id].kind);
 
         let guard = ValidationGuard::new(
             self,
@@ -1668,7 +1668,7 @@ impl GraphService {
         self.graph_mut()[edge_id] = updated_payload;
 
         let (coverage_los, skip_requires_dag, skip_fadeability, dirty) =
-            self.edge_validation_plan(edge_name, from, to);
+            self.edge_validation_plan(edge_name, from, to, &self.graph()[edge_id].kind);
         let guard = ValidationGuard::new(
             self,
             dirty,
@@ -1703,6 +1703,7 @@ impl GraphService {
         edge_name: &'static str,
         from: NodeId,
         to: NodeId,
+        kind: &EdgeKind,
     ) -> (Vec<NodeId>, bool, bool, InvariantFamilies) {
         let coverage_los = match edge_name {
             "assesses" => vec![to],
@@ -1730,7 +1731,20 @@ impl GraphService {
             }
             "assesses" => InvariantFamilies::PURITY,
             "precedes" => InvariantFamilies::DISCOURSE,
-            "anchors" => InvariantFamilies::DISCOURSE | InvariantFamilies::INTRODUCTIONS,
+            "anchors" => {
+                let mut families = InvariantFamilies::DISCOURSE | InvariantFamilies::INTRODUCTIONS;
+                if let EdgeKind::Anchors(attrs) = kind
+                    && attrs.impact == AnchorImpact::Target
+                    && matches!(
+                        &self.graph()[to].kind,
+                        NodeKind::Knowledge(k)
+                            if k.knowledge_type == KnowledgeType::LearningOutcome
+                    )
+                {
+                    families.insert(InvariantFamilies::PURITY);
+                }
+                families
+            }
             _ => InvariantFamilies::empty(),
         };
         if !coverage_los.is_empty() {

@@ -1,6 +1,7 @@
 use crate::{
+    analysis,
     graph::{model::*, service::GraphService},
-    schema::types::KnowledgeType,
+    schema::types::{AssessmentScope, KnowledgeType},
 };
 
 /// Trait implemented per edge type to centralize validation and payload
@@ -192,6 +193,18 @@ impl EdgeSpec for AssessesSpec {
                 "assesses.claim `{}` must equal target LO slug `{}`",
                 attrs.evidence_link.claim, target_slug
             )));
+        }
+
+        if attrs.evidence_link.scope == AssessmentScope::Target {
+            let intended = analysis::intended_knowledge_from_anchors(svc.graph(), to);
+            let allows_extraneous = matches!(from_kind, NodeKind::Knowledge(k) if !k.construct_irrelevant_demands.is_empty());
+            if intended.is_empty() && !allows_extraneous {
+                return Err(GraphError::Schema(
+                    "target assesses edges require intended knowledge anchors or an explicit \
+                     construct_irrelevant_demands whitelist on the assessment"
+                        .to_string(),
+                ));
+            }
         }
         Ok(())
     }

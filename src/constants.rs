@@ -1,7 +1,7 @@
 /// Default temperature applied to LLM requests. Some models only accept the
 /// default of 1.0, so keep this at the neutral setting.
 /// TODO: Change to 0.6 when running with gpt-oss-120b
-pub const DEFAULT_TEMPERATURE: f32 = 0.6;
+pub const DEFAULT_TEMPERATURE: f32 = 1.0;
 
 /// Default nucleus sampling value applied to LLM requests.
 pub const DEFAULT_TOP_P: f32 = 1.0;

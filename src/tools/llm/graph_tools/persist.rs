@@ -93,7 +93,8 @@ crate::graph_action_tool!(
             let root = Arc::clone(&state.workspace_root);
             Box::pin(async move { preflight_snapshot_path(provided, SAVE_SNAPSHOT, root).await })
         },
-    ))
+    )),
+    mutate: None
 );
 
 #[derive(Debug, Clone, Builder, Deserialize, Serialize, JsonSchema)]
@@ -183,7 +184,8 @@ crate::graph_action_tool!(
             let root = Arc::clone(&state.workspace_root);
             Box::pin(async move { preflight_snapshot_path(provided, LOAD_SNAPSHOT, root).await })
         },
-    ))
+    )),
+    mutate: None
 );
 
 fn resolve_snapshot_path(path: Option<String>) -> String {

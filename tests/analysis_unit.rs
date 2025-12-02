@@ -33,6 +33,48 @@ fn mk_kn(title: &str, kt: KnowledgeType) -> KnowledgeNode {
     }
 }
 
+fn anchor_lo_with_intended(svc: &mut GraphService, lo: NodeId, intended: NodeId) {
+    let ts = svc
+        .add_teaching_step(
+            "ts_intended".into(),
+            graph::TeachingStepNode {
+                title:       "ts intended".into(),
+                statement:   "anchor intended knowledge".into(),
+                purpose:     graph::TeachingPurpose::Idea,
+                method_tags: vec![],
+                episode:     "ep_intended".into(),
+                source_refs: vec![SourceRef {
+                    path:       "dummy".into(),
+                    start_line: 1,
+                    end_line:   2,
+                    revision:   "deadbeef".into(),
+                }],
+                rationale:   None,
+            },
+            vec![],
+        )
+        .unwrap();
+
+    svc.add_edge::<graph::AnchorsSpec>(
+        ts,
+        lo,
+        graph::AnchorsAttrs {
+            impact: graph::AnchorImpact::Target,
+        },
+        1.0,
+    )
+    .unwrap();
+    svc.add_edge::<graph::AnchorsSpec>(
+        ts,
+        intended,
+        graph::AnchorsAttrs {
+            impact: graph::AnchorImpact::Introduce,
+        },
+        1.0,
+    )
+    .unwrap();
+}
+
 fn canonical_slug(title: &str, kt: KnowledgeType) -> String {
     weaver::graph::slug::Slug::generate(kt, title).to_string()
 }
@@ -190,6 +232,7 @@ mod practice_alignment {
         let lo = svc
             .add_knowledge_node("lo".into(), lo_node, vec![])
             .unwrap();
+        anchor_lo_with_intended(&mut svc, lo, _proc);
         let lo_slug = svc.graph()[lo].slug.clone();
         svc.add_edge::<graph::AssessesSpec>(
             assess,
@@ -305,6 +348,7 @@ mod practice_alignment {
             1.0,
         )
         .unwrap();
+        anchor_lo_with_intended(&mut svc, lo, concept);
         svc.add_edge::<graph::AssessesSpec>(
             assess,
             lo,
@@ -364,6 +408,7 @@ mod practice_alignment {
             1.0,
         )
         .unwrap();
+        anchor_lo_with_intended(&mut svc, lo, concept);
         svc.add_edge::<graph::AssessesSpec>(
             assess,
             lo,
@@ -518,6 +563,198 @@ mod purity {
         } else {
             panic!("expected invariant violation, got {err:?}");
         }
+    }
+
+    #[test]
+    fn intended_collects_across_episode() {
+        let mut svc = GraphService::new();
+        let intended = svc
+            .add_knowledge_node(
+                "k_intended".into(),
+                mk_kn("k_intended", KnowledgeType::Conceptual),
+                vec![],
+            )
+            .unwrap();
+        let assess = svc
+            .add_knowledge_node("a".into(), mk_kn("a", KnowledgeType::AssessmentItem), vec![])
+            .unwrap();
+        let lo = svc
+            .add_knowledge_node("lo".into(), mk_kn("lo", KnowledgeType::LearningOutcome), vec![])
+            .unwrap();
+        let lo_slug = svc.graph()[lo].slug.clone();
+
+        let ts_target = svc
+            .add_teaching_step(
+                "ts_target".into(),
+                graph::TeachingStepNode {
+                    title:       "target".into(),
+                    statement:   "targets LO".into(),
+                    purpose:     graph::TeachingPurpose::Idea,
+                    method_tags: vec![],
+                    episode:     "ep_shared".into(),
+                    source_refs: vec![SourceRef {
+                        path:       "dummy".into(),
+                        start_line: 1,
+                        end_line:   2,
+                        revision:   "deadbeef".into(),
+                    }],
+                    rationale:   None,
+                },
+                vec![],
+            )
+            .unwrap();
+        let ts_intro = svc
+            .add_teaching_step(
+                "ts_intro".into(),
+                graph::TeachingStepNode {
+                    title:       "intro".into(),
+                    statement:   "introduces intended knowledge".into(),
+                    purpose:     graph::TeachingPurpose::Idea,
+                    method_tags: vec![],
+                    episode:     "ep_shared".into(),
+                    source_refs: vec![SourceRef {
+                        path:       "dummy".into(),
+                        start_line: 1,
+                        end_line:   2,
+                        revision:   "deadbeef".into(),
+                    }],
+                    rationale:   None,
+                },
+                vec![],
+            )
+            .unwrap();
+
+        svc.add_edge::<graph::AnchorsSpec>(
+            ts_target,
+            lo,
+            graph::AnchorsAttrs {
+                impact: graph::AnchorImpact::Target,
+            },
+            1.0,
+        )
+        .unwrap();
+        svc.add_edge::<graph::AnchorsSpec>(
+            ts_intro,
+            intended,
+            graph::AnchorsAttrs {
+                impact: graph::AnchorImpact::Introduce,
+            },
+            1.0,
+        )
+        .unwrap();
+        svc.add_edge::<graph::RequiresSpec>(
+            intended,
+            assess,
+            graph::RequiresAttrs {
+                strength:      weaver::schema::types::Strength::Necessary,
+                rationale:     "r".into(),
+                evidence_refs: vec![SourceRef {
+                    path:       "dummy".into(),
+                    start_line: 1,
+                    end_line:   2,
+                    revision:   "deadbeef".into(),
+                }],
+            },
+            1.0,
+        )
+        .unwrap();
+
+        // Should succeed because intended knowledge is discovered via same-episode
+        // introduce.
+        svc.add_edge::<graph::AssessesSpec>(
+            assess,
+            lo,
+            graph::AssessesAttrs {
+                evidence_link: EvidenceLink {
+                    scope:                AssessmentScope::Target,
+                    claim:                lo_slug,
+                    observation_features: vec!["feat".into()],
+                },
+            },
+            1.0,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn anchors_trigger_purity_recheck() {
+        let mut svc = GraphService::new();
+        let intended = svc
+            .add_knowledge_node(
+                "k_intended".into(),
+                mk_kn("k_intended", KnowledgeType::Conceptual),
+                vec![],
+            )
+            .unwrap();
+        let extraneous = svc
+            .add_knowledge_node(
+                "k_extra".into(),
+                mk_kn("k_extra", KnowledgeType::Conceptual),
+                vec![],
+            )
+            .unwrap();
+        let assess = svc
+            .add_knowledge_node("a".into(), mk_kn("a", KnowledgeType::AssessmentItem), vec![])
+            .unwrap();
+        let lo = svc
+            .add_knowledge_node("lo".into(), mk_kn("lo", KnowledgeType::LearningOutcome), vec![])
+            .unwrap();
+        let lo_slug = svc.graph()[lo].slug.clone();
+        let _ts = svc
+            .add_teaching_step(
+                "ts".into(),
+                graph::TeachingStepNode {
+                    title:       "target".into(),
+                    statement:   "targets LO".into(),
+                    purpose:     graph::TeachingPurpose::Idea,
+                    method_tags: vec![],
+                    episode:     "ep".into(),
+                    source_refs: vec![SourceRef {
+                        path:       "dummy".into(),
+                        start_line: 1,
+                        end_line:   2,
+                        revision:   "deadbeef".into(),
+                    }],
+                    rationale:   None,
+                },
+                vec![],
+            )
+            .unwrap();
+
+        for from in [intended, extraneous] {
+            svc.add_edge::<graph::RequiresSpec>(
+                from,
+                assess,
+                graph::RequiresAttrs {
+                    strength:      weaver::schema::types::Strength::Necessary,
+                    rationale:     "r".into(),
+                    evidence_refs: vec![SourceRef {
+                        path:       "dummy".into(),
+                        start_line: 1,
+                        end_line:   2,
+                        revision:   "deadbeef".into(),
+                    }],
+                },
+                1.0,
+            )
+            .unwrap();
+        }
+
+        let err = svc
+            .add_edge::<graph::AssessesSpec>(
+                assess,
+                lo,
+                graph::AssessesAttrs {
+                    evidence_link: EvidenceLink {
+                        scope:                AssessmentScope::Target,
+                        claim:                lo_slug,
+                        observation_features: vec!["feat".into()],
+                    },
+                },
+                1.0,
+            )
+            .expect_err("assesses without intended anchors should be rejected up front");
+        assert!(matches!(err, graph::GraphError::Schema(_)));
     }
 }
 
@@ -1060,6 +1297,41 @@ mod persistence_topology {
             let assess_id = svc
                 .add_knowledge_node(assess_slug, assess, vec![])
                 .expect("add assessment");
+
+            let fp_for_lo = first_principles[i % first_principles.len()];
+            let ts = svc
+                .add_teaching_step(
+                    format!("ts-{i}"),
+                    graph::TeachingStepNode {
+                        title:       format!("ts-{i}"),
+                        statement:   "anchor intended".into(),
+                        purpose:     graph::TeachingPurpose::Idea,
+                        method_tags: vec![],
+                        episode:     format!("ep-{i}"),
+                        source_refs: vec![evidence.clone()],
+                        rationale:   None,
+                    },
+                    vec![],
+                )
+                .expect("add teaching step");
+            svc.add_edge::<graph::AnchorsSpec>(
+                ts,
+                lo_id,
+                graph::AnchorsAttrs {
+                    impact: graph::AnchorImpact::Target,
+                },
+                1.0,
+            )
+            .expect("anchor to lo");
+            svc.add_edge::<graph::AnchorsSpec>(
+                ts,
+                fp_for_lo,
+                graph::AnchorsAttrs {
+                    impact: graph::AnchorImpact::Introduce,
+                },
+                1.0,
+            )
+            .expect("anchor intended");
 
             svc.add_edge::<graph::AssessesSpec>(
                 assess_id,

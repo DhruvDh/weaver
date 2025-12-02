@@ -1,8 +1,9 @@
 use weaver::{
     constants::MAX_DELEGATED_TASKS,
     graph::{
-        GraphError, GraphService, IntroductionScope, KnowledgeNode,
-        specs::{AssessesSpec, RequiresSpec},
+        self, AnchorImpact, AnchorsAttrs, GraphError, GraphService, IntroductionScope,
+        KnowledgeNode,
+        specs::{AnchorsSpec, AssessesSpec, RequiresSpec},
     },
     schema::types::{AssessmentScope, EvidenceLink, KnowledgeType, SourceRef, Strength},
     tools::llm::DelegateTasksArgs,
@@ -73,6 +74,36 @@ fn graph_lifecycle_validates_and_versions() -> Result<(), GraphError> {
         assessment_slug.to_string(),
         mk_kn("Assessment Alpha", KnowledgeType::AssessmentItem),
         vec![],
+    )?;
+
+    let ts = svc.add_teaching_step(
+        "ts_alpha".into(),
+        graph::TeachingStepNode {
+            title:       "ts alpha".into(),
+            statement:   "anchors lo".to_string(),
+            purpose:     graph::TeachingPurpose::Idea,
+            method_tags: vec![],
+            episode:     "ep_alpha".into(),
+            source_refs: vec![source_ref()],
+            rationale:   None,
+        },
+        vec![],
+    )?;
+    svc.add_edge::<AnchorsSpec>(
+        ts,
+        lo,
+        AnchorsAttrs {
+            impact: AnchorImpact::Target,
+        },
+        1.0,
+    )?;
+    svc.add_edge::<AnchorsSpec>(
+        ts,
+        concept,
+        AnchorsAttrs {
+            impact: AnchorImpact::Introduce,
+        },
+        1.0,
     )?;
 
     svc.add_edge::<RequiresSpec>(concept, assessment, requires(), 1.0)?;

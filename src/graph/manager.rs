@@ -842,10 +842,29 @@ impl Message<AuditInvariants> for GraphManager {
     ) -> Self::Reply {
         let start = Instant::now();
         let timeout = Duration::from_millis(self.validation_timeout_ms.max(1));
-        let res = self
+        let res = match self
             .service
             .validate_global_invariants_off_thread(timeout)
-            .await;
+            .await
+        {
+            Ok(ok) => Ok(ok),
+            Err(GraphError::Operational(GraphOperationalError::InvariantTimeout {
+                timeout_ms,
+            })) => {
+                let retry = timeout.saturating_mul(2);
+                tracing::warn!(
+                    target: "weaver.graph.validation.audit",
+                    code = "validation_timeout_retry",
+                    timeout_ms,
+                    retry_ms = retry.as_millis(),
+                    "validation timed out; retrying once with backoff"
+                );
+                self.service
+                    .validate_global_invariants_off_thread(retry)
+                    .await
+            }
+            Err(err) => Err(err),
+        };
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         if let Err(GraphError::Operational(GraphOperationalError::InvariantTimeout {
             timeout_ms,

@@ -12,6 +12,9 @@ The system prompt above defines all node types and constraints—reference it.
 1. `list_directory` → survey files in scope
 2. For large files (>150 lines): `delegate_tasks` to split by section
 3. Extract ALL relevant content; when uncertain, CREATE the node
+4. If a file is a toctree manifest (`*/toctree.ptx`), use it only to locate included sections; do
+   not extract nodes about xi:include lines, xml ids/titles, or navigation ordering. Read the
+   included section files for the actual pedagogy.
 
 ### Mandatory Tags (on EVERY node)
 - `source:<chapter_path>` — the chapter you're harvesting
@@ -41,6 +44,11 @@ graph_list_nodes_by_tag(tag="spec:<niche>")      → filter by type
 graph_search_nodes(query="...")                   → find by title/statement
 ```
 
+### Ignore PreTeXt manifest noise
+- Skip nodes whose statements are about toctree navigation, xi:include lists, XML ids/titles, or
+  file-order descriptions. Those are authoring metadata, not learner knowledge—do not add edges to
+  them.
+
 ### Workflow
 1. Discover nodes in scope
 2. Plan 10-20 edges based on hint tags (req:*, sup:*, claim:*)
@@ -48,6 +56,13 @@ graph_search_nodes(query="...")                   → find by title/statement
 4. Validate: `graph_dag_check`, `graph_gap_summary`
 5. Fix any issues
 6. Repeat until complete
+
+### Tool argument guardrails (read this)
+- Use lowercase slug prefixes (f./c./p./m./lo./a.). Copy slugs from `graph_get_node` to avoid typos.
+- Every edge call that accepts `evidence_refs` must include at least one span with `path`, `start_line`, `end_line`, **and** `revision`.
+- `supports` edges must include `case_tag` (typical/edge/error_case) even for analogies; if unsure, pick `typical`.
+- `graph_dag_check` takes **no arguments**; `graph_gap_summary` only accepts `fetch_body`.
+- `precedes` requires `episode` matching both steps; do **not** send extra fields like `rationale` or `strength`.
 
 ### Node Creation
 You CANNOT create nodes—you only have edge tools. If a node is missing:
@@ -284,6 +299,7 @@ graph_add_requires(
     from_slug: \"C.prerequisite_concept\",    // Knowledge node
     to_slug: \"C.dependent_concept\",         // Knowledge or AssessmentItem
     strength: \"necessary\",                  // necessary | strong | helpful
+    evidence_refs: [{{path, start_line, end_line, revision}}], // REQUIRED
     rationale: \"Understanding X is needed to apply Y because...\",
     apply: true
 )
@@ -298,6 +314,11 @@ graph_add_requires(
 ```
 graph_dag_check()  // MUST return is_dag: true
 ```
+
+**Rules**:
+- Include at least one evidence_refs span with path/start_line/end_line/revision.
+- Target cannot be a LearningOutcome; source cannot be an AssessmentItem.
+- If a proposed edge would create a cycle, drop it or downgrade to supports.
 
 **If cycle detected**:
 1. The edge will be rejected
@@ -329,7 +350,8 @@ graph_add_supports(
     to_slug: \"P.target_procedure\",          // What it supports
     support_kind: \"worked_example\",         // Type of scaffold
     intended_effect: \"reduce_extraneous_load\",
-    case_tag: \"typical\",                    // For examples: typical | edge | error_case
+    case_tag: \"typical\",                    // REQUIRED: typical | edge | error_case (use \
+                 typical for non-examples)
     apply: true
 )
 ```
@@ -356,7 +378,14 @@ graph_add_supports(
 Supports edges CANNOT be the only path to an assessment. After adding supports,
 check with `graph_fadeability_view()`. If violations found, either:
 1. Add a requires edge to provide an alternate path, OR
-2. The supports edge should actually be a requires edge",
+2. The supports edge should actually be a requires edge
+
+**Rules**:
+- Always include evidence_refs with revision (at least one span).
+- Always include case_tag (typical/edge/error_case); procedural targets need typical AND \
+                 edge/error_case coverage.
+- Supports cannot target assessment_item unless support_kind=rubric_note AND \
+                 intended_effect=motivate.",
                 shared = WEAVE_SHARED
             ),
         ),
@@ -405,7 +434,13 @@ graph_lo_alignment_summary(lo_slug=\"LO.xxx\", fetch_body=true)
 ```
 Check that:
 - Every LO has ≥1 assesses edge with scope=target
-- Coverage shows no missing criteria",
+- Coverage shows no missing criteria
+
+**Rules**:
+- Claim must EXACTLY equal the target LO slug (lowercase `lo.` prefix). Copy slug from \
+                 `graph_get_node`.
+- `observation_features` cannot be empty; include one per rubric criterion.
+- `scope` is required (target or enabling).",
                 shared = WEAVE_SHARED
             ),
         ),
@@ -452,6 +487,12 @@ graph_add_anchors(
   - Use with `setup` purpose steps
 - `target`: The step articulates expectations for an LO
   - Use when step describes rubric/grading
+
+**Rules**:
+- `graph_add_precedes` only accepts {{from_slug, to_slug, episode, apply}}; include the exact \
+                 episode shared by both steps, nothing else.
+- `graph_add_anchors` has no evidence_refs param. `introduce`/`refine` must target instructional \
+                 knowledge; `target` must point to a LearningOutcome.
 
 **Find candidates**:
 1. `graph_list_nodes_by_tag(tag=\"spec:teaching_steps\")` — all TeachingSteps

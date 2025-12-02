@@ -1115,15 +1115,25 @@ pub async fn run_app(cli: Cli, runtime: RuntimeOptions) -> Result<()> {
         .await?;
     }
 
-    if runtime.trigger_initial_save {
-        persist_once(
+    if runtime.trigger_initial_save
+        && let Err(err) = persist_once(
             &graph_actor,
             &gateway,
             &rerun_actor,
             &graph_config.autosave_path,
             "initial_autosave",
         )
-        .await?;
+        .await
+    {
+        log_scalar(&rerun_actor, "metrics/initial_autosave/failure", 1.0);
+        eprintln!(
+            "initial autosave failed (continuing): {err}. Try rerunning with --skip-demo or \
+             --graph-strict-quality for more detail."
+        );
+        warn!(
+            error = %err,
+            "initial autosave failed; continuing without persisted snapshot"
+        );
     }
 
     if interactive_tui {

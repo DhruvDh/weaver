@@ -530,7 +530,8 @@ macro_rules! graph_action_tool {
             build: $build,
             ok: $ok,
             map_err: $map_err,
-            preflight: None
+            preflight: None,
+            mutate: None
         );
     };
     (
@@ -542,7 +543,8 @@ macro_rules! graph_action_tool {
         build: $build:expr,
         ok: $ok:expr,
         map_err: $map_err:expr,
-        preflight: $preflight:expr
+        preflight: $preflight:expr,
+        mutate: $mutate:expr
     ) => {
         pub(super) fn $meta_fn() -> $crate::tools::llm::ToolPrototype {
             $crate::tools::llm::ToolPrototype {
@@ -554,7 +556,7 @@ macro_rules! graph_action_tool {
                     let raw_args =
                         serde_json::to_value(&args).expect("failed to serialize graph action args");
                     $crate::tools::llm::graph_tools::common::parse_graph_command::<$args_ty, _>(
-                        $id_const, raw_args, state, $build, $ok, $map_err, $preflight,
+                        $id_const, raw_args, state, $build, $ok, $map_err, $preflight, $mutate,
                     )
                 },
             }

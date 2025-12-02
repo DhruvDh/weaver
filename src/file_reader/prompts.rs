@@ -11,6 +11,20 @@ teaches it).
 
 ---
 
+## PreTeXt Guardrails (file format)
+
+- `*/toctree.ptx` files are **navigation manifests only**. Use them to find included files; do NOT
+  create nodes or edges from xi:include lists, xml:id/title wrappers, or file-name enumerations.
+- Ignore XML/PreTeXt syntax (`<chapter>`, `<section>`, `xi:include`, attributes). Model the Java/CS
+  meaning of the prose, examples, and exercises—not the markup or inclusion mechanics.
+- Never create LOs, assessments, TeachingSteps, or supports about "chapter assembly",
+  "navigation", "xi:include", or the order of included files. Those are authoring details, not
+  learner knowledge.
+- Source refs should point to the actual content file that states the idea (an included section),
+  not to the manifest, unless the manifest itself contains genuine pedagogical prose (rare).
+
+---
+
 ## 1. THE DOMAIN MODEL
 
 A First-Principles Learning Network captures:
@@ -197,6 +211,8 @@ const HARVESTER_PROMPT: &str = r#"
 ### What You DON'T Do
 - NO edge creation (requires, supports, assesses, precedes, anchors)
 - NO guessing at prerequisites—leave hints in tags for weavers
+- NO nodes about PreTeXt scaffolding (toctree manifests, xi:include syntax, xml ids/titles); use
+  manifests only to find real section files to read
 
 ### Mandatory Tagging
 Every node you create MUST have:

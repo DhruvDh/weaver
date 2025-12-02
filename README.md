@@ -130,13 +130,13 @@ sequenceDiagram
     
     S-->>GW: permit granted
     GW->>API: POST /chat/completions
-    
+
     alt API Error (429, 500, etc.)
         API-->>GW: Error
-        GW->>GW: Exponential backoff<br/>(250ms → 60s max)
-        GW->>API: Retry (up to 5x)
+        GW->>GW: Jittered backoff<br/>(250ms → ~2s cap with current retry limit)
+        GW->>API: Retry (up to 4 retries, 5 attempts total)
     end
-    
+
     API-->>GW: Response with tool_calls
     
     loop For each tool call
@@ -183,20 +183,17 @@ flowchart TB
     end
     
     subgraph "LLM Gateway"
-        GW[run_conversation]
-        GW --> |"tool_call"| Check{Tool allowed<br/>for mode?}
-        Check --> |Yes| Execute[Execute Tool]
-        Check --> |No| Reject["Return error:<br/>'tool not available'"]
+        GW[run_conversation<br/>exposes mode-scoped tool_ids]
+        GW --> TH1
+        GW --> TH2
+        note over GW: Disallowed tools are not advertised; there is no per-call runtime deny list.
     end
-    
-    Execute --> TH1
-    Execute --> TH2
-    
+
     style Tools1 fill:#e8f5e9
     style Tools2 fill:#e3f2fd
 ```
 
-### Compile-Time + Runtime Enforcement
+### Compile-Time + Tool Surface
 
 ```rust
 // Type-level mode specification (src/file_reader.rs)
@@ -224,6 +221,9 @@ fn tool_identifiers_for_mode(mode: AgentMode) -> Vec<&'static str> {
     }
 }
 ```
+
+Gateway enforcement is by construction: only the mode's `tool_ids` are published to the LLM; there
+is no per-call runtime deny list inside `LLMGateway::handle_tool_calls`.
 
 ---
 
@@ -407,10 +407,10 @@ flowchart TB
     R2 --> |"passes to"| GW
     R3 --> |"passes to"| GW
     
-    GW --> |"select! with"| API[API Call]
-    GW --> |"select! with"| Cancel[token.cancelled()]
+    GW --> |"select! with"| API[API call]
+    GW --> |"select! with"| CancelBranch["token.cancelled() ?"]
     
-    subgraph "On Grace Timeout"
+    subgraph GraceTimeout["On Grace Timeout"]
         Orch --> |"token.cancel()"| Token
         Token --> |"wakes all select!"| R1
         Token --> |"wakes all select!"| R2
@@ -429,75 +429,79 @@ flowchart TB
 ```mermaid
 classDiagram
     class NodePayload {
-        <<enumeration>>
+        +Uuid logical_id
+        +String slug
+        +NodeKind kind
+        +Vec~String~ tags
+    }
+
+    class NodeKind {
+        <<enum>>
         Knowledge(KnowledgeNode)
-        LearningOutcome(LONode)
-        AssessmentItem(AssessmentNode)
         TeachingStep(TeachingStepNode)
     }
-    
+
     class KnowledgeNode {
         +String title
         +String statement
         +KnowledgeType knowledge_type
         +Vec~SourceRef~ source_refs
         +f32 confidence
-        +GrainLevel grain_level
-        +IntroductionScope intro_scope
+        +Vec~String~ rubric_criteria
+        +Vec~String~ construct_irrelevant_demands
+        +Option~GrainLevel~ grain_level
+        +Option~IntrinsicLoad~ intrinsic_load
+        +IntroductionScope introduction_scope
     }
-    
-    class KnowledgeType {
-        <<enumeration>>
-        factual
-        conceptual
-        procedural
-        metacognitive
-    }
-    
+
     class TeachingStepNode {
         +String title
         +String statement
         +TeachingPurpose purpose
         +Vec~String~ method_tags
         +String episode
+        +Vec~SourceRef~ source_refs
+        +Option~String~ rationale
     }
-    
-    class TeachingPurpose {
-        <<enumeration>>
-        setup
-        idea
-        use
-        consolidate
+
+    class KnowledgeType {
+        <<enum>>
+        factual
+        conceptual
+        procedural
+        metacognitive
+        learning_outcome
+        assessment_item
     }
-    
-    NodePayload --> KnowledgeNode
-    NodePayload --> TeachingStepNode
+
+    NodePayload --> NodeKind
+    NodeKind --> KnowledgeNode
+    NodeKind --> TeachingStepNode
     KnowledgeNode --> KnowledgeType
-    TeachingStepNode --> TeachingPurpose
 ```
 
 ### Edge Types
 
 ```mermaid
 flowchart LR
-    subgraph "Edge: requires (DAG)"
-        R1[P.bubble_sort] --> |"strength: necessary<br/>rationale: 'needs comparison'"| R2[C.comparison]
+    subgraph "requires (DAG)"
+        R1[P.bubble_sort] --> |"strength + rationale + evidence_refs"| R2[C.comparison]
     end
-    
-    subgraph "Edge: supports (Fadeable)"
-        S1[P.swap_example] --> |"support_kind: worked_example<br/>intended_effect: illustrate"| S2[P.bubble_sort]
+
+    subgraph "supports (fadeable)"
+        S1[P.swap_example] --> |"support_kind + intended_effect<br/>case_tag + coverage_tags<br/>evidence_refs required"| S2[P.bubble_sort]
     end
-    
-    subgraph "Edge: assesses"
-        A1[A.sorting_quiz] --> |"scope: target<br/>observation_features: [...]"| A2[LO.apply_sorting]
+
+    subgraph "assesses"
+        A1[A.sorting_quiz] --> |"evidence_link {claim, observation_features, scope}"| A2[LO.apply_sorting]
     end
-    
-    subgraph "Edge: anchors"
-        AN1[TS.explain_bubble] --> |"impact: introduce"| AN2[P.bubble_sort]
+
+    subgraph "anchors"
+        AN1[TS.explain_bubble] --> |"impact: introduce/use/refine/motivate/target"| AN2[P.bubble_sort]
     end
-    
-    subgraph "Edge: precedes"
-        P1[TS.setup_problem] --> |"episode: 'sorting_lesson'"| P2[TS.explain_bubble]
+
+    subgraph "precedes"
+        P1[TS.setup_problem] --> |"episode matches both steps"| P2[TS.explain_bubble]
     end
 ```
 
@@ -512,9 +516,10 @@ flowchart LR
 export OPENAI_MODEL="your-model-name"
 export OPENAI_API_BASE="http://your-endpoint:1234/v1"
 
-# Run with 1-hour timeouts per phase
+# Demo run (matches run.sh: 13-way parallel, ~20/31 min timeouts)
 ./run.sh
-# Or manually:
+
+# Manual run with defaults (4-way parallel, 1h/phase)
 cargo run --release -- uncc_cs2-pretext-project \
   --max-concurrent-chapters 4 \
   --harvest-timeout-hours 1.0 \
@@ -586,30 +591,6 @@ flowchart TB
 | "What examples are missing?" | `graph_example_gaps_view()` |
 | "What are the keystone concepts?" | `graph_keystone()` |
 | "Are concepts used before taught?" | `graph_borrow_ahead()` |
-
----
-
-## 📈 Expected Output
-
-For a typical CS2 textbook with 15 chapters:
-
-| Metric | Expected Range |
-|--------|----------------|
-| Nodes per chapter | 80-150 |
-| Total nodes | 1,200-2,250 |
-| Edges per chapter | 200-400 |
-| Total edges | 3,000-6,000 |
-| Harvest time (1hr) | ~4 min/chapter |
-| Weave time (1hr) | ~4 min/chapter |
-
-### Graph Validation
-
-The system validates:
-- ✅ `requires` edges form a DAG (no cycles)
-- ✅ All `supports` edges are fadeable (alternate paths exist)
-- ✅ Procedural nodes have example coverage
-- ✅ LOs have assessment alignment
-- ✅ Source references are valid
 
 ---
 

@@ -55,10 +55,61 @@ fn build_minimal_graph() -> (Arc<weaver::graph::CurriculumGraph>, u64, NodeId) {
     let lo = svc
         .add_knowledge_node("lo".into(), mk_lo_node(), vec![])
         .unwrap();
+    let concept = svc
+        .add_knowledge_node(
+            "concept".into(),
+            KnowledgeNode {
+                title: "concept".into(),
+                statement: "concept".into(),
+                knowledge_type: KnowledgeType::Conceptual,
+                source_refs: vec![mk_source_ref()],
+                confidence: 1.0,
+                rubric_criteria: vec![],
+                construct_irrelevant_demands: vec![],
+                grain_level: None,
+                intrinsic_load: None,
+                introduction_scope: weaver::graph::IntroductionScope::InCourse,
+            },
+            vec![],
+        )
+        .unwrap();
     let assess = svc
         .add_knowledge_node("a1".into(), mk_assessment_node(), vec![])
         .unwrap();
     let lo_slug = svc.graph()[lo].slug.clone();
+    let ts = svc
+        .add_teaching_step(
+            "ts".into(),
+            weaver::graph::TeachingStepNode {
+                title:       "ts".into(),
+                statement:   "ts".into(),
+                purpose:     weaver::graph::TeachingPurpose::Idea,
+                method_tags: vec![],
+                episode:     "ep".into(),
+                source_refs: vec![mk_source_ref()],
+                rationale:   None,
+            },
+            vec![],
+        )
+        .unwrap();
+    svc.add_edge::<weaver::graph::AnchorsSpec>(
+        ts,
+        lo,
+        weaver::graph::AnchorsAttrs {
+            impact: weaver::graph::AnchorImpact::Target,
+        },
+        1.0,
+    )
+    .unwrap();
+    svc.add_edge::<weaver::graph::AnchorsSpec>(
+        ts,
+        concept,
+        weaver::graph::AnchorsAttrs {
+            impact: weaver::graph::AnchorImpact::Introduce,
+        },
+        1.0,
+    )
+    .unwrap();
     svc.add_edge::<weaver::graph::AssessesSpec>(
         assess,
         lo,

@@ -15,6 +15,7 @@ use crate::{
             AddAnchors, AddAssesses, AddPrecedes, AddRequires, AddSupports, RemoveNode, RenameNode,
             UpdateKnowledge, UpdateTeachingStep,
         },
+        slug::Slug as CanonicalSlug,
     },
     schema::types::{
         AssessmentScope, EvidenceLink, IntendedEffect, KnowledgeType, SourceRef, Strength,
@@ -237,6 +238,7 @@ pub(super) fn insert_knowledge_meta() -> ToolPrototype {
                 },
                 |e| map_send_err(e, INSERT_KNOWLEDGE),
                 None,
+                None,
             )
         },
     }
@@ -279,6 +281,7 @@ pub(super) fn update_knowledge_meta() -> ToolPrototype {
                     command_ok(UPDATE_KNOWLEDGE, json!({"slug": args.slug}))
                 },
                 |e| map_send_err(e, UPDATE_KNOWLEDGE),
+                None,
                 None,
             )
         },
@@ -418,6 +421,7 @@ pub(super) fn insert_teaching_meta() -> ToolPrototype {
                 },
                 |e| map_send_err(e, INSERT_TEACHING),
                 None,
+                None,
             )
         },
     }
@@ -460,6 +464,7 @@ pub(super) fn update_teaching_meta() -> ToolPrototype {
                     command_ok(UPDATE_TEACHING, json!({"slug": args.slug}))
                 },
                 |e| map_send_err(e, UPDATE_TEACHING),
+                None,
                 None,
             )
         },
@@ -506,10 +511,10 @@ pub struct AddRequiresArgs {
         require_string(v, ADD_REQUIRES, "rationale")
     })]
     pub rationale:     String,
-    #[serde(default)]
     #[schemars(
-        description = "Optional source locations supporting this dependency claim. Array of \
-                       {path, start_line, end_line}. Do NOT include 'revision'."
+        description = "REQUIRED: source locations supporting this dependency claim. Provide at \
+                       least one entry. Array of {path, start_line, end_line, revision}. If \
+                       revision is empty, it will be filled with the course commit."
     )]
     pub evidence_refs: Vec<SourceRef>,
     #[serde(default = "default_confidence")]
@@ -578,7 +583,10 @@ crate::graph_action_tool!(
                 Ok(())
             })
         },
-    ))
+    )),
+    mutate: Some(|args: &mut AddRequiresArgs, state: &CallState| {
+        fill_source_ref_revisions(&mut args.evidence_refs, state.course_commit.as_ref());
+    })
 );
 
 #[derive(Debug, Clone, Builder, Deserialize, Serialize, JsonSchema)]
@@ -614,22 +622,21 @@ pub struct AddSupportsArgs {
                        learn), contrast (highlight boundaries/differences)"
     )]
     pub intended_effect: IntendedEffect,
-    #[serde(default)]
     #[schemars(
-        description = "For examples only: typical (happy path, common case), edge (boundary \
-                       condition), error_case (demonstrates failure mode). Procedural nodes need \
-                       both typical AND edge/error_case examples."
+        description = "REQUIRED case tag: typical (happy path), edge (boundary), error_case \
+                       (failure mode). For non-example scaffolds, use typical. Procedural nodes \
+                       need both typical AND edge/error_case examples."
     )]
-    pub case_tag:        Option<CaseTag>,
+    pub case_tag:        CaseTag,
     #[serde(default)]
     #[schemars(description = "Specific constraints this scaffold covers. Example: \
                               ['negative_input', 'empty_list']. Helps track which edge cases \
                               are addressed.")]
     pub coverage_tags:   Vec<String>,
-    #[serde(default)]
     #[schemars(
-        description = "Optional source locations for this scaffold. Array of {path, start_line, \
-                       end_line}. Do NOT include 'revision'."
+        description = "REQUIRED: source locations for this scaffold. Provide at least one entry. \
+                       Array of {path, start_line, end_line, revision}. If revision is empty, it \
+                       will be filled with the course commit."
     )]
     pub evidence_refs:   Vec<SourceRef>,
     #[serde(default = "default_confidence")]
@@ -671,7 +678,7 @@ crate::graph_action_tool!(
         attrs:      SupportsAttrs {
             support_kind:    args.support_kind,
             intended_effect: args.intended_effect,
-            case_tag:        args.case_tag,
+            case_tag:        Some(args.case_tag),
             coverage_tags:   args.coverage_tags.clone(),
             evidence_refs:   args.evidence_refs.clone(),
         },
@@ -699,7 +706,10 @@ crate::graph_action_tool!(
                 Ok(())
             })
         },
-    ))
+    )),
+    mutate: Some(|args: &mut AddSupportsArgs, state: &CallState| {
+        fill_source_ref_revisions(&mut args.evidence_refs, state.course_commit.as_ref());
+    })
 );
 
 #[derive(Debug, Clone, Builder, Deserialize, Serialize, JsonSchema)]
@@ -761,6 +771,20 @@ crate::graph_action_tool!(
         |mut input: AddAssessesArgs| {
             input.from_slug = require_string(input.from_slug, ADD_ASSESSES, "from_slug")?;
             input.to_slug = require_string(input.to_slug, ADD_ASSESSES, "to_slug")?;
+            let from = CanonicalSlug::parse(&input.from_slug).map_err(|err| {
+                ToolInputError::InvalidPayload {
+                    tool:     ADD_ASSESSES,
+                    message: format!("invalid from_slug `{}`: {}", input.from_slug, err),
+                }
+            })?;
+            let to = CanonicalSlug::parse(&input.to_slug).map_err(|err| {
+                ToolInputError::InvalidPayload {
+                    tool:     ADD_ASSESSES,
+                    message: format!("invalid to_slug `{}`: {}", input.to_slug, err),
+                }
+            })?;
+            input.from_slug = from.to_string();
+            input.to_slug = to.to_string();
             Ok(input)
         },
     ),
@@ -798,7 +822,8 @@ crate::graph_action_tool!(
                 Ok(())
             })
         },
-    ))
+    )),
+    mutate: None
 );
 
 #[derive(Debug, Clone, Builder, Deserialize, Serialize, JsonSchema)]
@@ -894,7 +919,8 @@ crate::graph_action_tool!(
                 Ok(())
             })
         },
-    ))
+    )),
+    mutate: None
 );
 
 #[derive(Debug, Clone, Builder, Deserialize, Serialize, JsonSchema)]
@@ -986,7 +1012,8 @@ crate::graph_action_tool!(
                 Ok(())
             })
         },
-    ))
+    )),
+    mutate: None
 );
 
 // ---------- Rename / remove ----------

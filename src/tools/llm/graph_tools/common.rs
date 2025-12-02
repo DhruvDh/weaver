@@ -206,16 +206,22 @@ pub(crate) fn parse_graph_command<Args, Msg>(
     map_ok: fn(&Args, <MsgReply<Msg> as kameo::Reply>::Ok) -> Value,
     map_err: fn(SendError<Msg, <MsgReply<Msg> as kameo::Reply>::Error>) -> ToolExecutionError,
     preflight: Option<crate::tools::llm::common::ArgsPreflight<Args>>,
+    mutate: Option<fn(&mut Args, &CallState)>,
 ) -> ToolInputResult<Box<dyn ToolInstance>>
 where
     Args: for<'de> Deserialize<'de> + JsonSchema + Clone + Send + Sync + MaybeApply + 'static,
     Msg: Send + 'static,
     crate::graph::manager::GraphManager: kameo::message::Message<Msg>,
 {
-    let args: Args = serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
-        tool,
-        message: err.to_string(),
-    })?;
+    let mut args: Args =
+        serde_json::from_value(raw).map_err(|err| ToolInputError::InvalidPayload {
+            tool,
+            message: err.to_string(),
+        })?;
+
+    if let Some(f) = mutate {
+        f(&mut args, state);
+    }
 
     let action = GraphActionAdapter {
         args,
