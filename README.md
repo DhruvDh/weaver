@@ -6,7 +6,7 @@
 
 ## 1: The Lens Problem
 
-Network science tools can reveal simple truths about complex systems. But networks aren't found in nature. The lens for viewing something as a network must be designed. Whether insight is uncovered depends on the quality of that design. This is a creative problem.
+Network science tools can reveal simple truths about complex systems. But networks are not found in nature. The lens for viewing something as a network must be designed. Whether insight is uncovered depends on the quality of that design—a creative task.
 
 ---
 
@@ -24,15 +24,7 @@ A system was built to automate the transformation of unstructured text (a progra
 
 ## 4: Approach
 
-The system uses a multi-agent LLM architecture. It sounds simple; it is hard to build in practice.
-
-**The missing target problem.** Agent reading Chapter 2 wants to create edge "Loops → Variables." But Variables is in Chapter 1, processed by a different agent. If that agent hasn't finished, the target doesn't exist. Race condition.
-
-**Tool access control.** LLMs will use whatever tools they are given. Harvesters must only create nodes. Weavers must only create edges. Enforced at compile time (different agent types with different tool sets) and runtime (gateway only advertises permitted tools).
-
-**Coordination.** Each chapter gets an orchestrator. A supervisor coordinates across chapters—waits for all harvesting to complete before any weaving starts. Handles timeouts, cancellation, failures. Built on the actor model: isolated agents, message-passing, fault tolerance.
-
-**Rate limiting.** All agents share one LLM gateway with a semaphore (128 concurrent), exponential backoff, token tracking, timeouts.
+The system uses a multi-agent LLM architecture to perform the population step. It is organized as two phases—harvest nodes, then weave edges—with strict separation of concerns. The design must solve coordination challenges (avoiding race conditions on missing targets), constrain tool access per role, and tolerate partial progress so work can continue even when weaving lags.
 
 ---
 
