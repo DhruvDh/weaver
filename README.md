@@ -1,8 +1,193 @@
 # Weaver
 
-> **An Actor-Based Autonomous Curriculum Graph Construction System**
+> A Multi-Agent System for Curriculum Graph Construction
 
-Weaver uses a novel **two-phase architecture** with specialized LLM agents to autonomously extract knowledge from textbook content and construct a comprehensive curriculum graph with validated learning relationships.
+---
+
+## Slide 1: The Lens Problem
+
+Network science tools can reveal simple truths about complex systems. But networks aren't found in nature. The lens for viewing something as a network must be designed. Whether you uncover insight depends on the quality of that design. This is a creative problem.
+
+---
+
+## Slide 2: Lens Equals Definition
+
+The lens is the network definition: what is a node, what is an edge, what types exist, what properties they carry. Once you have a definition capable of yielding insight, the next problem is practical—how do you populate it from real data?
+
+---
+
+## Slide 3: My Project
+
+I built a system that automates the transformation of unstructured text (a programming textbook) into a structured network representation.
+
+---
+
+## Slide 4: The Approach
+
+I used a multi-agent LLM system. Sounds simple. Hard to actually build.
+
+**The missing target problem.** Agent reading Chapter 2 wants to create edge "Loops → Variables." But Variables is in Chapter 1, processed by a different agent. If that agent hasn't finished, the target doesn't exist. Race condition.
+
+**Tool access control.** LLMs use whatever tools you give them. Harvesters must only create nodes. Weavers must only create edges. Enforced at compile time (different agent types with different tool sets) and runtime (gateway only advertises permitted tools).
+
+**Coordination.** Each chapter gets an orchestrator. A supervisor coordinates across chapters—waits for all harvesting to complete before any weaving starts. Handles timeouts, cancellation, failures. Built on the actor model: isolated agents, message-passing, fault tolerance.
+
+**Rate limiting.** All agents share one LLM gateway with a semaphore (128 concurrent), exponential backoff, token tracking, timeouts.
+
+---
+
+## Slide 5: My Network Definition
+
+**Node types** (from Bloom's Taxonomy):
+- *Factual*: terms, symbols, conventions
+- *Conceptual*: categories, principles, models
+- *Procedural*: algorithms, methods, heuristics
+- *Metacognitive*: self-monitoring strategies
+- *Learning Outcome*: assessable claim about what learner can do
+- *Assessment Item*: task that elicits evidence
+- *TeachingStep*: authored step in textbook narrative (paragraph, example, figure)
+
+**Edge types** (three layers, different semantics):
+
+*requires* (Knowledge → Knowledge/Assessment): prerequisites. Must be a DAG—no cycles. Attributes: strength, rationale, evidence_refs.
+
+*supports* (Knowledge → Knowledge/LO): scaffolding. Worked examples, analogies, counterexamples. Can have cycles but must be "fadeable"—removing them can't break prerequisite paths. Attributes: support_kind, intended_effect, case_tag, coverage_tags.
+
+*assesses* (Assessment → LO): evidence links. Attributes: observation_features (what you measure), scope (target or enabling).
+
+**Design goals**: Constructive Alignment (LOs ↔ assessments ↔ teaching), Knowledge Space Theory (DAG = valid prerequisite structure), Evidence-Centered Design (assesses edges are the evidentiary argument).
+
+---
+
+## Slide 6: What Analysis Becomes Possible
+
+On a complete graph:
+
+**graph_first_principles**: Nodes with zero incoming requires edges. Should be small—your true foundations.
+
+**graph_dag_check**: Verifies requires layer is acyclic. Cycles = incoherent curriculum.
+
+**graph_gap_summary**: Surfaces missing scaffolding, procedures without worked examples, LOs without assessments. A to-do list from structure.
+
+**graph_lo_alignment_summary**: For each LO—is there an assessment reachable from first principles that tests it? If not, you claim to teach it but never measure it.
+
+**graph_keystone**: High centrality nodes in the DAG. If students fail here, large portions become inaccessible. Should have extra scaffolding.
+
+---
+
+## Slide 7: Two-Phase Architecture
+
+All nodes must exist before any edges are created.
+
+```mermaid
+flowchart TB
+    subgraph Phase1["🌾 Phase 1: Harvest (Nodes Only)"]
+        H1[Chapter 1 Harvester] --> N1[Variables, Types, ...]
+        H2[Chapter 2 Harvester] --> N2[Loops, Conditionals, ...]
+        H3[Chapter 3 Harvester] --> N3[Functions, Scope, ...]
+    end
+    
+    Phase1 --> Barrier
+    
+    subgraph Barrier["🔒 Deduplication Barrier"]
+        D1[Cluster Similar Nodes]
+        D2[Merge Duplicates]
+        D3[Validate & Persist]
+        D1 --> D2 --> D3
+    end
+    
+    Barrier --> Phase2
+    
+    subgraph Phase2["🕸️ Phase 2: Weave (Edges Only)"]
+        W1[Requires Weaver] --> E1[Prerequisites]
+        W2[Supports Weaver] --> E2[Examples & Scaffolds]
+        W3[Assesses Weaver] --> E3[Assessment Alignments]
+    end
+    
+    style Phase1 fill:#e8f5e9
+    style Barrier fill:#fff3e0
+    style Phase2 fill:#e3f2fd
+```
+
+**Phase 1: Harvest**
+
+Six niche agents per chapter, in parallel:
+1. Factual/Conceptual
+2. Procedural/Examples
+3. Assessments
+4. Teaching Steps
+5. Supports/Illustrations
+6. Metacognitive
+
+Only node-creation tools. Each node tagged with source chapter, specialist niche, and hint tags for linking: `req:<slug>`, `sup:<slug>`, `claim:<lo.slug>`.
+
+**Deduplication Barrier**
+
+After all harvesting: cluster similar nodes, merge duplicates, validate, persist.
+
+**Phase 2: Weave**
+
+Six niche agents per chapter, in parallel:
+1. Requires (build prereq DAG)
+2. Supports (attach scaffolds)
+3. Assesses (link assessments to LOs)
+4. Teaching Steps (precedes + anchors)
+5. Coverage Gap (close gaps found by analysis)
+6. Cleanup/QA (validate, fix warnings)
+
+Only edge-creation tools. Agents query nodes first, verify existence, then link.
+
+---
+
+## Slide 8: Current State
+
+~1,400 nodes harvested. ~500 edges created. Weaving incomplete due to a bug I'm still debugging. Structure is sparse—disconnected components, no giant component yet.
+
+---
+
+## Slide 9: Demo
+
+**Accurate results** (describing what exists):
+
+"Show everything harvested from StringMethods."
+→ `graph_list_nodes_by_tag tag="source:source/StringMethods/toctree.ptx"`
+
+"What's the type distribution?"
+→ `graph_list_nodes_by_kind kind="procedural"` (repeat for others)
+
+"Show a specific node."
+→ `graph_get_node slug="p.calling_methods_no_params"`
+
+"Trace neighbors for a teaching step."
+→ `graph_neighbors slug="TS.loop_three_steps" fetch_body=true`
+
+**Technically correct but misleading** (artifacts of incomplete weaving):
+
+"What are the first principles?"
+→ `graph_first_principles_summary`
+→ Will return a large set—almost everything looks foundational because incoming requires edges are sparse. On a complete graph, this should be small. The tool works; the data is incomplete.
+
+"What gaps exist?"
+→ `graph_gap_summary fetch_body=true`
+→ Will return many gaps—missing scaffolding, missing practice links, missing assessments. Most are artifacts of incomplete weaving, not real curriculum flaws. Shows the system knows what it doesn't have.
+
+**Validation** (should pass):
+
+"Is the requires layer acyclic?"
+→ `graph_dag_check`
+→ Should pass. We have ~900 edges now, and the system rejects cycle-creating edges. This constraint holds regardless of completeness.
+
+---
+
+## Slide 10: What's Next
+
+Fix weaving bug. Complete edge generation. Run full analysis suite on connected graph. Evaluate: does the structure reveal real curricular insights?
+
+---
+
+# Appendix: Technical Reference
+
+> The following sections provide detailed technical documentation for developers.
 
 ---
 
@@ -186,8 +371,9 @@ flowchart TB
         GW[run_conversation<br/>exposes mode-scoped tool_ids]
         GW --> TH1
         GW --> TH2
-        note over GW: Disallowed tools are not advertised; there is no per-call runtime deny list.
     end
+
+    note right of GW: Disallowed tools are not advertised; there is no per-call runtime deny list.
 
     style Tools1 fill:#e8f5e9
     style Tools2 fill:#e3f2fd
@@ -645,7 +831,7 @@ A dedicated analysis agent with **26 inspection tools** for validating curriculu
 ## 📚 Further Reading
 
 - [`AGENTS.md`](./AGENTS.md) - Detailed agent documentation
-- [`docs/white_paper.md`](./docs/white_paper.md) - Domain model specification
+- [`white_paper.md`](./white_paper.md) - Domain model specification
 - [`docs/graph_tools.md`](./docs/graph_tools.md) - Tool reference
 
 ---
