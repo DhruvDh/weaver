@@ -229,10 +229,7 @@ async fn apply_runtime_config_respects_timeout() -> anyhow::Result<()> {
         graph.add_edge(
             ids[i],
             ids[i + 1],
-            EdgePayload {
-                kind:       EdgeKind::Requires(requires.clone()),
-                confidence: 1.0,
-            },
+            EdgePayload::new(EdgeKind::Requires(requires.clone()), 1.0),
         );
     }
 

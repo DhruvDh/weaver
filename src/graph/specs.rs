@@ -67,10 +67,7 @@ impl EdgeSpec for RequiresSpec {
     }
 
     fn make_payload(attrs: Self::Attrs, confidence: f32) -> EdgePayload {
-        EdgePayload {
-            kind: EdgeKind::Requires(attrs),
-            confidence,
-        }
+        EdgePayload::new(EdgeKind::Requires(attrs), confidence)
     }
 }
 
@@ -155,10 +152,7 @@ impl EdgeSpec for SupportsSpec {
     }
 
     fn make_payload(attrs: Self::Attrs, confidence: f32) -> EdgePayload {
-        EdgePayload {
-            kind: EdgeKind::Supports(attrs),
-            confidence,
-        }
+        EdgePayload::new(EdgeKind::Supports(attrs), confidence)
     }
 }
 
@@ -203,10 +197,7 @@ impl EdgeSpec for AssessesSpec {
     }
 
     fn make_payload(attrs: Self::Attrs, confidence: f32) -> EdgePayload {
-        EdgePayload {
-            kind: EdgeKind::Assesses(attrs),
-            confidence,
-        }
+        EdgePayload::new(EdgeKind::Assesses(attrs), confidence)
     }
 }
 
@@ -253,10 +244,7 @@ impl EdgeSpec for PrecedesSpec {
     }
 
     fn make_payload(attrs: Self::Attrs, confidence: f32) -> EdgePayload {
-        EdgePayload {
-            kind: EdgeKind::Precedes(attrs),
-            confidence,
-        }
+        EdgePayload::new(EdgeKind::Precedes(attrs), confidence)
     }
 }
 
@@ -325,10 +313,7 @@ impl EdgeSpec for AnchorsSpec {
     }
 
     fn make_payload(attrs: Self::Attrs, confidence: f32) -> EdgePayload {
-        EdgePayload {
-            kind: EdgeKind::Anchors(attrs),
-            confidence,
-        }
+        EdgePayload::new(EdgeKind::Anchors(attrs), confidence)
     }
 }
 

@@ -5,6 +5,7 @@ pub mod analysis_cache;
 pub mod cache_admin;
 pub mod commands;
 pub mod common;
+pub mod edge_conflicts;
 pub mod inspection;
 pub mod persist;
 pub mod redundant_requires;
@@ -30,6 +31,8 @@ crate::tool_ids! {
             GRAPH_LOAD_SNAPSHOT = "graph_load_snapshot";
             GRAPH_NEIGHBORS = "graph_neighbors";
             GRAPH_GET_NODE = "graph_get_node";
+            GRAPH_EDGE_CONFLICTS = "graph_edge_conflicts";
+            GRAPH_RESOLVE_EDGE_CONFLICT = "graph_resolve_edge_conflict";
             GRAPH_FIRST_PRINCIPLES = "graph_first_principles";
             GRAPH_FIRST_PRINCIPLES_SUMMARY = "graph_first_principles_summary";
             GRAPH_DAG_CHECK = "graph_dag_check";
@@ -62,6 +65,7 @@ pub fn graph_tool_prototypes() -> Vec<ToolPrototype> {
     v.extend(algorithms::tool_prototypes());
     v.extend(cache_admin::tool_prototypes());
     v.extend(redundant_requires::tool_prototypes());
+    v.extend(edge_conflicts::tool_prototypes());
     let mut allowed: HashSet<&str> = CURATED_TOOL_IDS.iter().copied().collect();
     if std::env::var("WEAVER_DEBUG_GRAPH_ALGORITHMS")
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))

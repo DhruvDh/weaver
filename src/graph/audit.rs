@@ -27,6 +27,7 @@ pub enum MutationKind {
     PruneRequires,
     SetStrictQuality { strict: bool },
     MergeNodes,
+    ResolveEdgeConflict,
 }
 
 impl MutationKind {
@@ -44,6 +45,7 @@ impl MutationKind {
             MutationKind::PruneRequires => Cow::Borrowed("prune_requires"),
             MutationKind::SetStrictQuality { .. } => Cow::Borrowed("set_strict_quality"),
             MutationKind::MergeNodes => Cow::Borrowed("merge_nodes"),
+            MutationKind::ResolveEdgeConflict => Cow::Borrowed("resolve_edge_conflict"),
         }
     }
 }

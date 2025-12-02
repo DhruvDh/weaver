@@ -4,8 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::graph::{
-    AnchorsAttrs, AssessesAttrs, KnowledgeNode, PrecedesAttrs, RequiresAttrs, SupportsAttrs,
-    TeachingStepNode,
+    AnchorsAttrs, AssessesAttrs, EdgeConflict, EdgeKind, KnowledgeNode, PrecedesAttrs,
+    RequiresAttrs, SupportsAttrs, TeachingStepNode,
 };
 
 #[derive(Clone, Debug, Serialize)]
@@ -130,4 +130,25 @@ pub struct ResolveSlugs {
 
 pub struct LoadSnapshot {
     pub path: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub struct EdgeConflictView {
+    pub edge_id:    u32,
+    pub from_slug:  String,
+    pub to_slug:    String,
+    pub kind:       EdgeKind,
+    pub confidence: f32,
+    pub conflicts:  Vec<EdgeConflict>,
+}
+
+pub struct GetEdgeConflicts;
+
+#[derive(Clone, Debug)]
+pub struct ResolveEdgeConflict {
+    pub edge_id:         u32,
+    pub resolved_kind:   EdgeKind,
+    pub confidence:      Option<f32>,
+    pub clear_conflicts: bool,
 }

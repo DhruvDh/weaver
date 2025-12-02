@@ -121,6 +121,7 @@ impl ToolInstance for DelegateTasksTool {
             workspace_root:     Arc::clone(&self.state.workspace_root),
             metrics:            Arc::clone(&self.state.metrics),
             graph:              self.state.graph.clone(),
+            dedup:              self.state.dedup.clone(),
             analysis_cache:     Arc::clone(&self.state.analysis_cache),
             rerun:              self.state.rerun.clone(),
             depth:              self.state.depth,

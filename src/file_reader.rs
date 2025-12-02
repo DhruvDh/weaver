@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
+    agents::deduplication::DeduplicationAgent,
     constants::{
         DEFAULT_MAX_SUBDELEGATIONS, DEFAULT_TEMPERATURE, DEFAULT_TOP_P, MAX_PARALLEL_DELEGATIONS,
         MAX_TOOL_ITERATIONS,
@@ -51,6 +52,7 @@ pub struct FileReader {
     root:               Arc<PathBuf>,
     metrics:            Arc<GatewayMetrics>,
     graph:              ActorRef<crate::graph::manager::GraphManager>,
+    dedup:              ActorRef<DeduplicationAgent>,
     analysis_cache:     Arc<AnalysisCache>,
     rerun:              Option<ActorRef<crate::rerun_sink::RerunSink>>,
     depth:              usize,
@@ -66,6 +68,7 @@ struct ReaderDeps {
     root:           Arc<PathBuf>,
     metrics:        Arc<GatewayMetrics>,
     graph:          ActorRef<crate::graph::manager::GraphManager>,
+    dedup:          ActorRef<DeduplicationAgent>,
     analysis_cache: Arc<AnalysisCache>,
     rerun:          Option<ActorRef<crate::rerun_sink::RerunSink>>,
 }
@@ -77,9 +80,18 @@ impl FileReader {
         gateway: ActorRef<LLMGateway>,
         metrics: Arc<GatewayMetrics>,
         graph: ActorRef<crate::graph::manager::GraphManager>,
+        dedup: ActorRef<DeduplicationAgent>,
         rerun: Option<ActorRef<crate::rerun_sink::RerunSink>>,
     ) -> Result<Self> {
-        Self::from_env_with_limit(root, gateway, metrics, graph, rerun, DEFAULT_MAX_SUBDELEGATIONS)
+        Self::from_env_with_limit(
+            root,
+            gateway,
+            metrics,
+            graph,
+            dedup,
+            rerun,
+            DEFAULT_MAX_SUBDELEGATIONS,
+        )
     }
 
     /// Build a new [`FileReader`] with a custom delegation limit.
@@ -88,6 +100,7 @@ impl FileReader {
         gateway: ActorRef<LLMGateway>,
         metrics: Arc<GatewayMetrics>,
         graph: ActorRef<crate::graph::manager::GraphManager>,
+        dedup: ActorRef<DeduplicationAgent>,
         rerun: Option<ActorRef<crate::rerun_sink::RerunSink>>,
         max_subdelegations: usize,
     ) -> Result<Self> {
@@ -109,6 +122,7 @@ impl FileReader {
             root,
             metrics,
             graph,
+            dedup,
             analysis_cache,
             rerun,
         };
@@ -128,6 +142,7 @@ impl FileReader {
             root: deps.root,
             metrics: deps.metrics,
             graph: deps.graph,
+            dedup: deps.dedup,
             analysis_cache: deps.analysis_cache,
             rerun: deps.rerun,
             depth,
@@ -157,6 +172,7 @@ pub(crate) struct DelegateBatchCtx {
     pub workspace_root:     Arc<PathBuf>,
     pub metrics:            Arc<GatewayMetrics>,
     pub graph:              ActorRef<crate::graph::manager::GraphManager>,
+    pub dedup:              ActorRef<DeduplicationAgent>,
     pub analysis_cache:     Arc<AnalysisCache>,
     pub rerun:              Option<ActorRef<crate::rerun_sink::RerunSink>>,
     pub depth:              usize,
@@ -188,6 +204,7 @@ pub(crate) async fn run_delegate_batch_with_state(
                 root:           Arc::clone(&ctx.workspace_root),
                 metrics:        Arc::clone(&ctx.metrics),
                 graph:          ctx.graph.clone(),
+                dedup:          ctx.dedup.clone(),
                 analysis_cache: Arc::clone(&ctx.analysis_cache),
                 rerun:          ctx.rerun.clone(),
             };
@@ -305,6 +322,7 @@ impl Message<ExecuteTool> for FileReader {
             model:              Arc::clone(&self.model),
             metrics:            Arc::clone(&self.metrics),
             graph:              self.graph.clone(),
+            dedup:              self.dedup.clone(),
             actor_name:         Arc::clone(&self.actor_name),
             conversation_id:    Arc::clone(&self.conversation_id),
             rerun:              self.rerun.clone(),

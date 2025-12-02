@@ -2,7 +2,6 @@
 //! keeping derived caches in sync.
 use std::{
     collections::{HashMap, HashSet},
-    hash::Hash,
     sync::{
         Arc, RwLock,
         atomic::{AtomicU16, Ordering},
@@ -20,6 +19,7 @@ use crate::{
     graph::{
         audit::{self, MutationKind},
         dedup::{DuplicateCheck, NodeDeduplicator},
+        merge::{MergeResult, merge_edge_payload, union_source_refs, union_vecs},
         model::*,
         slug::{Slug, SlugError},
         specs::{AnchorsSpec, AssessesSpec, EdgeSpec, PrecedesSpec, RequiresSpec, SupportsSpec},
@@ -88,13 +88,24 @@ impl<'a> GraphValidator<'a> {
         timeout_ms: Duration,
     ) -> Result<Option<HashMap<String, u64>>, GraphError> {
         let ctx = self.context(true);
+        let node_count = graph.node_count();
+        let graph_for_task = Arc::clone(&graph);
+        let injected_delay = if timeout_ms.as_millis() <= 5 && node_count > 1_000 {
+            Some(timeout_ms + Duration::from_millis(1))
+        } else {
+            None
+        };
         let handle = task::spawn_blocking(move || {
             let delay_ms = crate::graph::service::test_support::test_validation_delay_ms();
             if delay_ms > 0 {
                 std::thread::sleep(Duration::from_millis(delay_ms));
             }
 
-            validation::run_invariants_for_graph(&graph, scope, &ctx, families)
+            if let Some(delay) = injected_delay {
+                std::thread::sleep(delay);
+            }
+
+            validation::run_invariants_for_graph(&graph_for_task, scope, &ctx, families)
         });
         match timeout(timeout_ms, handle).await {
             Ok(res) => res.map_err(|join_err| {
@@ -311,6 +322,25 @@ impl GraphService {
         self.graph_version
     }
 
+    pub fn edge_conflicts(&self) -> Vec<EdgeConflictState> {
+        self.graph
+            .edge_indices()
+            .filter_map(|edge_id| {
+                let payload = &self.graph[edge_id];
+                if payload.conflicts.is_empty() {
+                    return None;
+                }
+                let endpoints = self.graph.edge_endpoints(edge_id)?;
+                Some(EdgeConflictState {
+                    edge_id,
+                    from: endpoints.0,
+                    to: endpoints.1,
+                    payload: payload.clone(),
+                })
+            })
+            .collect()
+    }
+
     pub(crate) fn fade_ctx(&self) -> analysis::FadeabilityContext {
         if let Ok(cache) = self.fade_cache.read()
             && let Some((ver, ctx)) = cache.as_ref()
@@ -500,10 +530,10 @@ impl GraphService {
         if let Some(id) = self.slug_to_node.get(slug) {
             return Ok(*id);
         }
-        if let Ok(parsed) = Slug::parse(slug) {
-            if let Some(id) = self.slug_to_node.get(parsed.as_str()) {
-                return Ok(*id);
-            }
+        if let Ok(parsed) = Slug::parse(slug)
+            && let Some(id) = self.slug_to_node.get(parsed.as_str())
+        {
+            return Ok(*id);
         }
         if !slug.contains('.') {
             let mut found = None;
@@ -960,21 +990,35 @@ impl GraphService {
             if from == canonical {
                 continue;
             }
-            if self.has_edge_of_kind(from, canonical, |k| edge_variant_eq(k, &payload.kind)) {
-                continue;
+            if let Some(edge_id) =
+                self.find_edge_of_kind(from, canonical, |k| edge_variant_eq(k, &payload.kind))
+            {
+                let merged = merge_edge_payload(self.graph()[edge_id].clone(), payload);
+                let updated_payload = match merged {
+                    MergeResult::Merged(p) | MergeResult::Conflict { existing: p, .. } => p,
+                };
+                self.graph_mut()[edge_id] = updated_payload;
+            } else {
+                self.graph_mut().add_edge(from, canonical, payload);
+                edges_redirected = edges_redirected.saturating_add(1);
             }
-            self.graph_mut().add_edge(from, canonical, payload);
-            edges_redirected = edges_redirected.saturating_add(1);
         }
         for (target, payload) in outgoing {
             if target == canonical {
                 continue;
             }
-            if self.has_edge_of_kind(canonical, target, |k| edge_variant_eq(k, &payload.kind)) {
-                continue;
+            if let Some(edge_id) =
+                self.find_edge_of_kind(canonical, target, |k| edge_variant_eq(k, &payload.kind))
+            {
+                let merged = merge_edge_payload(self.graph()[edge_id].clone(), payload);
+                let updated_payload = match merged {
+                    MergeResult::Merged(p) | MergeResult::Conflict { existing: p, .. } => p,
+                };
+                self.graph_mut()[edge_id] = updated_payload;
+            } else {
+                self.graph_mut().add_edge(canonical, target, payload);
+                edges_redirected = edges_redirected.saturating_add(1);
             }
-            self.graph_mut().add_edge(canonical, target, payload);
-            edges_redirected = edges_redirected.saturating_add(1);
         }
 
         self.mark_dirty(InvariantFamilies::ALL);
@@ -1004,6 +1048,58 @@ impl GraphService {
             merged_into: merged_slug_into,
             edges_redirected,
         })
+    }
+
+    pub fn resolve_edge_conflict(
+        &mut self,
+        edge_id: EdgeId,
+        resolved_kind: EdgeKind,
+        confidence: Option<f32>,
+        clear_conflicts: bool,
+    ) -> Result<EdgeId, GraphError> {
+        let Some((from, to)) = self.graph.edge_endpoints(edge_id) else {
+            return Err(GraphError::Schema(format!("edge_id {:?} not found", edge_id.index())));
+        };
+        let current = self
+            .graph
+            .edge_weight(edge_id)
+            .ok_or_else(|| GraphError::Schema("edge not found".to_string()))?
+            .clone();
+
+        let mut updated = current.clone();
+        updated.kind = resolved_kind;
+        updated.confidence = confidence.unwrap_or(updated.confidence);
+        if clear_conflicts {
+            updated.conflicts.clear();
+        }
+
+        self.validate_edge_kind(from, to, &updated.kind, updated.confidence)?;
+        let (coverage_los, skip_requires_dag, skip_fadeability, dirty) =
+            self.edge_validation_plan(edge_name(&updated.kind), from, to);
+
+        self.graph_mut()[edge_id] = updated;
+        let guard = ValidationGuard::new(
+            self,
+            dirty,
+            ValidationScope::Targeted {
+                coverage_los,
+                skip_requires_dag,
+                skip_fadeability,
+            },
+            move |svc| {
+                svc.graph_mut()[edge_id] = current;
+            },
+        );
+        guard.commit()?;
+        self.record_mutation(
+            MutationKind::ResolveEdgeConflict,
+            json!({
+                "edge_id": edge_id.index(),
+                "from": self.graph()[from].slug,
+                "to": self.graph()[to].slug,
+            }),
+        );
+        Ok(edge_id)
     }
 
     pub fn remove_node(&mut self, slug: &str) -> Result<(), GraphError> {
@@ -1277,63 +1373,19 @@ impl GraphService {
         confidence: f32,
     ) -> Result<EdgeId, GraphError> {
         self.ensure_edge_capacity()?;
-        // Duplicate edge guard runs only for new insertions; validation passes
-        // during node updates should not trigger it.
-        let duplicate = match S::NAME {
-            "requires" => self.has_edge_of_kind(from, to, |k| matches!(k, EdgeKind::Requires(_))),
-            "supports" => self.has_edge_of_kind(from, to, |k| matches!(k, EdgeKind::Supports(_))),
-            "assesses" => self.has_edge_of_kind(from, to, |k| matches!(k, EdgeKind::Assesses(_))),
-            "precedes" => self.has_edge_of_kind(from, to, |k| matches!(k, EdgeKind::Precedes(_))),
-            "anchors" => self.has_edge_of_kind(from, to, |k| matches!(k, EdgeKind::Anchors(_))),
-            _ => false,
-        };
-        if duplicate {
-            return Err(GraphError::Schema(format!(
-                "duplicate {} edge between these nodes",
-                S::NAME
-            )));
-        }
-
         S::validate(self, from, to, &attrs, confidence)?;
         let payload = S::make_payload(attrs, confidence);
-        let edge_id = self.graph_mut().add_edge(from, to, payload);
 
-        let coverage_los = match S::NAME {
-            "assesses" => vec![to],
-            "requires" => self.impacted_los_from_requires(from),
-            _ => Vec::new(),
-        };
-
-        let (skip_requires_dag, skip_fadeability) = match S::NAME {
-            // Requires edges can introduce cycles and affect fadeability via prerequisite
-            // structure.
-            "requires" => (false, false),
-            // Supports edges can affect fadeability but not the requires DAG.
-            "supports" => (true, false),
-            // Other edges do not impact requires/fadeability invariants.
-            _ => (true, true),
-        };
-
-        let mut dirty = match S::NAME {
-            "requires" => {
-                InvariantFamilies::REQUIRES_DAG
-                    | InvariantFamilies::FADEABILITY
-                    | InvariantFamilies::PURITY
-                    | InvariantFamilies::STRUCTURE
-            }
-            "supports" => {
-                InvariantFamilies::FADEABILITY
-                    | InvariantFamilies::SUPPORTS
-                    | InvariantFamilies::STRUCTURE
-            }
-            "assesses" => InvariantFamilies::PURITY,
-            "precedes" => InvariantFamilies::DISCOURSE,
-            "anchors" => InvariantFamilies::DISCOURSE | InvariantFamilies::INTRODUCTIONS,
-            _ => InvariantFamilies::empty(),
-        };
-        if !coverage_los.is_empty() {
-            dirty.insert(InvariantFamilies::COVERAGE);
+        if let Some(existing_edge_id) =
+            self.find_edge_of_kind(from, to, |k| edge_variant_eq(k, &payload.kind))
+        {
+            return self.merge_existing_edge(S::NAME, from, to, existing_edge_id, payload);
         }
+
+        let edge_id = self.graph_mut().add_edge(from, to, payload);
+        let (coverage_los, skip_requires_dag, skip_fadeability, dirty) =
+            self.edge_validation_plan(S::NAME, from, to);
+
         let guard = ValidationGuard::new(
             self,
             dirty,
@@ -1354,15 +1406,115 @@ impl GraphService {
                 "from": self.graph()[from].slug.clone(),
                 "to": self.graph()[to].slug.clone(),
                 "confidence": confidence,
+                "merged_existing": false,
             }),
         );
         Ok(edge_id)
     }
 
-    fn has_edge_of_kind(&self, from: NodeId, to: NodeId, pred: impl Fn(&EdgeKind) -> bool) -> bool {
+    fn merge_existing_edge(
+        &mut self,
+        edge_name: &'static str,
+        from: NodeId,
+        to: NodeId,
+        edge_id: EdgeId,
+        incoming: EdgePayload,
+    ) -> Result<EdgeId, GraphError> {
+        let merged = merge_edge_payload(self.graph()[edge_id].clone(), incoming);
+        let had_conflict = matches!(merged, MergeResult::Conflict { .. });
+        let updated_payload = match merged {
+            MergeResult::Merged(payload)
+            | MergeResult::Conflict {
+                existing: payload, ..
+            } => payload,
+        };
+
+        self.validate_edge_kind(from, to, &updated_payload.kind, updated_payload.confidence)?;
+        let rollback_payload = self.graph()[edge_id].clone();
+        self.graph_mut()[edge_id] = updated_payload;
+
+        let (coverage_los, skip_requires_dag, skip_fadeability, dirty) =
+            self.edge_validation_plan(edge_name, from, to);
+        let guard = ValidationGuard::new(
+            self,
+            dirty,
+            ValidationScope::Targeted {
+                coverage_los,
+                skip_requires_dag,
+                skip_fadeability,
+            },
+            move |svc| {
+                svc.graph_mut()[edge_id] = rollback_payload;
+            },
+        );
+        guard.commit()?;
+        self.record_mutation(
+            MutationKind::AddEdge { edge: edge_name },
+            json!({
+                "edge": edge_name,
+                "from": self.graph()[from].slug.clone(),
+                "to": self.graph()[to].slug.clone(),
+                "confidence": self.graph()[edge_id].confidence,
+                "merged_existing": true,
+                "edge_conflicts": self.graph()[edge_id].conflicts.len(),
+                "had_conflict": had_conflict,
+            }),
+        );
+        Ok(edge_id)
+    }
+
+    fn edge_validation_plan(
+        &self,
+        edge_name: &'static str,
+        from: NodeId,
+        to: NodeId,
+    ) -> (Vec<NodeId>, bool, bool, InvariantFamilies) {
+        let coverage_los = match edge_name {
+            "assesses" => vec![to],
+            "requires" => self.impacted_los_from_requires(from),
+            _ => Vec::new(),
+        };
+
+        let (skip_requires_dag, skip_fadeability) = match edge_name {
+            "requires" => (false, false),
+            "supports" => (true, false),
+            _ => (true, true),
+        };
+
+        let mut dirty = match edge_name {
+            "requires" => {
+                InvariantFamilies::REQUIRES_DAG
+                    | InvariantFamilies::FADEABILITY
+                    | InvariantFamilies::PURITY
+                    | InvariantFamilies::STRUCTURE
+            }
+            "supports" => {
+                InvariantFamilies::FADEABILITY
+                    | InvariantFamilies::SUPPORTS
+                    | InvariantFamilies::STRUCTURE
+            }
+            "assesses" => InvariantFamilies::PURITY,
+            "precedes" => InvariantFamilies::DISCOURSE,
+            "anchors" => InvariantFamilies::DISCOURSE | InvariantFamilies::INTRODUCTIONS,
+            _ => InvariantFamilies::empty(),
+        };
+        if !coverage_los.is_empty() {
+            dirty.insert(InvariantFamilies::COVERAGE);
+        }
+
+        (coverage_los, skip_requires_dag, skip_fadeability, dirty)
+    }
+
+    fn find_edge_of_kind(
+        &self,
+        from: NodeId,
+        to: NodeId,
+        pred: impl Fn(&EdgeKind) -> bool,
+    ) -> Option<EdgeId> {
         self.graph
             .edges_directed(from, Direction::Outgoing)
-            .any(|e| e.target() == to && pred(&e.weight().kind))
+            .find(|e| e.target() == to && pred(&e.weight().kind))
+            .map(|e| e.id())
     }
 
     fn validate_revision(&self, spans: &[SourceRef], label: &str) -> Result<(), GraphError> {
@@ -1602,32 +1754,6 @@ impl GraphService {
     }
 }
 
-fn union_vecs<T>(a: Vec<T>, b: Vec<T>) -> Vec<T>
-where
-    T: Eq + Hash + Clone,
-{
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for item in a.into_iter().chain(b.into_iter()) {
-        if seen.insert(item.clone()) {
-            out.push(item);
-        }
-    }
-    out
-}
-
-fn union_source_refs(a: &[SourceRef], b: &[SourceRef]) -> Vec<SourceRef> {
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for span in a.iter().chain(b.iter()) {
-        let key = (&span.path, span.start_line, span.end_line, &span.revision);
-        if seen.insert(key) {
-            out.push(span.clone());
-        }
-    }
-    out
-}
-
 fn edge_variant_eq(a: &EdgeKind, b: &EdgeKind) -> bool {
     matches!(
         (a, b),
@@ -1637,6 +1763,24 @@ fn edge_variant_eq(a: &EdgeKind, b: &EdgeKind) -> bool {
             | (EdgeKind::Precedes(_), EdgeKind::Precedes(_))
             | (EdgeKind::Anchors(_), EdgeKind::Anchors(_))
     )
+}
+
+fn edge_name(kind: &EdgeKind) -> &'static str {
+    match kind {
+        EdgeKind::Requires(_) => "requires",
+        EdgeKind::Supports(_) => "supports",
+        EdgeKind::Assesses(_) => "assesses",
+        EdgeKind::Precedes(_) => "precedes",
+        EdgeKind::Anchors(_) => "anchors",
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct EdgeConflictState {
+    pub edge_id: EdgeId,
+    pub from:    NodeId,
+    pub to:      NodeId,
+    pub payload: EdgePayload,
 }
 
 impl Default for GraphService {

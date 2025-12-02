@@ -107,14 +107,26 @@ pub enum IntroductionScope {
 }
 
 /// Edge payload plus layer discriminator.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct EdgePayload {
     pub kind:       EdgeKind,
     pub confidence: f32,
+    #[serde(default)]
+    pub conflicts:  Vec<EdgeConflict>,
+}
+
+impl EdgePayload {
+    pub fn new(kind: EdgeKind, confidence: f32) -> Self {
+        Self {
+            kind,
+            confidence,
+            conflicts: Vec::new(),
+        }
+    }
 }
 
 /// Multiplex edge types.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub enum EdgeKind {
     Requires(RequiresAttrs),
     Supports(SupportsAttrs),
@@ -123,14 +135,20 @@ pub enum EdgeKind {
     Anchors(AnchorsAttrs),
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct RequiresAttrs {
     pub strength:      Strength,
     pub rationale:     String,
     pub evidence_refs: Vec<SourceRef>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct EdgeConflict {
+    pub kind:       EdgeKind,
+    pub confidence: f32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct SupportsAttrs {
     pub support_kind:    SupportKind,
     pub intended_effect: IntendedEffect,
@@ -139,7 +157,9 @@ pub struct SupportsAttrs {
     pub evidence_refs:   Vec<SourceRef>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CaseTag {
     Typical,
@@ -147,17 +167,17 @@ pub enum CaseTag {
     ErrorCase,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct AssessesAttrs {
     pub evidence_link: EvidenceLink,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct PrecedesAttrs {
     pub episode: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct AnchorsAttrs {
     pub impact: AnchorImpact,
 }

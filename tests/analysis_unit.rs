@@ -962,12 +962,12 @@ mod persistence_topology {
                 g.add_edge(
                     from,
                     to,
-                    EdgePayload {
-                        kind:       EdgeKind::Precedes(PrecedesAttrs {
+                    EdgePayload::new(
+                        EdgeKind::Precedes(PrecedesAttrs {
                             episode: episode.into(),
                         }),
-                        confidence: 1.0,
-                    },
+                        1.0,
+                    ),
                 );
             }
         }
@@ -976,12 +976,12 @@ mod persistence_topology {
         g.add_edge(
             steps[intro_idx],
             target,
-            EdgePayload {
-                kind:       EdgeKind::Anchors(AnchorsAttrs {
+            EdgePayload::new(
+                EdgeKind::Anchors(AnchorsAttrs {
                     impact: AnchorImpact::Introduce,
                 }),
-                confidence: 1.0,
-            },
+                1.0,
+            ),
         );
 
         for (idx, step) in steps.iter().enumerate() {
@@ -991,12 +991,12 @@ mod persistence_topology {
             g.add_edge(
                 *step,
                 target,
-                EdgePayload {
-                    kind:       EdgeKind::Anchors(AnchorsAttrs {
+                EdgePayload::new(
+                    EdgeKind::Anchors(AnchorsAttrs {
                         impact: AnchorImpact::Use,
                     }),
-                    confidence: 1.0,
-                },
+                    1.0,
+                ),
             );
         }
 
@@ -1207,5 +1207,213 @@ mod granularity {
                 .any(|v| matches!(v.code, graph::InvariantCode::GrainFragment)),
             "expected GrainFragment violation"
         );
+    }
+}
+
+mod edge_dedup_merging {
+    use super::*;
+
+    fn evidence(path: &str) -> SourceRef {
+        SourceRef::new(path, 1, 2, "deadbeef")
+    }
+
+    #[test]
+    fn merge_nodes_combines_duplicate_requires_edges() {
+        let mut svc = GraphService::new();
+        svc.set_skip_dedup_on_insert(true);
+
+        let canonical = svc
+            .add_knowledge_node("canon".into(), mk_kn("canon", KnowledgeType::Conceptual), vec![])
+            .unwrap();
+        let duplicate = svc
+            .add_knowledge_node("dup".into(), mk_kn("dup", KnowledgeType::Conceptual), vec![])
+            .unwrap();
+        let target = svc
+            .add_knowledge_node("target".into(), mk_kn("target", KnowledgeType::Conceptual), vec![])
+            .unwrap();
+
+        svc.add_edge::<graph::RequiresSpec>(
+            canonical,
+            target,
+            graph::RequiresAttrs {
+                strength:      Strength::Helpful,
+                rationale:     "first rationale".into(),
+                evidence_refs: vec![evidence("a")],
+            },
+            0.6,
+        )
+        .unwrap();
+        svc.add_edge::<graph::RequiresSpec>(
+            duplicate,
+            target,
+            graph::RequiresAttrs {
+                strength:      Strength::Necessary,
+                rationale:     "second rationale".into(),
+                evidence_refs: vec![evidence("b")],
+            },
+            0.8,
+        )
+        .unwrap();
+
+        let canonical_slug = svc.graph()[canonical].slug.clone();
+        let duplicate_slug = svc.graph()[duplicate].slug.clone();
+        svc.merge_nodes(&canonical_slug, &duplicate_slug).unwrap();
+
+        let edge = svc
+            .graph()
+            .find_edge(canonical, target)
+            .expect("merged edge exists");
+        let payload = &svc.graph()[edge];
+        let EdgeKind::Requires(attrs) = &payload.kind else {
+            panic!("expected requires edge after merge");
+        };
+        assert_eq!(attrs.strength, Strength::Necessary);
+        assert!(attrs.rationale.contains("first rationale"));
+        assert!(attrs.rationale.contains("second rationale"));
+        assert_eq!(attrs.evidence_refs.len(), 2);
+        assert!(payload.conflicts.is_empty());
+        assert!((payload.confidence - 0.8).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn merge_nodes_captures_conflicting_supports() {
+        let mut svc = GraphService::new();
+        svc.set_skip_dedup_on_insert(true);
+
+        let canonical = svc
+            .add_knowledge_node("canon".into(), mk_kn("canon", KnowledgeType::Conceptual), vec![])
+            .unwrap();
+        let duplicate = svc
+            .add_knowledge_node("dup".into(), mk_kn("dup", KnowledgeType::Conceptual), vec![])
+            .unwrap();
+        let target = svc
+            .add_knowledge_node("target".into(), mk_kn("target", KnowledgeType::Conceptual), vec![])
+            .unwrap();
+
+        svc.add_edge::<graph::SupportsSpec>(
+            canonical,
+            target,
+            graph::SupportsAttrs {
+                support_kind:    SupportKind::WorkedExample,
+                intended_effect: IntendedEffect::ReduceExtraneousLoad,
+                case_tag:        Some(graph::CaseTag::Typical),
+                coverage_tags:   vec!["trace".into()],
+                evidence_refs:   vec![evidence("c")],
+            },
+            0.4,
+        )
+        .unwrap();
+        svc.add_edge::<graph::SupportsSpec>(
+            duplicate,
+            target,
+            graph::SupportsAttrs {
+                support_kind:    SupportKind::Analogy,
+                intended_effect: IntendedEffect::ReduceExtraneousLoad,
+                case_tag:        Some(graph::CaseTag::Edge),
+                coverage_tags:   vec!["contrast".into()],
+                evidence_refs:   vec![evidence("d")],
+            },
+            0.7,
+        )
+        .unwrap();
+
+        let canonical_slug = svc.graph()[canonical].slug.clone();
+        let duplicate_slug = svc.graph()[duplicate].slug.clone();
+        svc.merge_nodes(&canonical_slug, &duplicate_slug).unwrap();
+
+        let edge = svc
+            .graph()
+            .find_edge(canonical, target)
+            .expect("merged edge exists");
+        let payload = &svc.graph()[edge];
+        let EdgeKind::Supports(attrs) = &payload.kind else {
+            panic!("expected supports edge after merge");
+        };
+        assert_eq!(attrs.support_kind, SupportKind::WorkedExample);
+        assert_eq!(payload.conflicts.len(), 1);
+        match &payload.conflicts[0].kind {
+            EdgeKind::Supports(conflict) => {
+                assert_eq!(conflict.support_kind, SupportKind::Analogy);
+            }
+            other => panic!("unexpected conflict kind: {other:?}"),
+        }
+        assert!((payload.confidence - 0.7).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn resolve_edge_conflict_clears_conflicts() {
+        let mut svc = GraphService::new();
+        svc.set_skip_dedup_on_insert(true);
+
+        let canonical = svc
+            .add_knowledge_node("canon".into(), mk_kn("canon", KnowledgeType::Conceptual), vec![])
+            .unwrap();
+        let duplicate = svc
+            .add_knowledge_node("dup".into(), mk_kn("dup", KnowledgeType::Conceptual), vec![])
+            .unwrap();
+        let target = svc
+            .add_knowledge_node("target".into(), mk_kn("target", KnowledgeType::Conceptual), vec![])
+            .unwrap();
+
+        svc.add_edge::<graph::SupportsSpec>(
+            canonical,
+            target,
+            graph::SupportsAttrs {
+                support_kind:    SupportKind::WorkedExample,
+                intended_effect: IntendedEffect::ReduceExtraneousLoad,
+                case_tag:        Some(graph::CaseTag::Typical),
+                coverage_tags:   vec!["trace".into()],
+                evidence_refs:   vec![evidence("c")],
+            },
+            0.4,
+        )
+        .unwrap();
+        svc.add_edge::<graph::SupportsSpec>(
+            duplicate,
+            target,
+            graph::SupportsAttrs {
+                support_kind:    SupportKind::Analogy,
+                intended_effect: IntendedEffect::ReduceExtraneousLoad,
+                case_tag:        Some(graph::CaseTag::Edge),
+                coverage_tags:   vec!["contrast".into()],
+                evidence_refs:   vec![evidence("d")],
+            },
+            0.7,
+        )
+        .unwrap();
+
+        let canonical_slug = svc.graph()[canonical].slug.clone();
+        let duplicate_slug = svc.graph()[duplicate].slug.clone();
+        svc.merge_nodes(&canonical_slug, &duplicate_slug).unwrap();
+
+        let edge = svc
+            .graph()
+            .find_edge(canonical, target)
+            .expect("merged edge exists");
+        assert!(!svc.graph()[edge].conflicts.is_empty(), "expected conflicts recorded");
+
+        svc.resolve_edge_conflict(
+            edge,
+            graph::EdgeKind::Supports(graph::SupportsAttrs {
+                support_kind:    SupportKind::Analogy,
+                intended_effect: IntendedEffect::ReduceExtraneousLoad,
+                case_tag:        Some(graph::CaseTag::Edge),
+                coverage_tags:   vec!["contrast".into()],
+                evidence_refs:   vec![evidence("d")],
+            }),
+            Some(0.9),
+            true,
+        )
+        .unwrap();
+
+        let payload = &svc.graph()[edge];
+        assert!(payload.conflicts.is_empty());
+        match &payload.kind {
+            graph::EdgeKind::Supports(attrs) => {
+                assert_eq!(attrs.support_kind, SupportKind::Analogy);
+            }
+            other => panic!("unexpected kind after resolution: {other:?}"),
+        }
+        assert!((payload.confidence - 0.9).abs() < f32::EPSILON);
     }
 }

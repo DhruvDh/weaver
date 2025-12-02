@@ -828,10 +828,14 @@ pub async fn run_app(cli: Cli, runtime: RuntimeOptions) -> Result<()> {
             .expect("scheduler actor not running");
     }
 
+    let dedup_agent = DeduplicationAgent::spawn(DeduplicationAgent::new(
+        graph_actor.clone(),
+        rerun_actor.clone(),
+    ));
+
     if cli.dedup_interval_secs > 0 {
-        let dedup = DeduplicationAgent::spawn(DeduplicationAgent::new(graph_actor.clone()));
         let dedup_task = SetInterval::new(
-            dedup.downgrade(),
+            dedup_agent.downgrade(),
             Duration::from_secs(cli.dedup_interval_secs),
             RunDeduplication {
                 auto_merge_threshold: cli.dedup_auto_merge_threshold,
@@ -880,6 +884,7 @@ pub async fn run_app(cli: Cli, runtime: RuntimeOptions) -> Result<()> {
             gateway.clone(),
             Arc::clone(&metrics),
             graph_actor.clone(),
+            dedup_agent.clone(),
             rerun_actor.clone(),
         ) {
             Ok(actor) => actor,

@@ -471,6 +471,56 @@ impl Message<AddAnchors> for GraphManager {
     }
 }
 
+impl Message<GetEdgeConflicts> for GraphManager {
+    type Reply = Result<Vec<EdgeConflictView>, GraphError>;
+
+    async fn handle(
+        &mut self,
+        _msg: GetEdgeConflicts,
+        _ctx: &mut MsgContext<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let conflicts = self.service.edge_conflicts();
+        let graph = self.service.graph();
+        let views = conflicts
+            .into_iter()
+            .map(|entry| EdgeConflictView {
+                edge_id:    entry.edge_id.index() as u32,
+                from_slug:  graph[entry.from].slug.clone(),
+                to_slug:    graph[entry.to].slug.clone(),
+                kind:       entry.payload.kind.clone(),
+                confidence: entry.payload.confidence,
+                conflicts:  entry.payload.conflicts.clone(),
+            })
+            .collect();
+        Ok(views)
+    }
+}
+
+impl Message<ResolveEdgeConflict> for GraphManager {
+    type Reply = Result<(), GraphError>;
+
+    async fn handle(
+        &mut self,
+        ResolveEdgeConflict {
+            edge_id,
+            resolved_kind,
+            confidence,
+            clear_conflicts,
+        }: ResolveEdgeConflict,
+        _ctx: &mut MsgContext<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let start = Instant::now();
+        let idx = petgraph::stable_graph::EdgeIndex::new(edge_id as usize);
+        let res =
+            self.service
+                .resolve_edge_conflict(idx, resolved_kind, confidence, clear_conflicts);
+        if res.is_ok() {
+            GraphManager::log_write_latency("resolve_edge_conflict", start);
+        }
+        res.map(|_| ())
+    }
+}
+
 impl Message<GetNode> for GraphManager {
     type Reply = Result<NodePayload, GraphError>;
 

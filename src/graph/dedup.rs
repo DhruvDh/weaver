@@ -67,12 +67,12 @@ impl NodeDeduplicator {
         exclude: Option<NodeId>,
     ) -> DuplicateCheck {
         let hash = normalized_statement_hash(statement);
-        if let Some(existing) = self.content_hashes.get(&(knowledge_type, hash)) {
-            if Some(*existing) != exclude {
-                return DuplicateCheck::Exact {
-                    existing: *existing,
-                };
-            }
+        if let Some(existing) = self.content_hashes.get(&(knowledge_type, hash))
+            && Some(*existing) != exclude
+        {
+            return DuplicateCheck::Exact {
+                existing: *existing,
+            };
         }
 
         let fp = simhash(statement);
@@ -161,17 +161,17 @@ pub(crate) fn simhash(statement: &str) -> u64 {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         token.to_ascii_lowercase().hash(&mut hasher);
         let hash = hasher.finish();
-        for i in 0..64 {
+        for (i, bit) in bits.iter_mut().enumerate() {
             if (hash >> i) & 1 == 1 {
-                bits[i] += 1;
+                *bit += 1;
             } else {
-                bits[i] -= 1;
+                *bit -= 1;
             }
         }
     }
     let mut fp = 0u64;
-    for i in 0..64 {
-        if bits[i] >= 0 {
+    for (i, bit) in bits.iter().enumerate() {
+        if *bit >= 0 {
             fp |= 1 << i;
         }
     }

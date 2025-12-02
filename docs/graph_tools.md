@@ -37,6 +37,7 @@ Command previews also return a cost block with byte/token hints so the gateway c
 | `graph_discourse_orphans` | analysis | TeachingSteps lacking precedes links | `episode` (optional) |
 | `graph_borrow_ahead` | analysis | Borrow-ahead uses within an episode | `episode` |
 | `graph_analysis_cache_clear` | admin | Clear all cached graph analyses (ops) | — |
+| `graph_edge_conflicts` | view | Edges carrying queued conflict payloads | `limit`, `offset` |
 
 ### Commands (mutations)
 All command outputs now follow `{type: "graph_command", tool: <id>, status: "ok", ...}` and may echo key fields (e.g., slugs, path):
@@ -46,6 +47,7 @@ All command outputs now follow `{type: "graph_command", tool: <id>, status: "ok"
 - `graph_add_requires`, `graph_add_supports`, `graph_add_assesses`, `graph_add_precedes`, `graph_add_anchors`
 - `graph_rename_node`, `graph_remove_node`
 - `graph_save_now`, `graph_load_snapshot`
+- `graph_resolve_edge_conflict`
 
 ### Limits and safety notes
 - Views are always bounded (`limit`/`offset`); use `has_more` to paginate.

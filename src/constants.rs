@@ -96,8 +96,11 @@ pub const MAX_SLUG_NAME_LEN: usize = 64;
 /// Simhash Hamming distance tolerated for insert-time duplicate detection.
 pub const DEDUP_INSERT_SIMHASH_DISTANCE: u32 = 3;
 
-/// Simhash distance threshold used for background clustering.
-pub const DEDUP_CLUSTER_DISTANCE: u32 = 6;
+/// Minimum Jaro-Winkler similarity used for background clustering.
+pub const DEDUP_CLUSTER_SIMILARITY: f64 = 0.92;
+
+/// Hard cap on auto-merges performed in a single dedup run.
+pub const DEDUP_MAX_AUTO_MERGES_PER_RUN: usize = 25;
 
 /// Title similarity threshold for duplicate warnings.
 pub const DEDUP_TITLE_SIMILARITY: f64 = 0.85;

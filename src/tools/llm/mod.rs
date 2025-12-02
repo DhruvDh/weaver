@@ -22,11 +22,13 @@ use self::{
     read_file_range::read_file_range_meta, search_text::search_text_meta,
 };
 use crate::{
+    agents::deduplication::DeduplicationAgent,
     graph::manager::GraphManager,
     llm_gateway::{GatewayMetrics, LLMGateway},
 };
 
 mod common;
+pub mod dedup_tools;
 mod delegate_tasks;
 pub mod graph_tools;
 mod list_directory;
@@ -306,6 +308,7 @@ fn build_tool_prototypes() -> Result<Vec<ToolPrototype>, ToolRegistryError> {
     ];
 
     metas.extend(graph_tools::graph_tool_prototypes());
+    metas.extend(dedup_tools::tool_prototypes());
 
     let mut seen = HashMap::new();
     for meta in &metas {
@@ -358,6 +361,7 @@ pub struct CallState {
     pub model:              Arc<String>,
     pub metrics:            Arc<GatewayMetrics>,
     pub graph:              ActorRef<GraphManager>,
+    pub dedup:              ActorRef<DeduplicationAgent>,
     pub actor_name:         Arc<String>,
     pub conversation_id:    Arc<String>,
     pub rerun:              Option<ActorRef<crate::rerun_sink::RerunSink>>,
