@@ -10,6 +10,7 @@ pub mod slug;
 pub mod specs;
 pub mod traversal;
 pub mod validation;
+pub mod viz;
 
 pub use model::*;
 pub use service::{EdgeConflictState, GraphService, MergeSummary};

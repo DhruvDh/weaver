@@ -25,13 +25,14 @@ use crate::{
     },
     graph::{
         CurriculumGraph, GraphConfig,
-        audit::RerunMutationSink,
+        audit::{FanoutMutationSink, RerunMutationSink},
         commands::ListNodesByTag,
         manager::{
             ApplyRuntimeConfig, AuditInvariants, GetCourseCommit, GraphManager, GraphManagerState,
             PersistSnapshot, RedundantRequires, SaveSnapshot, SetAuditSink,
         },
         persist,
+        viz::{GraphVisualizer, GraphVizConfig, GraphVizSink, PrimeRender},
     },
     llm_gateway::{
         GatewayMetrics, GetGatewayMetrics, LLMGateway, LLMGatewayState, PersistGatewaySnapshot,
@@ -1086,10 +1087,28 @@ pub async fn run_app(cli: Cli, runtime: RuntimeOptions) -> Result<()> {
     } else {
         Some(RerunSink::spawn(rerun_targets))
     };
+    let rerun_viz_actor = rerun_actor.as_ref().map(|rerun| {
+        GraphVisualizer::spawn(GraphVisualizer::new(
+            graph_actor.clone(),
+            rerun.clone(),
+            GraphVizConfig::default(),
+        ))
+    });
     if let Some(rerun) = &rerun_actor {
+        let mut sinks: Vec<crate::graph::audit::SharedMutationSink> =
+            vec![Arc::new(RerunMutationSink::new(rerun.clone()))];
+        if let Some(viz) = &rerun_viz_actor {
+            sinks.push(Arc::new(GraphVizSink::new(viz.clone())));
+        }
         let sink: crate::graph::audit::SharedMutationSink =
-            Arc::new(RerunMutationSink::new(rerun.clone()));
+            Arc::new(FanoutMutationSink::new(sinks));
         let _ = graph_actor.tell(SetAuditSink { sink }).await;
+        if let Some(viz) = &rerun_viz_actor {
+            let viz = viz.clone();
+            tokio::spawn(async move {
+                let _ = viz.tell(PrimeRender).await;
+            });
+        }
     }
 
     let autosave_worker = AutosaveWorker {

@@ -6,8 +6,8 @@ use std::{
 
 use kameo::prelude::*;
 use rerun::{
-    RecordingStream, RecordingStreamBuilder, TimeCell,
-    archetypes::{Scalars, TextLog},
+    GraphEdges, GraphNodes, RecordingStream, RecordingStreamBuilder, TimeCell,
+    archetypes::{Arrows2D, Scalars, TextLog},
 };
 use tokio::task;
 use tracing::debug;
@@ -85,6 +85,16 @@ pub struct LogText {
     pub time_ns: Option<i64>,
 }
 
+#[derive(Clone)]
+pub struct LogGraphFrame {
+    pub entity_path:       String,
+    pub edge_overlay_path: String,
+    pub nodes:             GraphNodes,
+    pub edges:             GraphEdges,
+    pub arrows:            Option<Arrows2D>,
+    pub time_ns:           Option<i64>,
+}
+
 impl Actor for RerunSink {
     type Args = Vec<RerunTarget>;
     type Error = Infallible;
@@ -159,6 +169,51 @@ impl Message<LogText> for RerunSink {
                 rec.set_time("time", time_cell);
                 if let Err(err) = rec.log(path.clone(), &TextLog::new(value.clone())) {
                     debug!(error = ?err, "rerun log failed");
+                }
+            }
+        });
+    }
+}
+
+impl Message<LogGraphFrame> for RerunSink {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: LogGraphFrame,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.ensure_streams();
+        if self.recs.is_empty() {
+            return;
+        }
+        let time_cell = msg
+            .time_ns
+            .map(TimeCell::from_timestamp_nanos_since_epoch)
+            .or_else(now_timecell)
+            .unwrap_or_else(|| TimeCell::from_timestamp_nanos_since_epoch(0));
+        let recs = self.recs.clone();
+        let LogGraphFrame {
+            entity_path,
+            edge_overlay_path,
+            nodes,
+            edges,
+            arrows,
+            ..
+        } = msg;
+
+        task::spawn(async move {
+            for rec in recs {
+                rec.set_time("time", time_cell);
+                if let Err(err) =
+                    rec.log(entity_path.clone(), &[&nodes as &dyn rerun::AsComponents, &edges])
+                {
+                    debug!(error = ?err, "rerun log graph frame failed");
+                }
+                if let Some(arrows) = arrows.as_ref()
+                    && let Err(err) = rec.log(edge_overlay_path.clone(), arrows)
+                {
+                    debug!(error = ?err, "rerun log edge overlay failed");
                 }
             }
         });

@@ -167,3 +167,22 @@ impl MutationEventSink for RerunMutationSink {
         });
     }
 }
+
+#[derive(Clone, Default)]
+pub struct FanoutMutationSink {
+    sinks: Vec<SharedMutationSink>,
+}
+
+impl FanoutMutationSink {
+    pub fn new(sinks: Vec<SharedMutationSink>) -> Self {
+        Self { sinks }
+    }
+}
+
+impl MutationEventSink for FanoutMutationSink {
+    fn record(&self, event: &MutationEvent) {
+        for sink in &self.sinks {
+            sink.record(event);
+        }
+    }
+}
