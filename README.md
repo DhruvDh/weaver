@@ -153,6 +153,15 @@ Only edge-creation tools. Agents query nodes first, verify existence, then link.
 "Trace neighbors for a teaching step."
 → `graph_neighbors slug="TS.loop_three_steps" fetch_body=true`
 
+**Centrality / keystone (requires layer):**
+
+"Find keystone concepts (betweenness-style importance)."
+→ `graph_keystone fetch_body=true limit=20`
+
+"(Optional) PageRank over prerequisites (requires debug flag)."
+Set `WEAVER_DEBUG_GRAPH_ALGORITHMS=1` before launching the analyst, then run:
+→ `graph_requires_pagerank damping=0.85 iterations=20 limit=20 fetch_body=true`
+
 **Technically correct but misleading** (artifacts of incomplete weaving):
 
 "What are the first principles?"
