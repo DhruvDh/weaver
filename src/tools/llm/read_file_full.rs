@@ -92,6 +92,9 @@ impl ToolInstance for ReadFileFullTool {
         let line_count = content.lines().count() as u64;
         let mode = ToolPayloadMode::from_fetch_flag(self.args.fetch_body);
         let path_hint = render_relative_path(self.state.workspace_root.as_ref(), &resolved);
+        let body_path = path_hint.clone();
+        let preview_path = path_hint.clone();
+
         let runner = ToolRunner::new(IDENTIFIER, &self.state)
             .with_mode(mode)
             .hints(vec![
@@ -116,7 +119,7 @@ impl ToolInstance for ReadFileFullTool {
                     body:          json!({
                         "type": "data",
                         "mode": "body",
-                        "path": path_hint,
+                        "path": body_path,
                         "content": content,
                         "bytes": file_bytes,
                     }),
@@ -125,7 +128,7 @@ impl ToolInstance for ReadFileFullTool {
                         "type": "data",
                         "tool": IDENTIFIER,
                         "mode": "preview",
-                        "path": path_hint,
+                        "path": preview_path,
                         "bytes": file_bytes,
                         "line_count": line_count,
                     })),

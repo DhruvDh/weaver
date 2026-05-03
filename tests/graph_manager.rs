@@ -151,6 +151,7 @@ async fn apply_runtime_config_honors_validation_timeout() -> anyhow::Result<()> 
             course_commit:         String::new(),
             strict_quality:        false,
             validation_timeout_ms: 1,
+            source_root:           None,
         })
         .await
     {

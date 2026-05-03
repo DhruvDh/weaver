@@ -2,7 +2,9 @@
 //! `GraphService` can focus on storage and routing.
 use std::{
     collections::{HashMap, HashSet},
+    fs,
     hash::{Hash, Hasher},
+    path::{Component, Path, PathBuf},
     time::Instant,
 };
 
@@ -73,6 +75,7 @@ pub enum ValidationScope {
 pub struct ValidationContext {
     pub strict:                bool,
     pub expected_revision:     Option<String>,
+    pub source_root:           Option<PathBuf>,
     pub rubric_prev:           HashMap<String, u64>,
     pub include_rubric_update: bool,
 }
@@ -185,7 +188,11 @@ pub fn run_invariants_for_graph(
         issues.extend(statements::validate(g));
     }
     if families.contains(InvariantFamilies::PROVENANCE) {
-        issues.extend(provenance::validate(g, ctx.expected_revision.as_deref()));
+        issues.extend(provenance::validate(
+            g,
+            ctx.expected_revision.as_deref(),
+            ctx.source_root.as_deref(),
+        ));
     }
     if include_requires_dag || include_fadeability {
         issues.extend(requires::validate(
@@ -319,44 +326,28 @@ mod provenance {
     pub(super) fn validate(
         g: &CurriculumGraph,
         expected_revision: Option<&str>,
+        source_root: Option<&Path>,
     ) -> Vec<ValidationIssue> {
-        let Some(expected) = expected_revision else {
-            return Vec::new();
-        };
         let mut out = Vec::new();
         for n in g.node_indices() {
             match &g[n].kind {
                 NodeKind::Knowledge(k) => {
-                    for span in &k.source_refs {
-                        if span.revision != expected {
-                            out.push(make_issue(
-                                InvariantCode::ProvenanceRevision,
-                                ValidationSeverity::Error,
-                                true,
-                                format!(
-                                    "knowledge `{}` source_ref revision `{}` must equal \
-                                     course_commit `{}`",
-                                    g[n].slug, span.revision, expected
-                                ),
-                            ));
-                        }
-                    }
+                    validate_spans(
+                        &mut out,
+                        &k.source_refs,
+                        &format!("knowledge `{}` source_ref", g[n].slug),
+                        expected_revision,
+                        source_root,
+                    );
                 }
                 NodeKind::TeachingStep(ts) => {
-                    for span in &ts.source_refs {
-                        if span.revision != expected {
-                            out.push(make_issue(
-                                InvariantCode::ProvenanceRevision,
-                                ValidationSeverity::Error,
-                                true,
-                                format!(
-                                    "teaching_step `{}` source_ref revision `{}` must equal \
-                                     course_commit `{}`",
-                                    g[n].slug, span.revision, expected
-                                ),
-                            ));
-                        }
-                    }
+                    validate_spans(
+                        &mut out,
+                        &ts.source_refs,
+                        &format!("teaching_step `{}` source_ref", g[n].slug),
+                        expected_revision,
+                        source_root,
+                    );
                 }
             }
         }
@@ -365,42 +356,98 @@ mod provenance {
             if let Some((u, v)) = g.edge_endpoints(edge) {
                 match &g[edge].kind {
                     EdgeKind::Requires(attrs) => {
-                        for span in &attrs.evidence_refs {
-                            if span.revision != expected {
-                                out.push(make_issue(
-                                    InvariantCode::ProvenanceRevision,
-                                    ValidationSeverity::Error,
-                                    true,
-                                    format!(
-                                        "{} -> {} evidence_ref revision `{}` must equal \
-                                         course_commit `{}`",
-                                        g[u].slug, g[v].slug, span.revision, expected
-                                    ),
-                                ));
-                            }
-                        }
+                        validate_spans(
+                            &mut out,
+                            &attrs.evidence_refs,
+                            &format!("{} -> {} evidence_ref", g[u].slug, g[v].slug),
+                            expected_revision,
+                            source_root,
+                        );
                     }
                     EdgeKind::Supports(attrs) => {
-                        for span in &attrs.evidence_refs {
-                            if span.revision != expected {
-                                out.push(make_issue(
-                                    InvariantCode::ProvenanceRevision,
-                                    ValidationSeverity::Error,
-                                    true,
-                                    format!(
-                                        "{} -> {} evidence_ref revision `{}` must equal \
-                                         course_commit `{}`",
-                                        g[u].slug, g[v].slug, span.revision, expected
-                                    ),
-                                ));
-                            }
-                        }
+                        validate_spans(
+                            &mut out,
+                            &attrs.evidence_refs,
+                            &format!("{} -> {} evidence_ref", g[u].slug, g[v].slug),
+                            expected_revision,
+                            source_root,
+                        );
                     }
                     _ => {}
                 }
             }
         }
         out
+    }
+
+    fn validate_spans(
+        out: &mut Vec<ValidationIssue>,
+        spans: &[SourceRef],
+        label: &str,
+        expected_revision: Option<&str>,
+        source_root: Option<&Path>,
+    ) {
+        for span in spans {
+            if let Some(expected) = expected_revision
+                && span.revision != expected
+            {
+                out.push(make_issue(
+                    InvariantCode::ProvenanceRevision,
+                    ValidationSeverity::Error,
+                    true,
+                    format!(
+                        "{label} revision `{}` must equal course_commit `{}`",
+                        span.revision, expected
+                    ),
+                ));
+            }
+            if let Some(root) = source_root
+                && let Err(message) = validate_span_path(root, span)
+            {
+                out.push(make_issue(
+                    InvariantCode::ProvenancePath,
+                    ValidationSeverity::Error,
+                    true,
+                    format!("{label} path `{}` is invalid: {message}", span.path),
+                ));
+            }
+        }
+    }
+
+    fn validate_span_path(source_root: &Path, span: &SourceRef) -> Result<(), String> {
+        let path = Path::new(&span.path);
+        if path.is_absolute() {
+            return Err("must be relative to the source root".to_string());
+        }
+        if path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+        {
+            return Err("must not contain `..` path components".to_string());
+        }
+
+        let candidate = source_root.join(path);
+        let canonical = candidate
+            .canonicalize()
+            .map_err(|err| format!("cannot resolve file: {err}"))?;
+        if !canonical.starts_with(source_root) {
+            return Err(format!("escapes source root {}", source_root.display()));
+        }
+        let meta =
+            fs::metadata(&canonical).map_err(|err| format!("cannot read file metadata: {err}"))?;
+        if !meta.is_file() {
+            return Err("must reference a file".to_string());
+        }
+        let body = fs::read_to_string(&canonical)
+            .map_err(|err| format!("cannot read file for line validation: {err}"))?;
+        let line_count = body.lines().count() as u32;
+        if span.end_line > line_count {
+            return Err(format!(
+                "end_line {} exceeds file line count {}",
+                span.end_line, line_count
+            ));
+        }
+        Ok(())
     }
 }
 

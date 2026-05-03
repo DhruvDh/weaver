@@ -430,6 +430,13 @@ pub fn resolve_workspace_path(
     relative: impl AsRef<Path>,
     tool: &'static str,
 ) -> ToolInputResult<PathBuf> {
+    let root = root
+        .canonicalize()
+        .map_err(|err| ToolInputError::InvalidPath {
+            tool,
+            path: root.display().to_string(),
+            message: err.to_string(),
+        })?;
     let rel = relative.as_ref();
     let candidate = if rel.is_absolute() {
         rel.to_path_buf()
@@ -443,7 +450,7 @@ pub fn resolve_workspace_path(
             path: candidate.display().to_string(),
             message: err.to_string(),
         })?;
-    if !canonical.starts_with(root) {
+    if !canonical.starts_with(&root) {
         return Err(ToolInputError::InvalidPath {
             tool,
             path: canonical.display().to_string(),

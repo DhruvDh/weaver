@@ -3,13 +3,15 @@
 use std::{
     collections::{HashMap, HashSet},
     panic::{AssertUnwindSafe, catch_unwind},
+    path::{Path, PathBuf},
     sync::{
-        Arc, RwLock,
+        Arc,
         atomic::{AtomicBool, AtomicU16, Ordering},
     },
     time::Duration,
 };
 
+use parking_lot::RwLock;
 use petgraph::{Direction, visit::EdgeRef};
 use serde_json::json;
 use strsim::jaro_winkler;
@@ -53,16 +55,12 @@ struct GraphSnapshot {
 
 impl GraphSnapshot {
     fn capture(svc: &GraphService) -> Self {
-        let fade_cache = svc.fade_cache.read().expect("fade_cache lock").clone();
+        let fade_cache = svc.fade_cache.read().clone();
         let validation_dirty = svc.validation_state.dirty.load(Ordering::Relaxed);
         Self {
             graph: Arc::clone(&svc.graph),
             slug_to_node: svc.slug_to_node.clone(),
-            rubric_hashes: svc
-                .rubric_hashes
-                .read()
-                .expect("rubric_hashes lock")
-                .clone(),
+            rubric_hashes: svc.rubric_hashes.read().clone(),
             validation_dirty,
             fade_cache,
             graph_version: svc.graph_version,
@@ -76,14 +74,15 @@ impl GraphSnapshot {
         svc.validation_state
             .dirty
             .store(self.validation_dirty, Ordering::Relaxed);
-        *svc.rubric_hashes.write().expect("rubric_hashes lock") = self.rubric_hashes;
-        *svc.fade_cache.write().expect("fade_cache lock") = self.fade_cache;
+        *svc.rubric_hashes.write() = self.rubric_hashes;
+        *svc.fade_cache.write() = self.fade_cache;
     }
 }
 
 struct GraphValidator<'a> {
     strict_quality:    bool,
     expected_revision: Option<String>,
+    source_root:       Option<PathBuf>,
     rubric_hashes:     &'a RwLock<HashMap<String, u64>>,
 }
 
@@ -91,11 +90,13 @@ impl<'a> GraphValidator<'a> {
     fn new(
         strict_quality: bool,
         expected_revision: Option<String>,
+        source_root: Option<PathBuf>,
         rubric_hashes: &'a RwLock<HashMap<String, u64>>,
     ) -> Self {
         Self {
             strict_quality,
             expected_revision,
+            source_root,
             rubric_hashes,
         }
     }
@@ -104,11 +105,8 @@ impl<'a> GraphValidator<'a> {
         ValidationContext {
             strict: self.strict_quality,
             expected_revision: self.expected_revision.clone(),
-            rubric_prev: self
-                .rubric_hashes
-                .read()
-                .expect("rubric_hashes lock")
-                .clone(),
+            source_root: self.source_root.clone(),
+            rubric_prev: self.rubric_hashes.read().clone(),
             include_rubric_update,
         }
     }
@@ -170,7 +168,7 @@ impl<'a> GraphValidator<'a> {
 
     fn update_rubric(&self, rubric_current: Option<HashMap<String, u64>>) {
         if let Some(rubric) = rubric_current {
-            *self.rubric_hashes.write().expect("rubric_hashes lock") = rubric;
+            *self.rubric_hashes.write() = rubric;
         }
     }
 }
@@ -295,6 +293,7 @@ pub struct GraphService {
     strict_quality:       bool,
     graph_version:        u64,
     expected_revision:    Option<String>,
+    source_root:          Option<PathBuf>,
     rubric_hashes:        RwLock<HashMap<String, u64>>,
     validation_state:     ValidationState,
     poisoned:             AtomicBool,
@@ -326,6 +325,7 @@ impl GraphService {
         GraphValidator::new(
             self.strict_quality,
             self.expected_revision.clone(),
+            self.source_root.clone(),
             &self.rubric_hashes,
         )
     }
@@ -336,13 +336,32 @@ impl GraphService {
     }
 
     pub fn from_parts(
-        mut graph: CurriculumGraph,
+        graph: CurriculumGraph,
         strict_quality: bool,
         graph_version: u64,
         expected_revision: Option<String>,
         skip_dedup_on_insert: bool,
     ) -> Result<Self, GraphError> {
+        Self::from_parts_with_source_root(
+            graph,
+            strict_quality,
+            graph_version,
+            expected_revision,
+            skip_dedup_on_insert,
+            None,
+        )
+    }
+
+    pub fn from_parts_with_source_root(
+        mut graph: CurriculumGraph,
+        strict_quality: bool,
+        graph_version: u64,
+        expected_revision: Option<String>,
+        skip_dedup_on_insert: bool,
+        source_root: Option<PathBuf>,
+    ) -> Result<Self, GraphError> {
         normalize_assesses_claims_graph(&mut graph);
+        let source_root = Self::canonicalize_source_root(source_root)?;
         let rubric_hashes = RwLock::new(compute_rubric_hashes(&graph));
         let graph = Arc::new(graph);
         let mut svc = Self {
@@ -351,6 +370,7 @@ impl GraphService {
             strict_quality,
             graph_version,
             expected_revision: expected_revision.filter(|s| !s.is_empty()),
+            source_root,
             rubric_hashes,
             validation_state: ValidationState::new_empty(),
             poisoned: AtomicBool::new(false),
@@ -424,21 +444,23 @@ impl GraphService {
     }
 
     pub(crate) fn fade_ctx(&self) -> analysis::FadeabilityContext {
-        if let Ok(cache) = self.fade_cache.read()
-            && let Some((ver, ctx)) = cache.as_ref()
-            && *ver == self.graph_version
         {
-            return ctx.clone();
-        }
-        let fresh = analysis::FadeabilityContext::compute(self.graph());
-        if let Ok(mut cache) = self.fade_cache.write() {
+            let cache = self.fade_cache.read();
             if let Some((ver, ctx)) = cache.as_ref()
                 && *ver == self.graph_version
             {
                 return ctx.clone();
             }
-            *cache = Some((self.graph_version, fresh.clone()));
         }
+
+        let fresh = analysis::FadeabilityContext::compute(self.graph());
+        let mut cache = self.fade_cache.write();
+        if let Some((ver, ctx)) = cache.as_ref()
+            && *ver == self.graph_version
+        {
+            return ctx.clone();
+        }
+        *cache = Some((self.graph_version, fresh.clone()));
         fresh
     }
 
@@ -449,9 +471,7 @@ impl GraphService {
         self.validation_state
             .dirty
             .fetch_or(families.bits(), Ordering::Relaxed);
-        if let Ok(mut cache) = self.fade_cache.write() {
-            cache.take();
-        }
+        self.fade_cache.write().take();
     }
 
     fn rebuild_dedup(&mut self) {
@@ -508,8 +528,43 @@ impl GraphService {
         self.expected_revision.as_deref()
     }
 
+    pub fn source_root(&self) -> Option<&Path> {
+        self.source_root.as_deref()
+    }
+
     pub fn set_expected_revision(&mut self, revision: Option<String>) {
         self.expected_revision = revision.filter(|s| !s.is_empty());
+    }
+
+    pub(crate) fn canonicalize_source_root(
+        source_root: Option<PathBuf>,
+    ) -> Result<Option<PathBuf>, GraphError> {
+        let Some(root) = source_root else {
+            return Ok(None);
+        };
+        if root.as_os_str().is_empty() {
+            return Ok(None);
+        }
+        let canonical = root.canonicalize().map_err(|err| {
+            GraphError::Schema(format!("source_root `{}` is invalid: {err}", root.display()))
+        })?;
+        if !canonical.is_dir() {
+            return Err(GraphError::Schema(format!(
+                "source_root `{}` must be a directory",
+                canonical.display()
+            )));
+        }
+        Ok(Some(canonical))
+    }
+
+    pub(crate) fn replace_source_root_unchecked(
+        &mut self,
+        source_root: Option<PathBuf>,
+    ) -> Option<PathBuf> {
+        let prev = self.source_root.clone();
+        self.source_root = source_root;
+        self.mark_dirty(InvariantFamilies::PROVENANCE);
+        prev
     }
 
     pub fn set_skip_dedup_on_insert(&mut self, skip: bool) {
@@ -1058,11 +1113,7 @@ impl GraphService {
         }
         let stored_slug = self.graph()[id].slug.clone();
         let old_index = self.slug_to_node.clone();
-        let old_rubric = self
-            .rubric_hashes
-            .read()
-            .expect("rubric_hashes lock")
-            .clone();
+        let old_rubric = self.rubric_hashes.read().clone();
         let incoming: Vec<_> = self
             .graph()
             .edges_directed(id, Direction::Incoming)
@@ -1096,7 +1147,7 @@ impl GraphService {
                             attrs.evidence_link.claim = old_slug.clone();
                         }
                     }
-                    *svc.rubric_hashes.write().expect("rubric_hashes lock") = old_rubric;
+                    *svc.rubric_hashes.write() = old_rubric;
                 }
             })
             .on_success(|svc| svc.refresh_rubric_hashes());
@@ -1159,11 +1210,7 @@ impl GraphService {
         let old_graph = self.graph.clone();
         let old_index = self.slug_to_node.clone();
         let old_version = self.graph_version;
-        let old_rubric = self
-            .rubric_hashes
-            .read()
-            .expect("rubric_hashes lock")
-            .clone();
+        let old_rubric = self.rubric_hashes.read().clone();
         let old_dirty = self.validation_state.dirty.load(Ordering::Relaxed);
 
         let incoming: Vec<(NodeId, EdgePayload)> = self
@@ -1251,7 +1298,7 @@ impl GraphService {
             self.graph = old_graph;
             self.slug_to_node = old_index;
             self.graph_version = old_version;
-            *self.rubric_hashes.write().expect("rubric_hashes lock") = old_rubric;
+            *self.rubric_hashes.write() = old_rubric;
             self.rebuild_dedup();
             self.validation_state
                 .dirty
@@ -1771,8 +1818,7 @@ impl GraphService {
     }
 
     fn refresh_rubric_hashes(&self) {
-        *self.rubric_hashes.write().expect("rubric_hashes lock") =
-            compute_rubric_hashes(self.graph());
+        *self.rubric_hashes.write() = compute_rubric_hashes(self.graph());
     }
 
     /// Ensure every assesses edge claim matches its target LO slug. Intended

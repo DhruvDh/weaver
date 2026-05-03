@@ -869,24 +869,40 @@ impl ToolInstance for LoAnchorsViewTool {
 
 const KEYSTONE: &str = "graph_keystone";
 
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Builder, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct KeystoneArgs {
+    pub limit:      Option<usize>,
+    pub offset:     Option<usize>,
+    #[serde(default = "default_true")]
+    pub fetch_body: bool,
+}
+
 crate::analysis_tool!(
     keystone_meta,
     id: KEYSTONE,
     description: "Identify 'keystone' nodes that are critical to the graph structure (high betweenness centrality). These nodes appear on many paths between first principles and assessments. Keystones are high-priority for scaffolding—if students struggle here, many downstream concepts are affected.",
-    args: NoArgs,
+    args: KeystoneArgs,
     prepare: |raw| crate::tools::llm::common::parse_args(KEYSTONE, raw),
-    runner: |_: NoArgs, state: &CallState| KeystoneTool {
+    runner: |args: KeystoneArgs, state: &CallState| KeystoneTool {
+        args,
         state: state.clone(),
     }
 );
 
 struct KeystoneTool {
+    args:  KeystoneArgs,
     state: CallState,
 }
 
 #[async_trait]
 impl ToolInstance for KeystoneTool {
     async fn execute(&self) -> Result<ToolOutput, ToolExecutionError> {
+        let mode = ToolPayloadMode::from_fetch_flag(self.args.fetch_body);
         let (graph, graph_version) =
             load_graph_with_version(&self.state.graph, &self.state.analysis_cache).await?;
         let meta = common::graph_meta(&self.state.graph).await?;
@@ -904,10 +920,8 @@ impl ToolInstance for KeystoneTool {
                 let graph = Arc::clone(&graph);
                 async move {
                     let scores = analysis::keystone_scores(&graph);
-                    let top_n = 20usize;
                     let rendered: Vec<_> = scores
                         .into_iter()
-                        .take(top_n)
                         .map(|score| {
                             json!({
                                 "slug": graph[score.node].slug,
@@ -929,15 +943,33 @@ impl ToolInstance for KeystoneTool {
         )
         .await?;
 
+        let all_scores = payload
+            .get("scores")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let total_ranked = all_scores.len();
+        let limit = self.args.limit.or(Some(20));
+        let (scores, page) = crate::paginate!(all_scores, limit, self.args.offset);
+        let payload = json!({
+            "type": "graph_analysis",
+            "tool": KEYSTONE,
+            "total_ranked": total_ranked,
+            "scores": scores,
+        });
+
         info!(
             tool = KEYSTONE,
-            total_ranked = payload["total_ranked"].as_u64().unwrap_or(0),
+            total_ranked,
+            limit = page.limit,
+            offset = page.offset,
+            has_more = page.has_more,
             "graph keystone scores"
         );
 
         let approx = payload_size_bytes(&payload);
         ToolRunner::new(KEYSTONE, &self.state)
-            .with_mode(ToolPayloadMode::Body)
+            .with_mode(mode)
             .with_meta(meta)
             .run(move |_| async move {
                 Ok(ToolRunPayload {
@@ -945,7 +977,7 @@ impl ToolInstance for KeystoneTool {
                     approx_bytes:  Some(approx),
                     preview:       None,
                     preview_hints: Vec::new(),
-                    page:          None,
+                    page:          Some(page),
                 })
             })
             .await

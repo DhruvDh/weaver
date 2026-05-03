@@ -654,6 +654,7 @@ async fn reconcile_course_commit(
     desired: Option<String>,
     strict_quality: bool,
     validation_timeout_ms: u64,
+    source_root: Option<PathBuf>,
 ) -> Result<String> {
     let current_commit = graph_actor
         .ask(GetCourseCommit)
@@ -679,6 +680,7 @@ async fn reconcile_course_commit(
             course_commit: target_commit.clone(),
             strict_quality,
             validation_timeout_ms,
+            source_root: source_root.clone(),
         })
         .await
     {
@@ -696,6 +698,7 @@ async fn reconcile_course_commit(
                         course_commit: current_commit.clone(),
                         strict_quality,
                         validation_timeout_ms,
+                        source_root: source_root.clone(),
                     })
                     .await
                     .map_err(|e| anyhow!(e))?;
@@ -839,23 +842,55 @@ pub async fn run_app(cli: Cli, runtime: RuntimeOptions) -> Result<()> {
             .create(true)
             .append(true)
             .open(&path)
-            .unwrap_or_else(|err| {
-                let _ = writeln!(stderr(), "failed to open log file {}: {err}", path.display());
+            .or_else(|err| {
+                let _ = writeln!(
+                    stderr(),
+                    "failed to open log file {}: {err}; retrying create",
+                    path.display()
+                );
                 fs::File::create(&path)
-                    .unwrap_or_else(|_| panic!("unable to create log file {}", path.display()))
+            })
+            .or_else(|err| {
+                let fallback = std::env::temp_dir().join("weaver.log");
+                let _ = writeln!(
+                    stderr(),
+                    "logging fallback to {} after error {err}",
+                    fallback.display()
+                );
+                fs::File::create(fallback)
             });
+
+        let file = match file {
+            Ok(f) => f,
+            Err(err) => {
+                let _ = writeln!(stderr(), "logging to stderr only: {err}");
+                // Return a writer factory that always writes to stderr.
+                return BoxMakeWriter::new(|| -> Box<dyn Write + Send + Sync> {
+                    Box::new(stderr())
+                });
+            }
+        };
+
         let shared = Arc::new(Mutex::new(file));
-        BoxMakeWriter::new(move || {
-            shared
-                .lock()
-                .expect("log writer mutex")
-                .try_clone()
-                .unwrap_or_else(|err| {
-                    let _ =
-                        writeln!(stderr(), "failed to clone log file {}: {err}", path.display());
-                    fs::File::create(&path)
-                        .unwrap_or_else(|_| panic!("unable to create log file {}", path.display()))
-                })
+        BoxMakeWriter::new(move || -> Box<dyn Write + Send + Sync> {
+            match shared.lock() {
+                Ok(guard) => match guard.try_clone() {
+                    Ok(cloned) => Box::new(cloned),
+                    Err(err) => {
+                        let _ = writeln!(
+                            stderr(),
+                            "failed to clone log file {}: {err}; logging to stderr",
+                            path.display()
+                        );
+                        Box::new(stderr())
+                    }
+                },
+                Err(poisoned) => {
+                    let _ = writeln!(stderr(), "log writer mutex poisoned; logging to stderr");
+                    drop(poisoned);
+                    Box::new(stderr())
+                }
+            }
         })
     };
 
@@ -960,6 +995,7 @@ pub async fn run_app(cli: Cli, runtime: RuntimeOptions) -> Result<()> {
                             graph_config.validation_timeout_ms,
                             graph_config.skip_dedup_on_insert,
                         )
+                        .with_source_root(cli.workspace.clone())
                     }
                     Err(err) => {
                         error!(
@@ -980,6 +1016,7 @@ pub async fn run_app(cli: Cli, runtime: RuntimeOptions) -> Result<()> {
                             graph_config.validation_timeout_ms,
                             graph_config.skip_dedup_on_insert,
                         )
+                        .with_source_root(cli.workspace.clone())
                     }
                 }
             } else {
@@ -996,6 +1033,7 @@ pub async fn run_app(cli: Cli, runtime: RuntimeOptions) -> Result<()> {
                     graph_config.validation_timeout_ms,
                     graph_config.skip_dedup_on_insert,
                 )
+                .with_source_root(cli.workspace.clone())
             };
             GraphManager::spawn_persistent(graph_state_url.clone(), state).await?
         }
@@ -1056,10 +1094,9 @@ pub async fn run_app(cli: Cli, runtime: RuntimeOptions) -> Result<()> {
         Duration::from_secs(graph_config.autosave_secs),
         AutosaveTick,
     );
-    scheduler
-        .tell(autosave_interval)
-        .await
-        .expect("scheduler actor not running");
+    if let Err(err) = scheduler.tell(autosave_interval).await {
+        warn!(error = ?err, "scheduler actor not running; autosave disabled");
+    }
 
     if let Some(prune_secs) = cli.graph_prune_requires_s.filter(|value| *value > 0) {
         let prune_worker = PruneWorker {
@@ -1069,10 +1106,9 @@ pub async fn run_app(cli: Cli, runtime: RuntimeOptions) -> Result<()> {
         let prune_ref = PruneWorker::spawn(prune_worker);
         let prune_interval =
             SetInterval::new(prune_ref.downgrade(), Duration::from_secs(prune_secs), PruneTick);
-        scheduler
-            .tell(prune_interval)
-            .await
-            .expect("scheduler actor not running");
+        if let Err(err) = scheduler.tell(prune_interval).await {
+            warn!(error = ?err, "scheduler actor not running; skipping prune task");
+        }
     }
 
     let dedup_agent = DeduplicationAgent::spawn(DeduplicationAgent::new(
@@ -1089,10 +1125,9 @@ pub async fn run_app(cli: Cli, runtime: RuntimeOptions) -> Result<()> {
                 dry_run:              false,
             },
         );
-        scheduler
-            .tell(dedup_task)
-            .await
-            .expect("scheduler actor not running");
+        if let Err(err) = scheduler.tell(dedup_task).await {
+            warn!(error = ?err, "scheduler actor not running; skipping dedup task");
+        }
     }
 
     let resolved_commit = reconcile_course_commit(
@@ -1100,6 +1135,7 @@ pub async fn run_app(cli: Cli, runtime: RuntimeOptions) -> Result<()> {
         desired_course_commit.clone(),
         cli.graph_strict_quality,
         graph_config.validation_timeout_ms,
+        Some(cli.workspace.clone()),
     )
     .await?;
     debug!(course_commit = %resolved_commit, "runtime course_commit resolved");
@@ -1137,7 +1173,15 @@ pub async fn run_app(cli: Cli, runtime: RuntimeOptions) -> Result<()> {
     }
 
     if interactive_tui {
-        match session_mode.expect("interactive mode should exist when TUI is active") {
+        let Some(mode) = session_mode else {
+            let err = anyhow!(
+                "interactive TUI requested but session mode could not be determined; pass \
+                 --interactive or --analyst"
+            );
+            error!(error = %err, "interactive mode missing");
+            return Err(err);
+        };
+        match mode {
             AgentMode::Analyst => {
                 let actor = match AnalystReader::from_env_with_limit(
                     cli.workspace.clone(),

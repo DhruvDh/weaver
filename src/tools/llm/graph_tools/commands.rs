@@ -586,6 +586,7 @@ crate::graph_action_tool!(
     )),
     mutate: Some(|args: &mut AddRequiresArgs, state: &CallState| {
         fill_source_ref_revisions(&mut args.evidence_refs, state.course_commit.as_ref());
+        Ok(())
     })
 );
 
@@ -709,6 +710,7 @@ crate::graph_action_tool!(
     )),
     mutate: Some(|args: &mut AddSupportsArgs, state: &CallState| {
         fill_source_ref_revisions(&mut args.evidence_refs, state.course_commit.as_ref());
+        Ok(())
     })
 );
 

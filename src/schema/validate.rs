@@ -1,3 +1,5 @@
+use std::path::{Component, Path};
+
 use thiserror::Error;
 
 use super::types::{
@@ -22,6 +24,8 @@ pub enum SchemaError {
     InvalidLineRange { start_line: u32, end_line: u32 },
     #[error("source_ref revision must be a 7-40 character hexadecimal git hash")]
     InvalidRevision,
+    #[error("source_ref.path `{path}` is invalid: {message}")]
+    InvalidSourcePath { path: String, message: String },
     #[error("observation_features must contain at least one entry for {edge}")]
     MissingObservationFeature { edge: &'static str },
 }
@@ -40,6 +44,22 @@ pub fn validate_source_ref(span: &SourceRef) -> Result<(), SchemaError> {
         });
     }
     ensure_non_empty(&span.path, "source_ref.path")?;
+    let path = Path::new(&span.path);
+    if path.is_absolute() {
+        return Err(SchemaError::InvalidSourcePath {
+            path:    span.path.clone(),
+            message: "must be relative to the workspace root".to_string(),
+        });
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(SchemaError::InvalidSourcePath {
+            path:    span.path.clone(),
+            message: "must not contain `..` path components".to_string(),
+        });
+    }
     ensure_non_empty(&span.revision, "source_ref.revision")?;
     if !is_git_hash(&span.revision) {
         return Err(SchemaError::InvalidRevision);

@@ -218,6 +218,7 @@ pub enum AnchorImpact {
 pub enum InvariantCode {
     StatementEmpty,
     ProvenanceRevision,
+    ProvenancePath,
     RequiresDag,
     Fadeability,
     LoTargetAssessment,
@@ -244,6 +245,7 @@ impl InvariantCode {
         match self {
             InvariantCode::StatementEmpty => "statement_empty",
             InvariantCode::ProvenanceRevision => "provenance_revision",
+            InvariantCode::ProvenancePath => "provenance_path",
             InvariantCode::RequiresDag => "requires_dag",
             InvariantCode::Fadeability => "fadeability",
             InvariantCode::LoTargetAssessment => "lo_target_assessment",

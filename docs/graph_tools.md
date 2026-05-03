@@ -82,7 +82,9 @@ All command outputs now follow `{type: "graph_command", tool: <id>, status: "ok"
 - Command preflight now resolves slugs with type guards: requires/supports expect knowledge nodes; assesses expects assessment_item -> learning_outcome; precedes/anchors ensure teaching_step sources (and anchors require knowledge/LO/assessment targets) before applying mutations.
 - Strict mode: `--graph-strict-quality` promotes alignment/coverage/practice/example/discourse warnings to errors. Use it in CI; leave it off locally while staging edits.
 - Supports: all supports must carry a `case_tag`; supports into high `intrinsic_load` targets must include `coverage_tags`.
-- Purity & provenance: extraneous prerequisites and SourceRef revision mismatches are fatal regardless of strictness.
+- Purity & provenance: extraneous prerequisites and SourceRef revision mismatches are fatal
+  regardless of strictness. When a source root is configured, SourceRef paths must also resolve
+  inside that root and line ranges must fit within the referenced file.
 - Teaching steps: when unanchored, provide `rationale` (new optional field on insert/update teaching-step commands).
 - Non-semantic algorithm tools (`graph_requires_pagerank`, cycles/bridges/articulation/shortest-path) are gated behind `WEAVER_DEBUG_GRAPH_ALGORITHMS=1` and stay out of the curated surface by default.
 

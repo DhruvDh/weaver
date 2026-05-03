@@ -374,7 +374,6 @@ where
     <<GraphManager as Message<Msg>>::Reply as kameo::Reply>::Ok: Send,
     <<GraphManager as Message<Msg>>::Reply as kameo::Reply>::Error: Send,
 {
-    let meta = graph_meta(&state.graph).await?;
     let mode = if action.apply() {
         ToolPayloadMode::Body
     } else {
@@ -383,6 +382,7 @@ where
 
     match mode {
         ToolPayloadMode::Preview => {
+            let meta = graph_meta(&state.graph).await?;
             let preview = action.preview_payload();
             ToolRunner::new(action.tool(), state)
                 .with_mode(mode)
@@ -396,6 +396,7 @@ where
             let reply: <MessageReply<Msg> as kameo::Reply>::Ok =
                 state.graph.ask(msg).await.map_err(|e| action.map_err(e))?;
             let body = action.map_ok(reply);
+            let meta = graph_meta(&state.graph).await?;
             ToolRunner::new(action.tool(), state)
                 .with_mode(mode)
                 .with_meta(meta)
@@ -420,6 +421,8 @@ pub type ArgsPreflight<Args> = Arc<
         + Send
         + Sync,
 >;
+
+pub type ArgsMutate<Args> = fn(&mut Args, &CallState) -> ToolInputResult<()>;
 
 /// ToolInstance wrapper over a GraphAction.
 pub struct GraphActionInstance<A>

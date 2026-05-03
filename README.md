@@ -156,7 +156,7 @@ Only edge-creation tools. Agents query nodes first, verify existence, then link.
 **Centrality / keystone (requires layer):**
 
 "Find keystone concepts (betweenness-style importance)."
-→ `graph_keystone fetch_body=true limit=20`
+→ `graph_keystone fetch_body=true limit=10`  # smaller payload to avoid timeouts
 
 "(Optional) PageRank over prerequisites (requires debug flag)."
 Set `WEAVER_DEBUG_GRAPH_ALGORITHMS=1` before launching the analyst, then run:

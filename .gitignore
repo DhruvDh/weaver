@@ -3,6 +3,5 @@ target/
 .envrc/st.envrc
 
 graph_snapshot.state
-graph_snapshot.json
 
 *.rrd

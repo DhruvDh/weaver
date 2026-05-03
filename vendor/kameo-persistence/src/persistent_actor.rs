@@ -3,11 +3,13 @@ use kameo::prelude::*;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "tracing")]
 use std::any;
+use std::io::ErrorKind;
 #[cfg(feature = "tracing")]
 use std::fmt::Debug;
 #[cfg(feature = "tracing")]
 use tracing::{debug, trace, warn};
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
 use url::Url;
 
 // todo Make deriving macro for this trait
@@ -182,7 +184,38 @@ pub trait PersistentActor: Actor {
                         anyhow::bail!("persistence key exists but is not a directory: {:?}", path);
                     }
 
-                    fs::write(&path.join("index.bin"), data).await?;
+                    let tmp_path = path.join("index.bin.tmp");
+                    let final_path = path.join("index.bin");
+
+                    let mut tmp = fs::File::create(&tmp_path).await?;
+                    tmp.write_all(&data).await?;
+                    tmp.sync_all().await?;
+
+                    if let Err(err) = fs::rename(&tmp_path, &final_path).await {
+                        let _ = fs::remove_file(&tmp_path).await;
+                        return Err(err.into());
+                    }
+
+                    match fs::File::open(&path).await {
+                        Ok(dir) => {
+                            if let Err(err) = dir.sync_all().await {
+                                if err.kind() == ErrorKind::Unsupported {
+                                    #[cfg(feature = "tracing")]
+                                    warn!(error = %err, "directory fsync unsupported after actor persistence rename");
+                                } else {
+                                    return Err(err.into());
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            if err.kind() == ErrorKind::Unsupported {
+                                #[cfg(feature = "tracing")]
+                                warn!(error = %err, "directory open unsupported for actor persistence fsync");
+                            } else {
+                                return Err(err.into());
+                            }
+                        }
+                    }
 
                     Ok(())
                 }

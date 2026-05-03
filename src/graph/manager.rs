@@ -29,6 +29,8 @@ pub struct GraphManagerState {
     pub validation_timeout_ms: u64,
     #[serde(default)]
     pub skip_dedup_on_insert:  bool,
+    #[serde(skip)]
+    pub source_root:           Option<PathBuf>,
 }
 
 const fn default_validation_timeout_ms() -> u64 {
@@ -59,7 +61,13 @@ impl GraphManagerState {
             graph_version,
             validation_timeout_ms,
             skip_dedup_on_insert,
+            source_root: None,
         }
+    }
+
+    pub fn with_source_root(mut self, source_root: impl Into<PathBuf>) -> Self {
+        self.source_root = Some(source_root.into());
+        self
     }
 }
 
@@ -79,6 +87,7 @@ pub struct GraphManager {
     service:               GraphService,
     course_commit:         String,
     validation_timeout_ms: u64,
+    source_root:           Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -90,10 +99,12 @@ pub struct GraphMeta {
 
 impl GraphManager {
     pub fn new(service: GraphService, config: GraphConfig) -> Self {
+        let source_root = service.source_root().map(PathBuf::from);
         Self {
             service,
             course_commit: config.course_commit,
             validation_timeout_ms: config.validation_timeout_ms,
+            source_root,
         }
     }
 
@@ -154,6 +165,7 @@ impl From<&GraphManager> for GraphManagerState {
             graph_version:         manager.service.graph_version(),
             validation_timeout_ms: manager.validation_timeout_ms,
             skip_dedup_on_insert:  manager.service.skip_dedup_on_insert(),
+            source_root:           manager.source_root.clone(),
         }
     }
 }
@@ -169,12 +181,13 @@ impl Actor for GraphManager {
         } else {
             Some(state.course_commit.clone())
         };
-        let service = match GraphService::from_parts(
+        let service = match GraphService::from_parts_with_source_root(
             state.graph.clone(),
             strict,
             state.graph_version,
             expected_revision,
             state.skip_dedup_on_insert,
+            state.source_root.clone(),
         ) {
             Ok(svc) => svc,
             Err(err) => {
@@ -204,6 +217,7 @@ impl Actor for GraphManager {
             service,
             course_commit: state.course_commit,
             validation_timeout_ms: state.validation_timeout_ms,
+            source_root: state.source_root,
         })
     }
 }
@@ -800,6 +814,7 @@ pub struct ApplyRuntimeConfig {
     pub course_commit:         String,
     pub strict_quality:        bool,
     pub validation_timeout_ms: u64,
+    pub source_root:           Option<PathBuf>,
 }
 
 pub struct SetAuditSink {
@@ -969,12 +984,14 @@ impl Message<ApplyRuntimeConfig> for GraphManager {
             course_commit,
             strict_quality,
             validation_timeout_ms,
+            source_root,
         }: ApplyRuntimeConfig,
         _ctx: &mut MsgContext<Self, Self::Reply>,
     ) -> Self::Reply {
         let prev_strict = self.service.strict_quality();
         let prev_timeout = self.validation_timeout_ms;
         let new_timeout = validation_timeout_ms.max(1);
+        let next_source_root = GraphService::canonicalize_source_root(source_root)?;
 
         self.validation_timeout_ms = new_timeout;
 
@@ -986,6 +1003,7 @@ impl Message<ApplyRuntimeConfig> for GraphManager {
         }
 
         let prev_commit = self.course_commit.clone();
+        let prev_source_root = self.source_root.clone();
         let expected = if course_commit.is_empty() {
             None
         } else {
@@ -993,12 +1011,16 @@ impl Message<ApplyRuntimeConfig> for GraphManager {
         };
         self.service.set_expected_revision(expected);
         self.course_commit = course_commit;
+        self.source_root = next_source_root.clone();
+        self.service.replace_source_root_unchecked(next_source_root);
 
         if let Err(err) = self
             .service
             .validate_global_invariants_off_thread(Duration::from_millis(new_timeout))
             .await
         {
+            self.source_root = prev_source_root.clone();
+            self.service.replace_source_root_unchecked(prev_source_root);
             if strict_quality != prev_strict {
                 let _ = self.service.set_strict_quality(prev_strict);
             }

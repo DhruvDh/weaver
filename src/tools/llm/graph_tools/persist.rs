@@ -1,8 +1,6 @@
 use std::{
     env,
-    path::{Path, PathBuf},
-    pin::Pin,
-    sync::Arc,
+    path::{Component, Path, PathBuf},
 };
 
 use anyhow::anyhow;
@@ -16,8 +14,8 @@ use super::common::{MaybeApply, map_send_err_anyhow, parse_args_with_builder};
 use crate::{
     graph::{commands::LoadSnapshot, manager::SaveSnapshot},
     tools::llm::{
-        CallState, ToolExecutionError, ToolInputError, ToolPrototype, require_string,
-        resolve_workspace_path,
+        CallState, ToolExecutionError, ToolInputError, ToolInputResult, ToolPrototype,
+        require_string,
     },
 };
 
@@ -81,20 +79,12 @@ crate::graph_action_tool!(
         ok_save_snapshot(args, reply)
     },
     map_err: map_send_err_anyhow,
-    preflight: Some(Arc::new(
-        |args: &SaveSnapshotArgs, state: &CallState| -> Pin<
-            Box<
-                dyn std::future::Future<
-                        Output = Result<(), crate::tools::llm::ToolExecutionError>
-                    > + Send,
-            >,
-        > {
-            let provided = args.path.clone();
-            let root = Arc::clone(&state.workspace_root);
-            Box::pin(async move { preflight_snapshot_path(provided, SAVE_SNAPSHOT, root).await })
-        },
-    )),
-    mutate: None
+    preflight: None,
+    mutate: Some(|args: &mut SaveSnapshotArgs, state: &CallState| {
+        let resolved = resolve_snapshot_save_path(state.workspace_root.as_ref(), args.path.clone(), SAVE_SNAPSHOT)?;
+        args.path = Some(resolved.display().to_string());
+        Ok(())
+    })
 );
 
 #[derive(Debug, Clone, Builder, Deserialize, Serialize, JsonSchema)]
@@ -154,17 +144,10 @@ crate::graph_action_tool!(
                   explicitly asked to restore from a snapshot path.",
     args: LoadSnapshotArgs,
     prepare: |raw| {
-        let args = parse_args_with_builder(LOAD_SNAPSHOT, raw, |mut input: LoadSnapshotArgs| {
+        parse_args_with_builder(LOAD_SNAPSHOT, raw, |mut input: LoadSnapshotArgs| {
             input.path = require_string(input.path, LOAD_SNAPSHOT, "path")?;
             Ok(input)
-        })?;
-        if !Path::new(&args.path).exists() {
-            return Err(ToolInputError::InvalidPayload {
-                tool:    LOAD_SNAPSHOT,
-                message: format!("snapshot file `{}` not found", args.path),
-            });
-        }
-        Ok(args)
+        })
     },
     build: |args: &LoadSnapshotArgs| build_load_snapshot(args),
     ok: |args: &LoadSnapshotArgs, _| {
@@ -172,20 +155,12 @@ crate::graph_action_tool!(
         command_ok(LOAD_SNAPSHOT, json!({"path": args.path}))
     },
     map_err: map_load_snapshot_err,
-    preflight: Some(Arc::new(
-        |args: &LoadSnapshotArgs, state: &CallState| -> Pin<
-            Box<
-                dyn std::future::Future<
-                        Output = Result<(), crate::tools::llm::ToolExecutionError>
-                    > + Send,
-            >,
-        > {
-            let provided = Some(args.path.clone());
-            let root = Arc::clone(&state.workspace_root);
-            Box::pin(async move { preflight_snapshot_path(provided, LOAD_SNAPSHOT, root).await })
-        },
-    )),
-    mutate: None
+    preflight: None,
+    mutate: Some(|args: &mut LoadSnapshotArgs, state: &CallState| {
+        let resolved = resolve_snapshot_load_path(state.workspace_root.as_ref(), &args.path, LOAD_SNAPSHOT)?;
+        args.path = resolved.display().to_string();
+        Ok(())
+    })
 );
 
 fn resolve_snapshot_path(path: Option<String>) -> String {
@@ -193,17 +168,252 @@ fn resolve_snapshot_path(path: Option<String>) -> String {
         .unwrap_or_else(|| "graph_snapshot.json".to_string())
 }
 
-async fn preflight_snapshot_path(
+fn resolve_snapshot_save_path(
+    workspace_root: &Path,
     provided: Option<String>,
     tool: &'static str,
-    workspace_root: Arc<PathBuf>,
-) -> Result<(), ToolExecutionError> {
-    let path = resolve_snapshot_path(provided);
-    resolve_workspace_path(workspace_root.as_ref(), Path::new(&path), tool)
-        .map_err(ToolExecutionError::Input)?;
+) -> ToolInputResult<PathBuf> {
+    let raw = resolve_snapshot_path(provided);
+    reject_parent_dir_components(&raw, tool)?;
+    let root = canonical_workspace_root(workspace_root, tool)?;
+    let candidate = absolute_or_workspace_path(&root, Path::new(&raw));
+    let parent = candidate
+        .parent()
+        .ok_or_else(|| ToolInputError::InvalidPath {
+            tool,
+            path: candidate.display().to_string(),
+            message: "snapshot path has no parent directory".to_string(),
+        })?;
+    let canonical_parent = parent
+        .canonicalize()
+        .map_err(|err| ToolInputError::InvalidPath {
+            tool,
+            path: parent.display().to_string(),
+            message: err.to_string(),
+        })?;
+    if !canonical_parent.starts_with(&root) {
+        return Err(ToolInputError::InvalidPath {
+            tool,
+            path: canonical_parent.display().to_string(),
+            message: format!("escapes workspace root {}", root.display()),
+        });
+    }
+    let file_name = candidate
+        .file_name()
+        .ok_or_else(|| ToolInputError::InvalidPath {
+            tool,
+            path: candidate.display().to_string(),
+            message: "snapshot path must include a file name".to_string(),
+        })?;
+    let resolved = canonical_parent.join(file_name);
+    if resolved.exists() {
+        let canonical = resolved
+            .canonicalize()
+            .map_err(|err| ToolInputError::InvalidPath {
+                tool,
+                path: resolved.display().to_string(),
+                message: err.to_string(),
+            })?;
+        if !canonical.starts_with(&root) {
+            return Err(ToolInputError::InvalidPath {
+                tool,
+                path: canonical.display().to_string(),
+                message: format!("escapes workspace root {}", root.display()),
+            });
+        }
+        if !canonical.is_file() {
+            return Err(ToolInputError::InvalidPath {
+                tool,
+                path: canonical.display().to_string(),
+                message: "snapshot path must be a file".to_string(),
+            });
+        }
+        return Ok(canonical);
+    }
+    Ok(resolved)
+}
+
+fn resolve_snapshot_load_path(
+    workspace_root: &Path,
+    provided: &str,
+    tool: &'static str,
+) -> ToolInputResult<PathBuf> {
+    reject_parent_dir_components(provided, tool)?;
+    let root = canonical_workspace_root(workspace_root, tool)?;
+    let candidate = absolute_or_workspace_path(&root, Path::new(provided));
+    let canonical = candidate
+        .canonicalize()
+        .map_err(|err| ToolInputError::InvalidPath {
+            tool,
+            path: candidate.display().to_string(),
+            message: err.to_string(),
+        })?;
+    if !canonical.starts_with(&root) {
+        return Err(ToolInputError::InvalidPath {
+            tool,
+            path: canonical.display().to_string(),
+            message: format!("escapes workspace root {}", root.display()),
+        });
+    }
+    let meta = canonical
+        .metadata()
+        .map_err(|err| ToolInputError::InvalidPath {
+            tool,
+            path: canonical.display().to_string(),
+            message: err.to_string(),
+        })?;
+    if !meta.is_file() {
+        return Err(ToolInputError::InvalidPath {
+            tool,
+            path: canonical.display().to_string(),
+            message: "snapshot path must be a file".to_string(),
+        });
+    }
+    Ok(canonical)
+}
+
+fn canonical_workspace_root(workspace_root: &Path, tool: &'static str) -> ToolInputResult<PathBuf> {
+    workspace_root
+        .canonicalize()
+        .map_err(|err| ToolInputError::InvalidPath {
+            tool,
+            path: workspace_root.display().to_string(),
+            message: err.to_string(),
+        })
+}
+
+fn absolute_or_workspace_path(root: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    }
+}
+
+fn reject_parent_dir_components(path: &str, tool: &'static str) -> ToolInputResult<()> {
+    if Path::new(path)
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(ToolInputError::InvalidPath {
+            tool,
+            path: path.to_string(),
+            message: "path must not contain `..` components".to_string(),
+        });
+    }
     Ok(())
 }
 
 pub(super) fn tool_prototypes() -> Vec<ToolPrototype> {
     vec![save_snapshot_meta(), load_snapshot_meta()]
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, path::PathBuf};
+
+    use uuid::Uuid;
+
+    use super::*;
+
+    fn temp_workspace(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("weaver-{name}-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create temp workspace");
+        root
+    }
+
+    #[test]
+    fn save_snapshot_allows_new_file_inside_workspace() {
+        let root = temp_workspace("snapshot-save-new");
+        let resolved =
+            resolve_snapshot_save_path(&root, Some("snapshot.json".into()), SAVE_SNAPSHOT)
+                .expect("resolve save path");
+
+        assert_eq!(resolved, root.canonicalize().unwrap().join("snapshot.json"));
+        assert!(!resolved.exists());
+    }
+
+    #[test]
+    fn save_snapshot_rejects_missing_parent() {
+        let root = temp_workspace("snapshot-save-missing-parent");
+        let err =
+            resolve_snapshot_save_path(&root, Some("missing/snapshot.json".into()), SAVE_SNAPSHOT)
+                .expect_err("missing parent rejected");
+
+        assert!(err.to_string().contains("No such file"));
+    }
+
+    #[test]
+    fn load_snapshot_requires_existing_workspace_file() {
+        let root = temp_workspace("snapshot-load-existing");
+        let path = root.join("snapshot.json");
+        fs::write(&path, "{}").expect("write snapshot");
+
+        let resolved =
+            resolve_snapshot_load_path(&root, "snapshot.json", LOAD_SNAPSHOT).expect("load path");
+
+        assert_eq!(resolved, path.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn load_snapshot_rejects_missing_file() {
+        let root = temp_workspace("snapshot-load-missing");
+
+        let err =
+            resolve_snapshot_load_path(&root, "snapshot.json", LOAD_SNAPSHOT).expect_err("missing");
+
+        assert!(err.to_string().contains("No such file"));
+    }
+
+    #[test]
+    fn snapshot_paths_reject_parent_dir_escape() {
+        let root = temp_workspace("snapshot-parent-escape");
+
+        assert!(
+            resolve_snapshot_save_path(&root, Some("../snapshot.json".into()), SAVE_SNAPSHOT)
+                .is_err()
+        );
+        assert!(resolve_snapshot_load_path(&root, "../snapshot.json", LOAD_SNAPSHOT).is_err());
+    }
+
+    #[test]
+    fn snapshot_paths_reject_absolute_outside_workspace() {
+        let root = temp_workspace("snapshot-absolute-root");
+        let outside = temp_workspace("snapshot-absolute-outside").join("snapshot.json");
+        fs::write(&outside, "{}").expect("write outside snapshot");
+
+        assert!(
+            resolve_snapshot_save_path(&root, Some(outside.display().to_string()), SAVE_SNAPSHOT)
+                .is_err()
+        );
+        assert!(
+            resolve_snapshot_load_path(&root, &outside.display().to_string(), LOAD_SNAPSHOT)
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_paths_reject_symlink_escape() {
+        let root = temp_workspace("snapshot-symlink-root");
+        let outside = temp_workspace("snapshot-symlink-outside");
+        let outside_file = outside.join("snapshot.json");
+        fs::write(&outside_file, "{}").expect("write outside snapshot");
+        std::os::unix::fs::symlink(&outside_file, root.join("linked.json"))
+            .expect("create file symlink");
+        std::os::unix::fs::symlink(&outside, root.join("linked_dir")).expect("create dir symlink");
+
+        assert!(resolve_snapshot_load_path(&root, "linked.json", LOAD_SNAPSHOT).is_err());
+        assert!(
+            resolve_snapshot_save_path(&root, Some("linked.json".into()), SAVE_SNAPSHOT).is_err()
+        );
+        assert!(
+            resolve_snapshot_save_path(
+                &root,
+                Some("linked_dir/snapshot.json".into()),
+                SAVE_SNAPSHOT
+            )
+            .is_err()
+        );
+    }
 }

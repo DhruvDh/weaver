@@ -198,6 +198,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn parse_graph_command<Args, Msg>(
     tool: &'static str,
     raw: Value,
@@ -206,7 +207,7 @@ pub(crate) fn parse_graph_command<Args, Msg>(
     map_ok: fn(&Args, <MsgReply<Msg> as kameo::Reply>::Ok) -> Value,
     map_err: fn(SendError<Msg, <MsgReply<Msg> as kameo::Reply>::Error>) -> ToolExecutionError,
     preflight: Option<crate::tools::llm::common::ArgsPreflight<Args>>,
-    mutate: Option<fn(&mut Args, &CallState)>,
+    mutate: Option<crate::tools::llm::common::ArgsMutate<Args>>,
 ) -> ToolInputResult<Box<dyn ToolInstance>>
 where
     Args: for<'de> Deserialize<'de> + JsonSchema + Clone + Send + Sync + MaybeApply + 'static,
@@ -220,7 +221,7 @@ where
         })?;
 
     if let Some(f) = mutate {
-        f(&mut args, state);
+        f(&mut args, state)?;
     }
 
     let action = GraphActionAdapter {
